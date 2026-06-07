@@ -450,17 +450,35 @@ Rules:
 ---
 
 ## Phase 6 — x0x Transport Integration
-**Goal:** peer query/response over x0x topics.
+**Goal:** peer query/response over x0x topics, via both gossip broadcast and direct agent-to-agent messaging.
+
+x0x provides two communication modes that serve different purposes:
+
+| Mode | Delivery | When to use |
+|------|----------|-------------|
+| **Gossip pub/sub** | Broadcast, epidemic, eventually consistent | Queries to unknown peers, broadcasting name claims, presence |
+| **Direct messaging** | Private, immediate, reliable, ordered | Trusted/known agents, private responses, avoiding gossip fan-out |
 
 ### Tasks
+
+#### Gossip (broadcast)
 - Implement publish/subscribe wrapper in `av-net-x0x`.
 - Add envelope validation and dedupe.
 - Implement request-response flow with timeout.
 - Implement name query/response flow (`name_query`, `name_response`, `name_claim`).
 - Cache peer responses with TTL.
 
+#### Direct messaging (established relationships)
+- Implement `connect_agent()` to establish a direct relationship with a peer via `POST /agents/connect`.
+- Implement `send_direct()` for private, reliable, ordered agent-to-agent messages via `POST /direct/send`.
+- Implement `DirectListener` (SSE `GET /direct/events`) for receiving direct messages.
+- Extend `MessageDispatcher` with direct variants: `send_direct_query()`, `send_direct_response()`, `send_direct_name_query()`, `send_direct_name_response()`.
+- Extend `MockNetClient` to record direct connections and messages for test inspection.
+
 ### Acceptance
-- Two-node integration scenario: node A query gets node B responses.
+- Gossip: node A broadcasts a query and receives node B's gossip response.
+- Direct: known agent A sends a private query directly to agent B and receives a direct response.
+- Both modes share the same `MessageEnvelope` wire format and validation pipeline.
 
 ---
 

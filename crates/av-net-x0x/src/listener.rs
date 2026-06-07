@@ -1,0 +1,105 @@
+use std::io::BufRead;
+use std::sync::mpsc;
+use std::thread;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+use av_core::types::MessageEnvelope;
+
+use crate::error::{NetError, NetResult};
+
+/// A received event from the x0x SSE stream.
+#[derive(Debug, Clone)]
+pub struct IncomingEvent {
+    pub topic: String,
+    pub origin: String,
+    pub envelope: MessageEnvelope,
+    pub raw_size: usize,
+}
+
+/// Starts a background thread that listens to the x0x SSE `/events` endpoint
+/// and sends decoded `IncomingEvent`s through the returned channel.
+///
+/// The thread terminates when the sender is dropped (connection closed) or on error.
+pub fn start_listener(
+    api_base: String,
+    token: String,
+) -> NetResult<mpsc::Receiver<NetResult<IncomingEvent>>> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::Builder::new()
+        .name("av-net-x0x-listener".into())
+        .spawn(move || {
+            let url = format!("{api_base}/events");
+            let resp = match ureq::get(&url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "text/event-stream")
+                .call()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(NetError::DaemonUnreachable(e.to_string())));
+                    return;
+                }
+            };
+
+            let reader = std::io::BufReader::new(resp.into_reader());
+            let mut data_buf = String::new();
+
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let _ = tx.send(Err(NetError::Io(e)));
+                        break;
+                    }
+                };
+
+                if line.starts_with("data: ") {
+                    data_buf = line[6..].to_string();
+                } else if line.is_empty() && !data_buf.is_empty() {
+                    // End of SSE event — parse it
+                    match parse_event(&data_buf) {
+                        Ok(Some(event)) => {
+                            let _ = tx.send(Ok(event));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                        }
+                    }
+                    data_buf.clear();
+                }
+            }
+        })
+        .map_err(|e| NetError::Other(format!("thread spawn: {e}")))?;
+
+    Ok(rx)
+}
+
+fn parse_event(data: &str) -> NetResult<Option<IncomingEvent>> {
+    let raw_size = data.len();
+    let v: serde_json::Value = serde_json::from_str(data)
+        .map_err(|e| NetError::InvalidPayload(format!("SSE JSON: {e}")))?;
+
+    let topic = v["topic"].as_str().unwrap_or("").to_string();
+    let origin = v["origin"].as_str().unwrap_or("").to_string();
+    let payload_b64 = match v["payload"].as_str() {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    let payload_bytes = BASE64
+        .decode(payload_b64)
+        .map_err(|e| NetError::InvalidPayload(format!("base64: {e}")))?;
+
+    let envelope: MessageEnvelope = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| NetError::InvalidPayload(format!("envelope: {e}")))?;
+
+    Ok(Some(IncomingEvent {
+        topic,
+        origin,
+        envelope,
+        raw_size,
+    }))
+}

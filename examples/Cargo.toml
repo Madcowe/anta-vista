@@ -1,0 +1,26 @@
+[package]
+name = "anta-vista-examples"
+version = "0.1.0"
+edition = "2024"
+description = "Runnable examples for anta-vista"
+publish = false
+
+[dependencies]
+av-core    = { workspace = true }
+av-store   = { workspace = true }
+av-ingest  = { workspace = true }
+av-embed   = { workspace = true }
+av-index   = { workspace = true }
+av-trust   = { workspace = true }
+av-query   = { workspace = true }
+av-net-x0x = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "local_search"
+path = "examples/local_search.rs"
+
+[[example]]
+name = "p2p_two_nodes"
+path = "examples/p2p_two_nodes.rs"

@@ -1,0 +1,20 @@
+[package]
+name = "av-index"
+version = "0.1.0"
+edition = "2024"
+description = "Local vector index and search for anta-vista"
+
+[dependencies]
+av-core = { workspace = true }
+av-store = { workspace = true }
+av-embed = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+av-trust = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+av-ingest = { workspace = true }
+tempfile = { workspace = true }
