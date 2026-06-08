@@ -1,0 +1,32 @@
+[package]
+name = "av-test-suite"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Independent adversarial and cross-crate integration tests"
+
+[lib]
+
+[dependencies]
+av-core = { workspace = true }
+av-store = { workspace = true }
+av-embed = { workspace = true }
+av-ingest = { workspace = true }
+av-index = { workspace = true }
+av-trust = { workspace = true }
+av-query = { workspace = true }
+av-net-x0x = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+proptest = "1"
+tempfile = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+directories = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }
+unicode-normalization = { workspace = true }

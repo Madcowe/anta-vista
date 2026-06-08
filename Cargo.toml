@@ -9,6 +9,7 @@ members = [
     "crates/av-net-x0x",
     "crates/av-trust",
     "crates/av-query",
+    "crates/av-test-suite",
 ]
 resolver = "2"
 
@@ -36,3 +37,4 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 toml = "0.8"
+proptest = "1"
