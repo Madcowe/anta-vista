@@ -42,6 +42,7 @@ Your machine
 | `av-trust` | Trust updates, feedback aggregation, ranking formula |
 | `av-query` | Cold-start clustering, rate limiting, abuse tracking |
 | `av-net-x0x` | x0x network transport (gossip + direct) |
+| `av-probe` | Standalone test tool for multi-machine integration testing |
 
 ---
 
@@ -137,6 +138,34 @@ All fields have defaults — partial configs work fine. See [`docs/config.md`](d
 
 ---
 
+## Distributed integration testing with av-probe
+
+`av-probe` is a diagnostic tool used for validating multi-machine networks running `anta-vista`. It executes a battery of test suites validating Gossip & Direct messaging transport, Name registration & Case-insensitivity/Alias normalization, Semantic Search (mock or real embeddings), and Interactive Trust level states.
+
+### Build
+
+```bash
+./scripts/build-probe.sh
+```
+
+### Running the Seed Node (Machine A)
+
+```bash
+target/release/av-probe seed --real-model
+```
+
+### Running the Probe Node (Machine B)
+
+```bash
+# Auto-detects the seed node via NameClaim broadcast and runs all tests
+target/release/av-probe probe --output markdown
+
+# Or specify the seed Agent ID directly
+target/release/av-probe probe --peer <SEED_AGENT_ID>
+```
+
+---
+
 ## Running tests
 
 ```bash
@@ -159,4 +188,4 @@ See [`docs/known-limitations.md`](docs/known-limitations.md) for the full list. 
 
 ## License
 
-MIT OR Apache-2.0
+MIT

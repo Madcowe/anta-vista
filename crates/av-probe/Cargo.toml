@@ -1,0 +1,27 @@
+[package]
+name = "av-probe"
+version = "0.1.0"
+edition = "2024"
+description = "Multi-machine test tool for anta-vista"
+
+[dependencies]
+av-core = { workspace = true }
+av-store = { workspace = true }
+av-embed = { workspace = true }
+av-ingest = { workspace = true }
+av-index = { workspace = true }
+av-net-x0x = { workspace = true }
+av-trust = { workspace = true }
+av-query = { workspace = true }
+
+clap = { version = "4.4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+ureq = { version = "2", features = ["json"] }
+ctrlc = "3.4"
+base64 = { workspace = true }
+chrono = "0.4"
+rusqlite = { workspace = true }

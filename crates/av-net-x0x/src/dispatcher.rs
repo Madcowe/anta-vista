@@ -32,6 +32,11 @@ impl MessageDispatcher {
         }
     }
 
+    /// Access the underlying network client.
+    pub fn client(&self) -> &Arc<dyn NetworkClient> {
+        &self.client
+    }
+
     /// Subscribe to all anta-vista topics.
     pub fn subscribe_all(&self) -> NetResult<()> {
         for topic in &[
