@@ -33,6 +33,23 @@ pub fn lookup_name(
     // Filter by scheme
     let records: Vec<NameRecord> = records
         .into_iter()
+        .map(|mut r| {
+            if let Some(ref s) = r.target_scheme {
+                r.target_scheme = Some(av_core::types::normalize_scheme(s));
+            }
+            if let Some(ref tc) = r.target_canonical {
+                if tc.starts_with("autonomi://") {
+                    r.target_canonical = Some(tc.replace("autonomi://", "ant://"));
+                }
+            } else {
+                if r.target.starts_with("autonomi://") {
+                    r.target_canonical = Some(r.target.replace("autonomi://", "ant://"));
+                } else if r.target.starts_with("ant://") {
+                    r.target_canonical = Some(r.target.clone());
+                }
+            }
+            r
+        })
         .filter(|r| scheme_filter.allows(r.target_scheme.as_deref()))
         .collect();
 

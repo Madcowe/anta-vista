@@ -321,7 +321,7 @@ fn get_daemon_trust_level(config: &X0xConfig, peer_id: &str) -> Option<String> {
         .call()
         .ok()?;
     let val: serde_json::Value = resp.into_json().ok()?;
-    let arr = val.as_array()?;
+    let arr = val["contacts"].as_array()?;
     for contact in arr {
         if contact["agent_id"].as_str() == Some(peer_id) {
             return contact["trust_level"].as_str().map(|s| s.to_string());

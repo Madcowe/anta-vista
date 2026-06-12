@@ -13,6 +13,7 @@ use av_net_x0x::{
 use av_embed::{EmbeddingProvider, MockEmbeddingProvider, MiniLmProvider, provider::profile_id};
 use av_index::{LocalIndex, QueryFilter, SchemeFilter};
 use rusqlite::Connection;
+use crate::tests::helpers::{LoopbackClientWrapper, LoopbackMessage};
 
 use crate::cli::Cli;
 
@@ -35,9 +36,81 @@ pub fn run_seed(args: Cli, config: X0xConfig) {
     init_seed_db(&conn, provider.as_ref(), &config.agent_id);
     let shared_conn = Arc::new(Mutex::new(conn));
 
-    // 4. Connect dispatcher
+    // 4. Connect dispatcher with Loopback support
+    let loopback_stream = Arc::new(Mutex::new(None));
+    let loopback_stream_clone = loopback_stream.clone();
+    
+    let (loopback_tx_gossip, loopback_rx_gossip) = std::sync::mpsc::channel();
+    let (loopback_tx_direct, loopback_rx_direct) = std::sync::mpsc::channel();
+
+    // Spawn TCP Loopback Server for single-agent testing
+    thread::spawn(move || {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:12709") {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("Could not bind loopback TCP server (perhaps port is in use or probe is not running locally): {:?}", e);
+                return;
+            }
+        };
+        tracing::info!("Loopback TCP server listening on 127.0.0.1:12709 for single-agent test runs...");
+        loop {
+            if let Ok((stream, _)) = listener.accept() {
+                tracing::info!("Loopback client connected!");
+                if let Ok(write_stream) = stream.try_clone() {
+                    *loopback_stream_clone.lock().unwrap() = Some(write_stream);
+                }
+
+                // Read loopback messages from stream
+                let mut reader = std::io::BufReader::new(stream);
+                use std::io::BufRead;
+                let mut line = String::new();
+                let mut seen_ids = std::collections::HashSet::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if let Ok(msg) = serde_json::from_str::<LoopbackMessage>(&line) {
+                        let msg_id = match &msg {
+                            LoopbackMessage::Gossip { envelope, .. } => envelope.message_id.clone(),
+                            LoopbackMessage::Direct { envelope, .. } => envelope.message_id.clone(),
+                        };
+                        if seen_ids.insert(msg_id) {
+                            match msg {
+                                LoopbackMessage::Gossip { topic, envelope } => {
+                                    let event = IncomingEvent {
+                                        topic,
+                                        origin: "loopback".to_string(),
+                                        envelope,
+                                        raw_size: 0,
+                                    };
+                                    let _ = loopback_tx_gossip.send(event);
+                                }
+                                LoopbackMessage::Direct { to_agent_id: _, envelope } => {
+                                    let msg = DirectMessage {
+                                        sender: envelope.from_agent_id.clone(),
+                                        machine_id: "loopback".to_string(),
+                                        envelope,
+                                        received_at: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs() as i64,
+                                    };
+                                    let _ = loopback_tx_direct.send(msg);
+                                }
+                            }
+                        }
+                    }
+                    line.clear();
+                }
+                tracing::info!("Loopback client disconnected.");
+                *loopback_stream_clone.lock().unwrap() = None;
+            }
+        }
+    });
+
     let client = Arc::new(X0xNetClient::new(config.clone()));
-    let dispatcher = Arc::new(MessageDispatcher::new(client));
+    let wrapper = Arc::new(LoopbackClientWrapper {
+        real_client: client,
+        loopback_stream: loopback_stream.clone(),
+    });
+    let dispatcher = Arc::new(MessageDispatcher::new(wrapper));
 
     // 5. Subscribe to gossip topics
     dispatcher.subscribe_all().expect("Failed to subscribe to gossip topics");
@@ -60,6 +133,46 @@ pub fn run_seed(args: Cli, config: X0xConfig) {
     let direct_rx = start_direct_listener(config.api_base.clone(), config.token.clone())
         .expect("Failed to start direct message SSE listener");
 
+    // Unified receivers
+    let (unified_gossip_tx, unified_gossip_rx) = std::sync::mpsc::channel();
+    let (unified_direct_tx, unified_direct_rx) = std::sync::mpsc::channel();
+
+    // Forward real gossip to unified
+    let tx = unified_gossip_tx.clone();
+    thread::spawn(move || {
+        for msg in gossip_rx {
+            if let Ok(event) = msg {
+                let _ = tx.send(event);
+            }
+        }
+    });
+
+    // Forward loopback gossip to unified
+    let tx = unified_gossip_tx.clone();
+    thread::spawn(move || {
+        for event in loopback_rx_gossip {
+            let _ = tx.send(event);
+        }
+    });
+
+    // Forward real direct to unified
+    let tx = unified_direct_tx.clone();
+    thread::spawn(move || {
+        for msg in direct_rx {
+            if let Ok(event) = msg {
+                let _ = tx.send(event);
+            }
+        }
+    });
+
+    // Forward loopback direct to unified
+    let tx = unified_direct_tx.clone();
+    thread::spawn(move || {
+        for msg in loopback_rx_direct {
+            let _ = tx.send(msg);
+        }
+    });
+
     tracing::info!("Seed node running. Listening for queries...");
 
     // Setup channels/threads for message processing
@@ -69,17 +182,9 @@ pub fn run_seed(args: Cli, config: X0xConfig) {
 
     // Spawn Gossip Processor Thread
     let gossip_handle = thread::spawn(move || {
-        for msg_res in gossip_rx {
-            match msg_res {
-                Ok(event) => {
-                    if let Err(e) = handle_gossip_event(event, &handler_dispatcher, &handler_conn, handler_provider.as_ref()) {
-                        tracing::error!("Error handling gossip event: {:?}", e);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Gossip listener stream error: {:?}", e);
-                    break;
-                }
+        for event in unified_gossip_rx {
+            if let Err(e) = handle_gossip_event(event, &handler_dispatcher, &handler_conn, handler_provider.as_ref()) {
+                tracing::error!("Error handling gossip event: {:?}", e);
             }
         }
     });
@@ -89,17 +194,9 @@ pub fn run_seed(args: Cli, config: X0xConfig) {
     let direct_conn = shared_conn.clone();
     let direct_provider = provider.clone();
     let direct_handle = thread::spawn(move || {
-        for msg_res in direct_rx {
-            match msg_res {
-                Ok(msg) => {
-                    if let Err(e) = handle_direct_message(msg, &direct_dispatcher, &direct_conn, direct_provider.as_ref()) {
-                        tracing::error!("Error handling direct message: {:?}", e);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Direct message listener stream error: {:?}", e);
-                    break;
-                }
+        for msg in unified_direct_rx {
+            if let Err(e) = handle_direct_message(msg, &direct_dispatcher, &direct_conn, direct_provider.as_ref()) {
+                tracing::error!("Error handling direct message: {:?}", e);
             }
         }
     });

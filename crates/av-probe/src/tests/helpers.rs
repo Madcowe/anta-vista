@@ -1,5 +1,7 @@
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::net::TcpStream;
+use av_core::types::MessageEnvelope;
 use av_net_x0x::listener::IncomingEvent;
 use av_net_x0x::direct_listener::DirectMessage;
 use av_net_x0x::error::NetResult;
@@ -90,7 +92,7 @@ pub fn prompt_user(peer_id: &str, target_level: &str, config: &X0xConfig) {
     println!("│   {} to '{}'                 │", peer_id, target_level);
     println!("│                                                          │");
     println!("│ Option A (CLI):                                          │");
-    println!("│   x0x contacts trust {} {}               │", peer_id, target_level);
+    println!("│   x0x trust set {} {}                 │", peer_id, target_level);
     println!("│                                                          │");
     println!("│ Option B (curl):                                         │");
     println!("│   curl -X POST \"{}/contacts/trust\" \\", config.api_base);
@@ -104,4 +106,76 @@ pub fn prompt_user(peer_id: &str, target_level: &str, config: &X0xConfig) {
     
     let mut input = String::new();
     let _ = std::io::stdin().read_line(&mut input);
+}
+
+use std::sync::{Arc, Mutex};
+use av_net_x0x::client::{NetworkClient, X0xNetClient};
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub enum LoopbackMessage {
+    Gossip {
+        topic: String,
+        envelope: MessageEnvelope,
+    },
+    Direct {
+        to_agent_id: String,
+        envelope: MessageEnvelope,
+    },
+}
+
+#[derive(Clone)]
+pub struct LoopbackClientWrapper {
+    pub real_client: Arc<X0xNetClient>,
+    pub loopback_stream: Arc<Mutex<Option<TcpStream>>>,
+}
+
+impl NetworkClient for LoopbackClientWrapper {
+    fn publish(&self, topic: &str, envelope: &MessageEnvelope) -> NetResult<()> {
+        let mut stream_guard = self.loopback_stream.lock().unwrap();
+        if let Some(ref mut stream) = *stream_guard {
+            let msg = LoopbackMessage::Gossip {
+                topic: topic.to_string(),
+                envelope: envelope.clone(),
+            };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                use std::io::Write;
+                if writeln!(stream, "{}", json).is_ok() && stream.flush().is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+        self.real_client.publish(topic, envelope)
+    }
+
+    fn subscribe(&self, topic: &str) -> NetResult<()> {
+        self.real_client.subscribe(topic)
+    }
+
+    fn agent_id(&self) -> &str {
+        self.real_client.agent_id()
+    }
+
+    fn connect_agent(&self, agent_id: &str) -> NetResult<()> {
+        if agent_id == self.agent_id() {
+            return Ok(());
+        }
+        self.real_client.connect_agent(agent_id)
+    }
+
+    fn send_direct(&self, to_agent_id: &str, envelope: &MessageEnvelope) -> NetResult<()> {
+        let mut stream_guard = self.loopback_stream.lock().unwrap();
+        if let Some(ref mut stream) = *stream_guard {
+            let msg = LoopbackMessage::Direct {
+                to_agent_id: to_agent_id.to_string(),
+                envelope: envelope.clone(),
+            };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                use std::io::Write;
+                if writeln!(stream, "{}", json).is_ok() && stream.flush().is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+        self.real_client.send_direct(to_agent_id, envelope)
+    }
 }

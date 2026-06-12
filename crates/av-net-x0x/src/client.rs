@@ -28,9 +28,23 @@ pub struct X0xConfig {
 }
 
 impl X0xConfig {
-    /// Auto-detect from the x0x data directory (Linux / macOS).
+    /// Auto-detect from the x0x data directory (Linux / macOS), or via environment variables.
     pub fn from_data_dir() -> NetResult<Self> {
-        let data_dir = x0x_data_dir()?;
+        if let (Ok(api_base), Ok(token)) = (std::env::var("X0X_API_BASE"), std::env::var("X0X_TOKEN")) {
+            let agent_id = fetch_agent_id(&api_base, &token)?;
+            return Ok(Self {
+                api_base,
+                token,
+                agent_id,
+            });
+        }
+
+        let data_dir = if let Ok(data_dir_str) = std::env::var("X0X_DATA_DIR") {
+            std::path::PathBuf::from(data_dir_str)
+        } else {
+            x0x_data_dir()?
+        };
+
         let port_str = std::fs::read_to_string(data_dir.join("api.port"))
             .map_err(|e| NetError::DaemonUnreachable(format!("api.port: {e}")))?;
         let token = std::fs::read_to_string(data_dir.join("api-token"))
