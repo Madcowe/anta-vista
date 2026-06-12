@@ -140,28 +140,27 @@ All fields have defaults — partial configs work fine. See [`docs/config.md`](d
 
 ## Distributed integration testing with av-probe
 
-`av-probe` is a diagnostic tool used for validating multi-machine networks running `anta-vista`. It executes a battery of test suites validating Gossip & Direct messaging transport, Name registration & Case-insensitivity/Alias normalization, Semantic Search (mock or real embeddings), and Interactive Trust level states.
+`av-probe` is a diagnostic tool for validating `anta-vista` networks. It runs 13 tests across transport, naming, search, and trust categories.
 
 ### Build
 
 ```bash
-./scripts/build-probe.sh
+cargo build --release -p av-probe
 ```
 
-### Running the Seed Node (Machine A)
+### Multi-machine mode
+
+Run the seed and probe on separate machines, each with their own x0x daemon running.
 
 ```bash
-target/release/av-probe seed --real-model
-```
+# Machine A: Start the seed node
+target/release/av-probe --role seed --real-model
 
-### Running the Probe Node (Machine B)
-
-```bash
-# Auto-detects the seed node via NameClaim broadcast and runs all tests
-target/release/av-probe probe --output markdown
+# Machine B: Auto-detect via gossip broadcast
+target/release/av-probe --role probe --wait 30
 
 # Or specify the seed Agent ID directly
-target/release/av-probe probe --peer <SEED_AGENT_ID>
+target/release/av-probe --role probe --peer <SEED_AGENT_ID>
 ```
 
 ---
