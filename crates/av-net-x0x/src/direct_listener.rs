@@ -57,11 +57,15 @@ pub fn start_direct_listener(
                 } else if line.is_empty() && !data_buf.is_empty() {
                     match parse_direct_event(&data_buf) {
                         Ok(Some(msg)) => {
-                            let _ = tx.send(Ok(msg));
+                            if tx.send(Ok(msg)).is_err() {
+                                break;
+                            }
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            let _ = tx.send(Err(e));
+                            if tx.send(Err(e)).is_err() {
+                                break;
+                            }
                         }
                     }
                     data_buf.clear();

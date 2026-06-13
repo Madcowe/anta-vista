@@ -43,6 +43,8 @@ pub fn run_seed(args: Cli, config: X0xConfig) {
     dispatcher.subscribe_all().expect("Failed to subscribe to gossip topics");
     tracing::info!("Subscribed to gossip topics.");
 
+    announce_identity(&config);
+
     // 6. Broadcast our NameClaims
     broadcast_claims(&dispatcher, &shared_conn);
 
@@ -200,6 +202,17 @@ fn broadcast_claims(dispatcher: &MessageDispatcher, conn: &Mutex<Connection>) {
             tracing::debug!("Broadcasting NameClaim for alias.av");
             let _ = dispatcher.publish_name_claim(record);
         }
+    }
+}
+
+fn announce_identity(config: &X0xConfig) {
+    let result = ureq::post(&format!("{}/announce", config.api_base))
+        .set("Authorization", &format!("Bearer {}", config.token))
+        .send_json(serde_json::json!({}));
+
+    match result {
+        Ok(_) => tracing::info!("Announced seed identity to x0x discovery."),
+        Err(e) => tracing::warn!("Could not announce seed identity to x0x discovery: {}", e),
     }
 }
 

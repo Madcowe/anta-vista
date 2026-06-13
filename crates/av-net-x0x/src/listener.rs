@@ -61,11 +61,15 @@ pub fn start_listener(
                     // End of SSE event — parse it
                     match parse_event(&data_buf) {
                         Ok(Some(event)) => {
-                            let _ = tx.send(Ok(event));
+                            if tx.send(Ok(event)).is_err() {
+                                break;
+                            }
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            let _ = tx.send(Err(e));
+                            if tx.send(Err(e)).is_err() {
+                                break;
+                            }
                         }
                     }
                     data_buf.clear();
