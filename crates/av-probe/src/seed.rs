@@ -222,6 +222,15 @@ fn handle_gossip_event(
     conn: &Mutex<Connection>,
     provider: &dyn EmbeddingProvider,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Deduplicate: x0x fans out one published message to every active
+    // subscription on this daemon.  validate_incoming checks the message_id
+    // against the dispatcher's dedup cache and returns Err(Duplicate) on
+    // repeat deliveries, so we only process each query once.
+    if let Err(e) = dispatcher.validate_incoming(&event.envelope, event.raw_size) {
+        tracing::debug!("Dropping gossip event ({}): {:?}", event.envelope.message_id, e);
+        return Ok(());
+    }
+
     match event.envelope.kind {
         MessageKind::Query => {
             let payload: QueryPayload = serde_json::from_value(event.envelope.payload)?;
@@ -262,7 +271,13 @@ fn handle_gossip_event(
             let name_records: Vec<NameRecord> = results.into_iter().map(|r| r.record).collect();
 
             tracing::info!("Found {} matching name records. Publishing gossip name response...", name_records.len());
-            dispatcher.publish_name_response(&payload.query_id, &payload.normalized_name, name_records)?;
+            dispatcher.publish_name_response(&payload.query_id, &payload.normalized_name, name_records.clone())?;
+
+            // Re-broadcast NameClaim for any matching records so the probe can
+            // observe a fresh NameClaim in response to its query (N1 test).
+            for record in name_records {
+                let _ = dispatcher.publish_name_claim(record);
+            }
         }
         _ => {}
     }
@@ -275,6 +290,17 @@ fn handle_direct_message(
     conn: &Mutex<Connection>,
     provider: &dyn EmbeddingProvider,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Ensure we have a bidirectional QUIC link back to the sender so we can
+    // reply via /direct/send.  connect_agent is idempotent if the link is
+    // already established.
+    if let Err(e) = dispatcher.connect_agent(&msg.sender) {
+        tracing::warn!(
+            "Could not establish return QUIC link to {}: {:?}",
+            msg.sender,
+            e
+        );
+    }
+
     match msg.envelope.kind {
         MessageKind::Query => {
             let payload: QueryPayload = serde_json::from_value(msg.envelope.payload)?;

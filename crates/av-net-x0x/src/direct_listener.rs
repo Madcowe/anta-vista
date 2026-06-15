@@ -55,20 +55,27 @@ pub fn start_direct_listener(
                 if line.starts_with("data: ") {
                     data_buf = line[6..].to_string();
                 } else if line.is_empty() && !data_buf.is_empty() {
+                    tracing::debug!(target: "av_net_x0x::direct_listener", raw = %data_buf, "SSE direct event received");
                     match parse_direct_event(&data_buf) {
                         Ok(Some(msg)) => {
+                            tracing::debug!(target: "av_net_x0x::direct_listener", sender = %msg.sender, kind = ?msg.envelope.kind, "direct message decoded");
                             if tx.send(Ok(msg)).is_err() {
                                 break;
                             }
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            tracing::debug!(target: "av_net_x0x::direct_listener", raw = %data_buf, "SSE direct event skipped (not direct_message type)");
+                        }
                         Err(e) => {
+                            tracing::warn!(target: "av_net_x0x::direct_listener", raw = %data_buf, error = ?e, "SSE direct event parse error");
                             if tx.send(Err(e)).is_err() {
                                 break;
                             }
                         }
                     }
                     data_buf.clear();
+                } else if !line.is_empty() && !line.starts_with("data: ") {
+                    tracing::debug!(target: "av_net_x0x::direct_listener", line = %line, "SSE non-data line");
                 }
             }
         })
@@ -81,14 +88,22 @@ fn parse_direct_event(data: &str) -> NetResult<Option<DirectMessage>> {
     let v: serde_json::Value = serde_json::from_str(data)
         .map_err(|e| NetError::InvalidPayload(format!("direct SSE JSON: {e}")))?;
 
-    // Only process direct_message type events
-    if v["type"].as_str() != Some("direct_message") {
-        return Ok(None);
-    }
+    // x0x /direct/events SSE format (the SSE event type line is "event: direct_message"):
+    //   data: {"machine_id":"...","payload":"<b64>","received_at":<ms_epoch>,"sender":"<hex>","trust_decision":"accept","verified":true}
+    //
+    // The payload field is at the top level (not nested under "data").
+    // There is no "type" field in the data JSON — the event type comes from the
+    // SSE "event:" line, which we don't capture here.  We identify a valid
+    // direct message by the presence of both "sender" and "payload".
 
-    let sender = v["sender"].as_str().unwrap_or("").to_string();
+    let sender = match v["sender"].as_str() {
+        Some(s) => s.to_string(),
+        None => return Ok(None),  // not a direct_message event (e.g. heartbeat)
+    };
+
     let machine_id = v["machine_id"].as_str().unwrap_or("").to_string();
-    let received_at = v["received_at"].as_i64().unwrap_or(0);
+    // received_at is in milliseconds in the x0x API
+    let received_at = v["received_at"].as_i64().unwrap_or(0) / 1000;
 
     let payload_b64 = match v["payload"].as_str() {
         Some(p) => p,

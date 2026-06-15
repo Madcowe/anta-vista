@@ -278,6 +278,9 @@ pub fn test_blocked_trust(
     if let Some(res) = name_results.iter().find(|r| r.record.by_agent_id == *peer_id) {
         // (trust_score + 1.0) / 2.0 = (-1.0 + 1.0) / 2.0 = 0.0
         if (res.trust_score - 0.0).abs() < 0.001 {
+            // 5. Reset trust back to unknown so subsequent runs (and the seed's
+            //    gossip messages) are not blocked by leftover state.
+            reset_daemon_trust(x0x_cfg, peer_id);
             TestResult {
                 test_id: "T6".to_string(),
                 category: "trust".to_string(),
@@ -289,6 +292,7 @@ pub fn test_blocked_trust(
                 debug: serde_json::json!({ "trust_score": res.trust_score }),
             }
         } else {
+            reset_daemon_trust(x0x_cfg, peer_id);
             TestResult {
                 test_id: "T6".to_string(),
                 category: "trust".to_string(),
@@ -301,6 +305,7 @@ pub fn test_blocked_trust(
             }
         }
     } else {
+        reset_daemon_trust(x0x_cfg, peer_id);
         TestResult {
             test_id: "T6".to_string(),
             category: "trust".to_string(),
@@ -328,4 +333,21 @@ fn get_daemon_trust_level(config: &X0xConfig, peer_id: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Reset a peer's trust level to "unknown" in the local x0x daemon.
+///
+/// This is called after T6 (blocked_trust) completes so that the daemon stops
+/// silently dropping gossip messages and direct sends from the seed node.
+/// Without this, every subsequent probe run would fail because x0x drops all
+/// traffic from blocked agents.
+pub fn reset_daemon_trust(config: &X0xConfig, peer_id: &str) {
+    let body = serde_json::json!({ "agent_id": peer_id, "level": "unknown" });
+    match ureq::post(&format!("{}/contacts/trust", config.api_base))
+        .set("Authorization", &format!("Bearer {}", config.token))
+        .send_json(body)
+    {
+        Ok(_) => tracing::info!("Reset trust level to 'unknown' for peer {}", peer_id),
+        Err(e) => tracing::warn!("Failed to reset trust level for peer {}: {}", peer_id, e),
+    }
 }

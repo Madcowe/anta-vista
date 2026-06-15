@@ -105,20 +105,34 @@ pub fn test_direct_delivery(
         };
     }
 
-    // 2. Send direct query
-    let query_id = match dispatcher.send_direct_query(peer_id, "test direct delivery query", 1, args.wait * 1000, vec![]) {
-        Ok(id) => id,
-        Err(e) => {
-            return TestResult {
-                test_id: "T2".to_string(),
-                category: "transport".to_string(),
-                name: "direct_delivery".to_string(),
-                transport: "direct".to_string(),
-                status: TestStatus::Fail,
-                duration_ms: start.elapsed().as_millis() as u64,
-                details: format!("Failed to send direct query: {:?}", e),
-                debug: serde_json::json!({ "error": e.to_string() }),
-            };
+    // 2. Send direct query — retry with backoff to give QUIC time to establish
+    let query_id = {
+        let mut last_err = String::new();
+        let mut result = None;
+        let delays_ms = [0u64, 500, 1000, 2000, 3000];
+        for &delay in &delays_ms {
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            match dispatcher.send_direct_query(peer_id, "test direct delivery query", 1, args.wait * 1000, vec![]) {
+                Ok(id) => { result = Some(id); break; }
+                Err(e) => { last_err = e.to_string(); }
+            }
+        }
+        match result {
+            Some(id) => id,
+            None => {
+                return TestResult {
+                    test_id: "T2".to_string(),
+                    category: "transport".to_string(),
+                    name: "direct_delivery".to_string(),
+                    transport: "direct".to_string(),
+                    status: TestStatus::Fail,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    details: format!("Failed to send direct query after retries: {}", last_err),
+                    debug: serde_json::json!({ "error": last_err }),
+                };
+            }
         }
     };
 

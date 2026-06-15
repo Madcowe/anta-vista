@@ -102,20 +102,37 @@ pub fn test_direct_search(
         }
     };
 
-    // 1. Send direct search query
-    let query_id = match dispatcher.send_direct_query(peer_id, "document about memory safety", 5, args.wait * 1000, vec![]) {
-        Ok(id) => id,
-        Err(e) => {
-            return TestResult {
-                test_id: "S2".to_string(),
-                category: "search".to_string(),
-                name: "direct_search".to_string(),
-                transport: "direct".to_string(),
-                status: TestStatus::Fail,
-                duration_ms: start.elapsed().as_millis() as u64,
-                details: format!("Failed to send direct search query: {:?}", e),
-                debug: serde_json::json!({ "error": e.to_string() }),
-            };
+    // 1. Send direct search query — retry with backoff so QUIC has time to establish
+    let query_id = {
+        let mut last_err = String::new();
+        let mut result = None;
+        let delays_ms = [0u64, 500, 1000, 2000, 3000];
+        if let Err(e) = dispatcher.connect_agent(peer_id) {
+            tracing::debug!("connect_agent before direct search: {:?}", e);
+        }
+        for &delay in &delays_ms {
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            match dispatcher.send_direct_query(peer_id, "document about memory safety", 5, args.wait * 1000, vec![]) {
+                Ok(id) => { result = Some(id); break; }
+                Err(e) => { last_err = e.to_string(); }
+            }
+        }
+        match result {
+            Some(id) => id,
+            None => {
+                return TestResult {
+                    test_id: "S2".to_string(),
+                    category: "search".to_string(),
+                    name: "direct_search".to_string(),
+                    transport: "direct".to_string(),
+                    status: TestStatus::Fail,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    details: format!("Failed to send direct search query: {}", last_err),
+                    debug: serde_json::json!({ "error": last_err }),
+                };
+            }
         }
     };
 

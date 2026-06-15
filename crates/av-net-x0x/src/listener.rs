@@ -59,20 +59,26 @@ pub fn start_listener(
                     data_buf = line[6..].to_string();
                 } else if line.is_empty() && !data_buf.is_empty() {
                     // End of SSE event — parse it
+                    tracing::debug!(target: "av_net_x0x::listener", raw = %data_buf, "SSE gossip event received");
                     match parse_event(&data_buf) {
                         Ok(Some(event)) => {
+                            tracing::debug!(target: "av_net_x0x::listener", topic = %event.topic, kind = ?event.envelope.kind, "gossip event decoded");
                             if tx.send(Ok(event)).is_err() {
                                 break;
                             }
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            tracing::debug!(target: "av_net_x0x::listener", raw = %data_buf, "SSE gossip event had no payload field — dropped");
+                        }
                         Err(e) => {
-                            if tx.send(Err(e)).is_err() {
-                                break;
-                            }
+                            tracing::debug!(target: "av_net_x0x::listener", raw = %data_buf, error = ?e, "SSE gossip event not an av envelope — skipped");
+                            // Don't forward parse errors for foreign-app payloads to
+                            // the channel — they are expected noise on a shared daemon.
                         }
                     }
                     data_buf.clear();
+                } else if !line.is_empty() && !line.starts_with("data: ") {
+                    tracing::debug!(target: "av_net_x0x::listener", line = %line, "SSE non-data line");
                 }
             }
         })
@@ -86,9 +92,20 @@ fn parse_event(data: &str) -> NetResult<Option<IncomingEvent>> {
     let v: serde_json::Value = serde_json::from_str(data)
         .map_err(|e| NetError::InvalidPayload(format!("SSE JSON: {e}")))?;
 
-    let topic = v["topic"].as_str().unwrap_or("").to_string();
-    let origin = v["origin"].as_str().unwrap_or("").to_string();
-    let payload_b64 = match v["payload"].as_str() {
+    // x0x SSE format (REST /events):
+    //   {"type":"message","data":{"payload":"<b64>","sender":"<hex>","topic":"...","trust_level":"...","verified":true}}
+    // We only handle type=="message" events; others (heartbeat, etc.) are skipped.
+    if v["type"].as_str() != Some("message") {
+        return Ok(None);
+    }
+
+    let inner = &v["data"];
+
+    let topic = inner["topic"].as_str().unwrap_or("").to_string();
+    // x0x uses "sender" for the originating agent ID; map to our "origin" field.
+    let origin = inner["sender"].as_str().unwrap_or("").to_string();
+
+    let payload_b64 = match inner["payload"].as_str() {
         Some(p) => p,
         None => return Ok(None),
     };

@@ -8,7 +8,7 @@ use av_core::types::MessageKind;
 
 pub fn test_gossip_name_claim(
     args: &Cli,
-    _dispatcher: &MessageDispatcher,
+    dispatcher: &MessageDispatcher,
     hub: &MessageHub,
 ) -> TestResult {
     let start = Instant::now();
@@ -28,7 +28,12 @@ pub fn test_gossip_name_claim(
         }
     };
 
-    // 1. Wait for name claim broadcast from the seed node
+    // Publish a name query for "seed.av" to prompt the seed to immediately
+    // re-broadcast its NameClaim rather than waiting up to 10 s for the next
+    // periodic tick.
+    let _ = dispatcher.publish_name_query("seed.av", None, 1, args.wait * 1000);
+
+    // Wait for the NameClaim broadcast from the seed node.
     let timeout = Duration::from_secs(args.wait);
     let matched = hub.wait_for_gossip(timeout, |event| {
         if event.envelope.kind == MessageKind::NameClaim && &event.envelope.from_agent_id == peer_id {

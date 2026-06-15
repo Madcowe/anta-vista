@@ -15,7 +15,7 @@ pub fn run() {
     let filter = if args.verbose {
         "debug,av_probe=debug,av_net_x0x=debug"
     } else {
-        "info,av_probe=info"
+        "info,av_probe=info,av_net_x0x=info"
     };
     
     let _ = tracing_subscriber::fmt()
