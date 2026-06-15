@@ -108,19 +108,21 @@ impl NetworkClient for X0xNetClient {
         let json_bytes = serde_json::to_vec(envelope)?;
         let payload_b64 = BASE64.encode(&json_bytes);
         let body = json!({ "topic": topic, "payload": payload_b64 });
-        ureq::post(&format!("{}/publish", self.config.api_base))
+        let resp = ureq::post(&format!("{}/publish", self.config.api_base))
             .set("Authorization", &format!("Bearer {}", self.config.token))
             .send_json(body)
             .map_err(|e| NetError::Http(e.to_string()))?;
+        tracing::debug!(target: "av_net_x0x::client", topic = %topic, status = %resp.status(), "publish ok");
         Ok(())
     }
 
     fn subscribe(&self, topic: &str) -> NetResult<()> {
         let body = json!({ "topic": topic });
-        ureq::post(&format!("{}/subscribe", self.config.api_base))
+        let resp = ureq::post(&format!("{}/subscribe", self.config.api_base))
             .set("Authorization", &format!("Bearer {}", self.config.token))
             .send_json(body)
             .map_err(|e| NetError::Http(e.to_string()))?;
+        tracing::debug!(target: "av_net_x0x::client", topic = %topic, status = %resp.status(), "subscribe ok");
         Ok(())
     }
 
@@ -130,10 +132,11 @@ impl NetworkClient for X0xNetClient {
 
     fn connect_agent(&self, agent_id: &str) -> NetResult<()> {
         let body = serde_json::json!({ "agent_id": agent_id });
-        ureq::post(&format!("{}/agents/connect", self.config.api_base))
+        let resp = ureq::post(&format!("{}/agents/connect", self.config.api_base))
             .set("Authorization", &format!("Bearer {}", self.config.token))
             .send_json(body)
             .map_err(|e| NetError::Http(e.to_string()))?;
+        tracing::debug!(target: "av_net_x0x::client", agent_id = %agent_id, status = %resp.status(), "connect_agent ok");
         Ok(())
     }
 
@@ -141,10 +144,12 @@ impl NetworkClient for X0xNetClient {
         let json_bytes = serde_json::to_vec(envelope)?;
         let payload_b64 = BASE64.encode(&json_bytes);
         let body = serde_json::json!({ "agent_id": to_agent_id, "payload": payload_b64 });
-        ureq::post(&format!("{}/direct/send", self.config.api_base))
+        tracing::debug!(target: "av_net_x0x::client", to = %to_agent_id, kind = ?envelope.kind, "send_direct attempt");
+        let resp = ureq::post(&format!("{}/direct/send", self.config.api_base))
             .set("Authorization", &format!("Bearer {}", self.config.token))
             .send_json(body)
             .map_err(|e| NetError::Http(e.to_string()))?;
+        tracing::debug!(target: "av_net_x0x::client", to = %to_agent_id, status = %resp.status(), "send_direct ok");
         Ok(())
     }
 }
