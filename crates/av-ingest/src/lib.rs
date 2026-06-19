@@ -2,6 +2,7 @@ pub mod describe;
 pub mod error;
 pub mod filename;
 pub mod ingest;
+pub mod location;
 pub mod metadata;
 pub mod mime;
 

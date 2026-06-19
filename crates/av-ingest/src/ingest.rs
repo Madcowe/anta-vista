@@ -1,6 +1,7 @@
 use crate::{
     describe::synthesize,
     error::IngestResult,
+    location::analyze_location,
     metadata::extract,
     mime::{canonicalize_mime, detect_mime, mime_major},
 };
@@ -21,20 +22,15 @@ pub fn ingest_bytes(
 
     let kind = kind_from_mime(&mime);
 
-    // Extract scheme if present (i.e. location contains "://")
-    let location_scheme = if location.contains("://") {
-        Some(av_core::types::normalize_scheme(
-            location.splitn(2, "://").next().unwrap_or(""),
-        ))
-    } else {
-        None
-    };
-
-    let location_canonical = location_scheme.as_deref().map(|_| location.to_string());
+    let location_info = analyze_location(location);
+    let location_scheme = location_info.scheme;
+    let location_canonical = location_info.canonical;
+    let inferred_filename = location_info.inferred_filename;
+    let effective_filename = filename.or(inferred_filename.as_deref());
 
     let meta = extract(bytes, &mime);
 
-    let description_text = synthesize(&mime, filename, &meta);
+    let description_text = synthesize(&mime, effective_filename, &meta);
 
     // Build metadata JSON
     let metadata_json = meta.extra.clone();
@@ -58,7 +54,7 @@ pub fn ingest_bytes(
         location_scheme,
         location_canonical,
         mime_type: mime,
-        filename: filename.map(|f| f.to_string()),
+        filename: effective_filename.map(|f| f.to_string()),
         metadata_json,
         description_text,
         created_at,

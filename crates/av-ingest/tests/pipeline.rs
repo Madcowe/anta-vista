@@ -168,6 +168,96 @@ fn test_ingest_bytes_no_location_scheme() {
 }
 
 #[test]
+fn test_ingest_infers_ant_path_filename() {
+    let location =
+        "ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a/lucky.jpg";
+    let resource = ingest_bytes(MINIMAL_JPEG, None, location).unwrap();
+    assert_eq!(resource.location_scheme.as_deref(), Some("ant"));
+    assert_eq!(
+        resource.location_canonical.as_deref(),
+        Some("ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a")
+    );
+    assert_eq!(resource.filename.as_deref(), Some("lucky.jpg"));
+    assert_eq!(
+        resource.description_text,
+        "a lucky image file in jpeg format"
+    );
+}
+
+#[test]
+fn test_ingest_infers_ant_query_name_filename() {
+    let location =
+        "ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a?name=lucky.jpg";
+    let resource = ingest_bytes(MINIMAL_JPEG, None, location).unwrap();
+    assert_eq!(resource.filename.as_deref(), Some("lucky.jpg"));
+    assert_eq!(
+        resource.location_canonical.as_deref(),
+        Some("ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a")
+    );
+}
+
+#[test]
+fn test_ingest_infers_autonomi_query_name_filename() {
+    let location = "autonomi://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a?name=lucky.jpg";
+    let resource = ingest_bytes(MINIMAL_JPEG, None, location).unwrap();
+    assert_eq!(resource.location_scheme.as_deref(), Some("ant"));
+    assert_eq!(resource.filename.as_deref(), Some("lucky.jpg"));
+    assert_eq!(
+        resource.location_canonical.as_deref(),
+        Some("ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a")
+    );
+}
+
+#[test]
+fn test_ingest_explicit_filename_overrides_uri_hint() {
+    let location =
+        "ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a?name=lucky.jpg";
+    let resource = ingest_bytes(MINIMAL_JPEG, Some("chosen.jpg"), location).unwrap();
+    assert_eq!(resource.filename.as_deref(), Some("chosen.jpg"));
+    assert_eq!(
+        resource.description_text,
+        "a chosen image file in jpeg format"
+    );
+}
+
+#[test]
+fn test_ingest_ant_path_filename_overrides_query_name() {
+    let location = "ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a/path.jpg?name=query.jpg";
+    let resource = ingest_bytes(MINIMAL_JPEG, None, location).unwrap();
+    assert_eq!(resource.filename.as_deref(), Some("path.jpg"));
+}
+
+#[test]
+fn test_ingest_ignores_empty_or_unsafe_query_name() {
+    let empty = ingest_bytes(
+        MINIMAL_JPEG,
+        None,
+        "ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a?name=",
+    )
+    .unwrap();
+    assert_eq!(empty.filename, None);
+
+    let unsafe_name = ingest_bytes(
+        MINIMAL_JPEG,
+        None,
+        "ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a?name=../secret.jpg",
+    )
+    .unwrap();
+    assert_eq!(unsafe_name.filename, None);
+}
+
+#[test]
+fn test_ingest_non_ant_location_does_not_infer_filename() {
+    let resource = ingest_bytes(MINIMAL_JPEG, None, "https://example.com/lucky.jpg").unwrap();
+    assert_eq!(resource.location_scheme.as_deref(), Some("https"));
+    assert_eq!(resource.filename, None);
+    assert_eq!(
+        resource.location_canonical.as_deref(),
+        Some("https://example.com/lucky.jpg")
+    );
+}
+
+#[test]
 fn test_ingest_sha256_deterministic() {
     let r1 = ingest_bytes(MINIMAL_JPEG, Some("a.jpg"), "file:///a.jpg").unwrap();
     let r2 = ingest_bytes(MINIMAL_JPEG, Some("b.jpg"), "file:///b.jpg").unwrap();
