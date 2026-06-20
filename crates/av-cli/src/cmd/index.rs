@@ -1,0 +1,223 @@
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use av_core::types::EmbeddingRecord;
+use av_embed::minilm::MiniLmProvider;
+use av_embed::provider::{profile_id, EmbeddingProvider};
+use av_ingest::ingest::ingest_bytes;
+use av_net_x0x::client::X0xNetClient;
+use av_net_x0x::dispatcher::MessageDispatcher;
+use av_net_x0x::payloads::ResourceResult;
+use dialoguer::Input;
+use indicatif::{ProgressBar, ProgressStyle};
+use serde_json::json;
+
+use crate::cmd::{CliError, CliResult};
+use crate::download::{download_content, verify_uri_exists};
+use crate::output::print_output;
+use crate::startup::StartupState;
+
+pub fn run(
+    cli: crate::Cli,
+    state: StartupState,
+    uri: String,
+    tags: Option<String>,
+    no_download: bool,
+    no_verify: bool,
+    force: bool,
+) -> CliResult<()> {
+    let db_path = av_core::paths::db_path()
+        .ok_or_else(|| CliError::Database("Failed to determine database path".to_string()))?;
+    let conn = av_store::open(&db_path).map_err(|e| CliError::Database(e.to_string()))?;
+
+    // --- Step 1: Verify URI (unless skipped) --------------------------------
+    if !no_verify {
+        if let Err(e) = verify_uri_exists(&uri) {
+            return Err(CliError::Network(format!("URI unreachable: {}", e)));
+        }
+    }
+
+    // --- Step 2: Download content (unless skipped) --------------------------
+    let bytes = if no_download {
+        // Use the URI as a 1-byte placeholder so ingest can derive location info
+        uri.as_bytes().to_vec()
+    } else {
+        let pb = if !cli.non_interactive {
+            let bar = ProgressBar::new_spinner();
+            bar.set_style(
+                ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+                    .unwrap()
+                    .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+            );
+            bar.set_message("Downloading...");
+            bar.enable_steady_tick(std::time::Duration::from_millis(80));
+            Some(bar)
+        } else {
+            None
+        };
+
+        let data = download_content(&uri)?;
+
+        if let Some(bar) = pb {
+            bar.finish_with_message(format!("Downloaded ({} KB)", data.len() / 1024));
+        }
+        data
+    };
+
+    // --- Step 3: Ingest and build ResourceDescriptor ------------------------
+    let mut resource =
+        ingest_bytes(&bytes, None, &uri).map_err(|e| CliError::Ingest(e.to_string()))?;
+
+    // Append tags to description if provided
+    let effective_tags: Vec<String> = if let Some(ref t) = tags {
+        t.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else if !cli.non_interactive {
+        // Interactive: prompt for tags
+        let raw: String = Input::new()
+            .with_prompt("Tags (comma-separated, or Enter to skip)")
+            .allow_empty(true)
+            .interact_text()
+            .map_err(|e| CliError::Other(e.to_string()))?;
+        raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        vec![]
+    };
+
+    if !effective_tags.is_empty() {
+        let tag_str = effective_tags.join(", ");
+        resource.description_text = format!("{} tagged as: {}", resource.description_text, tag_str);
+    }
+
+    // --- Step 4: Check for duplicate ----------------------------------------
+    let existing = av_store::repo::resources::get(&conn, &resource.id)
+        .map_err(|e| CliError::Database(e.to_string()))?;
+
+    if existing.is_some() && !force {
+        let output_json = json!({
+            "ok": true,
+            "resource_id": resource.id,
+            "location": uri,
+            "mime_type": resource.mime_type,
+            "kind": format!("{:?}", resource.kind),
+            "duplicate": true,
+            "skipped": true,
+        });
+
+        print_output(
+            cli.non_interactive,
+            || {
+                println!(
+                    "  {} Resource already indexed (use --force to re-index)",
+                    console::style("~").yellow()
+                );
+                println!("  resource_id: {}", &resource.id[..16]);
+            },
+            &output_json,
+        );
+        return Ok(());
+    }
+
+    // --- Step 5: Embed -------------------------------------------------------
+    let provider = MiniLmProvider::new().map_err(|e| CliError::Model(e.to_string()))?;
+
+    let vector = provider
+        .embed_text(&resource.description_text)
+        .map_err(|e| CliError::Model(e.to_string()))?;
+
+    let pid = profile_id(provider.profile());
+    let l2_norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    let embedding = EmbeddingRecord {
+        resource_id: resource.id.clone(),
+        profile_id: pid.clone(),
+        vector,
+        l2_norm,
+        created_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    };
+
+    // --- Step 6: Store locally -----------------------------------------------
+    av_store::repo::resources::insert(&conn, &resource)
+        .map_err(|e| CliError::Database(e.to_string()))?;
+    av_store::repo::embeddings::insert_profile(&conn, &pid, provider.profile())
+        .map_err(|e| CliError::Database(e.to_string()))?;
+    av_store::repo::embeddings::insert(&conn, &embedding)
+        .map_err(|e| CliError::Database(e.to_string()))?;
+
+    // --- Step 7: Broadcast via network if x0x is running --------------------
+    let broadcast = if let Some(ref x0x_cfg) = state.x0x_config {
+        let net_client = Arc::new(X0xNetClient::new(x0x_cfg.clone()));
+        let dispatcher = MessageDispatcher::new(net_client);
+
+        let result_payload = ResourceResult {
+            resource_id: resource.id.clone(),
+            location: resource.location.clone(),
+            location_scheme: resource.location_scheme.clone(),
+            description_text: resource.description_text.clone(),
+            mime_type: resource.mime_type.clone(),
+            score: 1.0, // freshly indexed, high confidence
+        };
+
+        // Publish as a response with no query_id — acts as an announcement
+        match dispatcher.publish_response("av-index-announce", vec![result_payload]) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("Failed to broadcast indexed resource: {}", e);
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    // --- Output --------------------------------------------------------------
+    let output_json = json!({
+        "ok": true,
+        "resource_id": resource.id,
+        "location": uri,
+        "mime_type": resource.mime_type,
+        "kind": format!("{:?}", resource.kind),
+        "description": resource.description_text,
+        "embedding_dim": embedding.vector.len(),
+        "duplicate": false,
+        "broadcast": broadcast,
+    });
+
+    print_output(
+        cli.non_interactive,
+        || {
+            println!("Indexing: {}", console::style(&uri).cyan().bold());
+            println!(
+                "  {} Detected: {}",
+                console::style("✓").green(),
+                resource.mime_type
+            );
+            println!(
+                "  {} Description: \"{}\"",
+                console::style("✓").green(),
+                resource.description_text
+            );
+            println!(
+                "  {} Embedded ({} dimensions)",
+                console::style("✓").green(),
+                embedding.vector.len()
+            );
+            println!("  {} Stored locally", console::style("✓").green());
+            if broadcast {
+                println!("  {} Broadcast to network", console::style("✓").green());
+            }
+            println!("\n  resource_id: {}", resource.id);
+        },
+        &output_json,
+    );
+
+    Ok(())
+}

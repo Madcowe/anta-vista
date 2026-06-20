@@ -24,6 +24,9 @@ pub fn cache_dir() -> Option<PathBuf> {
 
 /// Returns the path to the main SQLite database file.
 pub fn db_path() -> Option<PathBuf> {
+    if let Ok(env_path) = std::env::var("ANTA_VISTA_DB_PATH") {
+        return Some(PathBuf::from(env_path));
+    }
     data_dir().map(|d| d.join("anta-vista.db"))
 }
 

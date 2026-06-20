@@ -1,0 +1,33 @@
+[package]
+name = "av-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "av"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+av-core = { workspace = true }
+av-store = { workspace = true }
+av-embed = { workspace = true }
+av-ingest = { workspace = true }
+av-index = { workspace = true }
+av-trust = { workspace = true }
+av-query = { workspace = true }
+av-net-x0x = { workspace = true }
+ureq = { version = "2" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dialoguer = { workspace = true }
+indicatif = { workspace = true }
+console = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+directories = { workspace = true }
+base64 = { workspace = true }
+rusqlite = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
