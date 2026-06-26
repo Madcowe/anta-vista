@@ -65,6 +65,12 @@ pub fn execute_search(
         let net_client = Arc::new(X0xNetClient::new(x0x_cfg.clone()));
         let dispatcher = MessageDispatcher::new(net_client.clone());
 
+        // Subscribe to all anta-vista gossip topics BEFORE opening the SSE listener
+        // so the daemon is already a member of those topics when we start listening.
+        dispatcher
+            .subscribe_all()
+            .map_err(|e| CliError::Network(e.to_string()))?;
+
         // Start background listeners
         let gossip_rx =
             av_net_x0x::listener::start_listener(x0x_cfg.api_base.clone(), x0x_cfg.token.clone())
@@ -177,6 +183,11 @@ pub fn execute_resolve(
     if let Some(ref x0x_cfg) = state.x0x_config {
         let net_client = Arc::new(X0xNetClient::new(x0x_cfg.clone()));
         let dispatcher = MessageDispatcher::new(net_client.clone());
+
+        // Subscribe to all anta-vista gossip topics BEFORE opening the SSE listener.
+        dispatcher
+            .subscribe_all()
+            .map_err(|e| CliError::Network(e.to_string()))?;
 
         // Start background listeners
         let gossip_rx =

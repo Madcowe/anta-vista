@@ -115,6 +115,8 @@ pub fn run(
     let broadcast = if let Some(ref x0x_cfg) = state.x0x_config {
         let net_client = Arc::new(X0xNetClient::new(x0x_cfg.clone()));
         let dispatcher = MessageDispatcher::new(net_client);
+        // Subscribe to name topics so we receive any conflicting claims in return.
+        let _ = dispatcher.subscribe_all();
         match dispatcher.publish_name_claim(record.clone()) {
             Ok(()) => true,
             Err(e) => {

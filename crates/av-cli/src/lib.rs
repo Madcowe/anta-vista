@@ -132,4 +132,13 @@ pub enum Commands {
         #[arg(long, help = "Skip confirmation prompt (for scripting)")]
         no_confirm: bool,
     },
+
+    #[command(about = "Listen for and respond to network queries from peers")]
+    Listen {
+        #[arg(
+            long,
+            help = "Stop after this many seconds (omit to run until Ctrl-C)"
+        )]
+        run_for: Option<u64>,
+    },
 }

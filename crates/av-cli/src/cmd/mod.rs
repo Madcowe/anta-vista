@@ -2,6 +2,7 @@ use crate::{Cli, Commands};
 use thiserror::Error;
 
 pub mod index;
+pub mod listen;
 pub mod name;
 pub mod purge;
 pub mod rate;
@@ -131,5 +132,6 @@ pub fn run(cli: Cli) -> CliResult<()> {
             *cache,
             *no_confirm,
         ),
+        Commands::Listen { run_for } => listen::run(startup_state, *run_for),
     }
 }

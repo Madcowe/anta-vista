@@ -49,7 +49,13 @@ impl X0xConfig {
             .map_err(|e| NetError::DaemonUnreachable(format!("api.port: {e}")))?;
         let token = std::fs::read_to_string(data_dir.join("api-token"))
             .map_err(|e| NetError::DaemonUnreachable(format!("api-token: {e}")))?;
-        let api_base = format!("http://{}", port_str.trim());
+        // api.port may contain "127.0.0.1:12700" or just "12700" — handle both.
+        let port_trimmed = port_str.trim();
+        let api_base = if port_trimmed.contains(':') {
+            format!("http://{}", port_trimmed)
+        } else {
+            format!("http://127.0.0.1:{}", port_trimmed)
+        };
         // Fetch agent id from daemon
         let agent_id = fetch_agent_id(&api_base, token.trim())?;
         Ok(Self {

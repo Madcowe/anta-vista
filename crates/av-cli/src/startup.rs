@@ -111,6 +111,7 @@ fn enforce_dependencies(cli: &crate::Cli, state: &StartupState) -> CliResult<()>
     let needs_x0x = match cli.command {
         crate::Commands::Status => false,
         crate::Commands::Purge { .. } => false, // purge can run offline on local DB
+        crate::Commands::Listen { .. } => false, // listen checks x0x itself with a clear error
         _ => true,
     };
 
