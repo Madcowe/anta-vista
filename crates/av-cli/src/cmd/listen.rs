@@ -71,6 +71,9 @@ pub fn run(state: StartupState, run_for_secs: Option<u64>) -> CliResult<()> {
         println!("  Press Ctrl-C to stop.");
     }
 
+    // Register our PID so other av commands and `av status` can detect us.
+    crate::listener::write_pid(std::process::id());
+
     loop {
         // Honour optional runtime limit.
         if let Some(dl) = deadline {
@@ -135,6 +138,8 @@ pub fn run(state: StartupState, run_for_secs: Option<u64>) -> CliResult<()> {
         }
     }
 
+    // Clean up PID file on graceful exit (run_for timeout).
+    crate::listener::clear_pid();
     Ok(())
 }
 

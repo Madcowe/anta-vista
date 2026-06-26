@@ -12,6 +12,7 @@ pub struct StartupState {
     pub x0x_config: Option<X0xConfig>,
     pub antd_running: bool,
     pub minilm_loaded: bool,
+    pub listener_running: bool,
 }
 
 pub fn run_startup_checks(cli: &crate::Cli) -> CliResult<StartupState> {
@@ -42,12 +43,29 @@ pub fn run_startup_checks(cli: &crate::Cli) -> CliResult<StartupState> {
     // Let's check if the model is cached locally, or check if we can run it.
     let minilm_loaded = check_minilm_cached();
 
+    // 5. Ensure the background listener is running whenever x0x is available and
+    //    the current command is one that benefits from peer responses.  We skip
+    //    this for Status (read-only), Purge (offline), and Listen itself (it IS
+    //    the listener — starting another would be redundant).
+    let needs_listener = x0x_config.is_some() && match cli.command {
+        crate::Commands::Status => false,
+        crate::Commands::Purge { .. } => false,
+        crate::Commands::Listen { .. } => false,
+        _ => true,
+    };
+    let listener_running = if needs_listener {
+        crate::listener::ensure_running()
+    } else {
+        crate::listener::is_running()
+    };
+
     let state = StartupState {
         config,
         config_path,
         x0x_config,
         antd_running,
         minilm_loaded,
+        listener_running,
     };
 
     // 5. Handle missing dependencies based on interactive/non-interactive mode

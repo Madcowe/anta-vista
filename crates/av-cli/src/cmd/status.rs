@@ -47,6 +47,12 @@ pub fn run(cli: crate::Cli, state: StartupState) -> CliResult<()> {
             "agent_id": state.x0x_config.as_ref().map(|c| c.agent_id.clone()).unwrap_or_else(|| "".to_string()),
             "api": state.x0x_config.as_ref().map(|c| c.api_base.clone()).unwrap_or_else(|| "".to_string()),
         },
+        "av_listener": {
+            "running": state.listener_running,
+            "pid": crate::listener::pid_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|s| s.trim().parse::<u32>().ok()),
+        },
         "ant_daemon": {
             "running": state.antd_running,
             "network": ant_network,
@@ -78,6 +84,21 @@ pub fn run(cli: crate::Cli, state: StartupState) -> CliResult<()> {
                 );
             } else {
                 println!("  x0x daemon:  {} offline", console::style("x").red());
+            }
+
+            if state.listener_running {
+                let pid = crate::listener::pid_path()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .map(|p| format!(" (pid: {p})"))
+                    .unwrap_or_default();
+                println!(
+                    "  av listener: {} running{}",
+                    console::style("✓").green(),
+                    pid
+                );
+            } else {
+                println!("  av listener: {} not running", console::style("x").red());
             }
 
             if state.antd_running {

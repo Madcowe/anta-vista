@@ -192,6 +192,7 @@ dependencies = [
  "dialoguer",
  "directories",
  "indicatif",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
