@@ -1,9 +1,0 @@
-- Search always seem to return everything irrespective of the search term...should we set a mimimum score for things to appear?
-	- IF so could you recomend one that would likely be a good cutoof and case we also a add an optional parameter that could set it.
-- For downloading autonomi files using the autonomi-developer skill can we modify so it check if either the ant daemon is running or the
-ant cli program is present and use which ever...if neither is present offer to download the ant cli program automatically or if not possile offer intructions of how to do so.
-- I have indexed three websites 
-https://x0x.md/
-https://autonomi.com/
-https://gogglevox.blogspot.com/
-however the ordering of the results is odd if I search for gogglevox...the x0x and autonomi site get rated higher even though they don't mention it can we look at to improve the scoring alogrithm for that type of thing

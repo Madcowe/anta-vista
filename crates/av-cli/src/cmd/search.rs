@@ -30,12 +30,11 @@ pub fn run(
     let clustered = cluster_responses(&res.network_results);
     let use_clustering = needs_clustering(state.x0x_config.as_ref().map(|_| 1).unwrap_or(0), 3);
 
-    // Build the output results list: local results first, then clustered network
-    // Build JSON results array
-    let mut results_json = Vec::new();
+    // Merge local and clustered network results, sorted by score descending
+    let mut all_results: Vec<serde_json::Value> = Vec::new();
 
     for r in &res.local_results {
-        results_json.push(json!({
+        all_results.push(json!({
             "resource_id": r.resource.id,
             "location": r.resource.location,
             "description": r.resource.description_text,
@@ -53,7 +52,6 @@ pub fn run(
     }
 
     for c in &clustered {
-        // Skip if already in local results
         if res
             .local_results
             .iter()
@@ -61,7 +59,7 @@ pub fn run(
         {
             continue;
         }
-        results_json.push(json!({
+        all_results.push(json!({
             "resource_id": c.result.resource_id,
             "location": c.result.location,
             "description": c.result.description_text,
@@ -71,17 +69,25 @@ pub fn run(
         }));
     }
 
+    all_results.sort_by(|a, b| {
+        let a_score = a["score"].as_f64().unwrap_or(0.0);
+        let b_score = b["score"].as_f64().unwrap_or(0.0);
+        b_score
+            .partial_cmp(&a_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     let output_json = json!({
         "query": query,
-        "results": results_json,
-        "total": results_json.len(),
+        "results": all_results,
+        "total": all_results.len(),
         "clustering_active": use_clustering,
     });
 
     print_output(
         cli.non_interactive,
         || {
-            if results_json.is_empty() {
+            if all_results.is_empty() {
                 println!("No results found for: {}", console::style(&query).cyan());
                 return;
             }
@@ -91,48 +97,45 @@ pub fn run(
                 console::style(&query).cyan().bold()
             );
 
-            let mut rank = 1usize;
+            for (rank, result) in all_results.iter().enumerate() {
+                let score = result["score"].as_f64().unwrap_or(0.0);
+                let location = result["location"].as_str().unwrap_or("");
+                let description = result["description"].as_str().unwrap_or("");
+                let resource_id = result["resource_id"].as_str().unwrap_or("");
+                let source = result["source"].as_str().unwrap_or("");
 
-            for r in &res.local_results {
-                println!(
-                    "  {}. [{}] {} (score: {:.3})",
-                    rank,
-                    console::style("local").dim(),
-                    console::style(&r.resource.location).green(),
-                    r.score,
-                );
-                println!(
-                    "     {} [{}]",
-                    r.resource.description_text, r.resource.mime_type
-                );
-                println!("     resource_id: {}", &r.resource.id[..16]);
-                println!();
-                rank += 1;
-            }
-
-            for c in &clustered {
-                if res
-                    .local_results
-                    .iter()
-                    .any(|lr| lr.resource.id == c.result.resource_id)
-                {
-                    continue;
+                match source {
+                    "local" => {
+                        let mime_type = result["mime_type"].as_str().unwrap_or("");
+                        println!(
+                            "  {}. [{}] {} (score: {:.3})",
+                            rank + 1,
+                            console::style("local").dim(),
+                            console::style(location).green(),
+                            score,
+                        );
+                        println!("     {} [{}]", description, mime_type);
+                        println!("     resource_id: {}", &resource_id[..resource_id.len().min(16)]);
+                    }
+                    "network" => {
+                        let agreement_count = result["agreement_count"].as_u64().unwrap_or(0);
+                        println!(
+                            "  {}. [{}] {} (score: {:.3}, agreed by {} peers)",
+                            rank + 1,
+                            console::style("network").blue(),
+                            console::style(location).green(),
+                            score,
+                            agreement_count,
+                        );
+                        println!("     {}", description);
+                        println!(
+                            "     resource_id: {}",
+                            &resource_id[..resource_id.len().min(16)]
+                        );
+                    }
+                    _ => {}
                 }
-                println!(
-                    "  {}. [{}] {} (score: {:.3}, agreed by {} peers)",
-                    rank,
-                    console::style("network").blue(),
-                    console::style(&c.result.location).green(),
-                    c.avg_score,
-                    c.agreement_count,
-                );
-                println!("     {}", c.result.description_text);
-                println!(
-                    "     resource_id: {}",
-                    &c.result.resource_id[..16.min(c.result.resource_id.len())]
-                );
                 println!();
-                rank += 1;
             }
         },
         &output_json,
