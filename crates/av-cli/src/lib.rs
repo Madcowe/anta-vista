@@ -11,7 +11,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "av", version, about = "Anta-Vista CLI Client")]
 pub struct Cli {
-    #[arg(long, help = "Machine mode: JSON output, no prompts")]
+    #[arg(long, global = true, help = "Machine mode: JSON output, no prompts")]
     pub non_interactive: bool,
 
     #[arg(long, help = "Path to config.toml")]

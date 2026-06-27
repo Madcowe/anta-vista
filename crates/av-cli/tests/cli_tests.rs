@@ -13,7 +13,8 @@ fn test_cli_status_command() {
     let _guard = ENV_LOCK.lock().unwrap();
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("test_anta_vista.db");
-    std::env::set_var("ANTA_VISTA_DB_PATH", &db_path);
+    // SAFETY: tests are single-threaded (Mutex-guarded), so env var access is safe
+    unsafe { std::env::set_var("ANTA_VISTA_DB_PATH", &db_path) };
 
     // Open connection to initialize schema
     let conn = av_store::open(&db_path).unwrap();
@@ -49,6 +50,7 @@ fn test_cli_status_command() {
         x0x_config: None,
         antd_running: false,
         minilm_loaded: true,
+        listener_running: false,
     };
 
     // We capture stdout to inspect JSON output
@@ -56,7 +58,8 @@ fn test_cli_status_command() {
     let res = av_cli::cmd::status::run(cli, startup_state);
     assert!(res.is_ok());
 
-    std::env::remove_var("ANTA_VISTA_DB_PATH");
+    // SAFETY: tests are single-threaded (Mutex-guarded), so env var access is safe
+    unsafe { std::env::remove_var("ANTA_VISTA_DB_PATH") };
 }
 
 #[test]
@@ -64,7 +67,8 @@ fn test_cli_purge_command() {
     let _guard = ENV_LOCK.lock().unwrap();
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("test_anta_vista.db");
-    std::env::set_var("ANTA_VISTA_DB_PATH", &db_path);
+    // SAFETY: tests are single-threaded (Mutex-guarded), so env var access is safe
+    unsafe { std::env::set_var("ANTA_VISTA_DB_PATH", &db_path) };
 
     let conn = av_store::open(&db_path).unwrap();
 
@@ -103,6 +107,7 @@ fn test_cli_purge_command() {
         x0x_config: None,
         antd_running: false,
         minilm_loaded: true,
+        listener_running: false,
     };
 
     let res = av_cli::cmd::purge::run(
@@ -121,7 +126,8 @@ fn test_cli_purge_command() {
     let fetched = av_store::repo::resources::get(&conn2, "test-res").unwrap();
     assert!(fetched.is_none());
 
-    std::env::remove_var("ANTA_VISTA_DB_PATH");
+    // SAFETY: tests are single-threaded (Mutex-guarded), so env var access is safe
+    unsafe { std::env::remove_var("ANTA_VISTA_DB_PATH") };
 }
 
 #[test]
@@ -129,7 +135,8 @@ fn test_cli_purge_resource_removes_related_rows() {
     let _guard = ENV_LOCK.lock().unwrap();
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("test_anta_vista.db");
-    std::env::set_var("ANTA_VISTA_DB_PATH", &db_path);
+    // SAFETY: tests are single-threaded (Mutex-guarded), so env var access is safe
+    unsafe { std::env::set_var("ANTA_VISTA_DB_PATH", &db_path) };
 
     let conn = av_store::open(&db_path).unwrap();
     let rd = ResourceDescriptor {
@@ -200,6 +207,7 @@ fn test_cli_purge_resource_removes_related_rows() {
         x0x_config: None,
         antd_running: false,
         minilm_loaded: true,
+        listener_running: false,
     };
 
     av_cli::cmd::purge::run(
@@ -228,5 +236,6 @@ fn test_cli_purge_resource_removes_related_rows() {
             .is_empty()
     );
 
-    std::env::remove_var("ANTA_VISTA_DB_PATH");
+    // SAFETY: tests are single-threaded (Mutex-guarded), so env var access is safe
+    unsafe { std::env::remove_var("ANTA_VISTA_DB_PATH") };
 }
