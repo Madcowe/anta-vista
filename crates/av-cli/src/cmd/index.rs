@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,14 +9,14 @@ use av_ingest::ingest::ingest_bytes;
 use av_net_x0x::client::X0xNetClient;
 use av_net_x0x::dispatcher::MessageDispatcher;
 use av_net_x0x::payloads::ResourceResult;
-use dialoguer::Input;
+use dialoguer::{Confirm, Input};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 
 use crate::cmd::{CliError, CliResult};
-use crate::download::{download_content, verify_uri_exists};
+use crate::download::{download_content, verify_uri_exists, DownloadEvent};
 use crate::output::print_output;
-use crate::startup::StartupState;
+use crate::startup::{start_antd_daemon, StartupState};
 
 pub fn run(
     cli: crate::Cli,
@@ -29,6 +30,43 @@ pub fn run(
     let db_path = av_core::paths::db_path()
         .ok_or_else(|| CliError::Database("Failed to determine database path".to_string()))?;
     let conn = av_store::open(&db_path).map_err(|e| CliError::Database(e.to_string()))?;
+
+    // --- Step 0: Ensure antd is running for ant:// URIs --------------------
+    let uri_lower = uri.to_lowercase();
+    if uri_lower.starts_with("ant://") || uri_lower.starts_with("autonomi://") {
+        if !state.antd_running {
+            if cli.non_interactive {
+                let err = json!({
+                    "ok": false,
+                    "error": "antd_daemon_not_running",
+                    "detail": "Could not connect to antd daemon. Please start it with 'antd start'."
+                });
+                println!("{}", serde_json::to_string_pretty(&err).unwrap());
+                std::process::exit(1);
+            } else {
+                println!("antd daemon is not running.");
+                let offer = Confirm::new()
+                    .with_prompt("Would you like to try starting the antd daemon?")
+                    .default(true)
+                    .interact()
+                    .map_err(|e| CliError::Other(e.to_string()))?;
+                if offer {
+                    if start_antd_daemon() {
+                        println!("antd daemon started successfully.");
+                    } else {
+                        return Err(CliError::Daemon(
+                            "Failed to start antd daemon. Please run 'antd start' manually."
+                                .to_string(),
+                        ));
+                    }
+                } else {
+                    return Err(CliError::Daemon(
+                        "antd daemon is required for indexing ant:// URIs. Exiting.".to_string(),
+                    ));
+                }
+            }
+        }
+    }
 
     // --- Step 1: Verify URI (unless skipped) --------------------------------
     if !no_verify {
@@ -56,9 +94,25 @@ pub fn run(
             None
         };
 
-        let data = download_content(&uri)?;
+        let pb_cell = RefCell::new(pb);
 
-        if let Some(bar) = pb {
+        let notify = |event: DownloadEvent<'_>| {
+            match event {
+                DownloadEvent::Status(msg) => {
+                    if let Some(ref bar) = *pb_cell.borrow() {
+                        bar.set_message(msg.to_string());
+                    }
+                }
+                DownloadEvent::SubprocessOutput => {
+                    if let Some(bar) = pb_cell.borrow_mut().take() {
+                        bar.finish_and_clear();
+                    }
+                }
+            }
+        };
+        let data = download_content(&uri, Some(&notify as &dyn Fn(DownloadEvent)))?;
+
+        if let Some(bar) = pb_cell.into_inner() {
             bar.finish_with_message(format!("Downloaded ({} KB)", data.len() / 1024));
         }
         data

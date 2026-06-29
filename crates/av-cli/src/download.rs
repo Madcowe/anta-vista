@@ -1,16 +1,26 @@
 use crate::cmd::{CliError, CliResult};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
+use std::process::Command;
 use tempfile::NamedTempFile;
 use ureq;
 
-pub fn download_content(uri: &str) -> CliResult<Vec<u8>> {
+pub enum DownloadEvent<'a> {
+    Status(&'a str),
+    SubprocessOutput,
+}
+
+pub fn download_content(uri: &str, on_event: Option<&dyn Fn(DownloadEvent)>) -> CliResult<Vec<u8>> {
     let location_info = av_ingest::location::analyze_location(uri);
     let scheme = location_info.scheme.as_deref().unwrap_or("file");
 
     match scheme {
         "http" | "https" => {
+            if let Some(f) = on_event {
+                f(DownloadEvent::Status("Downloading from HTTP..."));
+            }
             let resp = ureq::get(uri)
                 .call()
                 .map_err(|e| CliError::Network(format!("Failed to download {}: {}", uri, e)))?;
@@ -22,6 +32,9 @@ pub fn download_content(uri: &str) -> CliResult<Vec<u8>> {
         "ant" => {
             // Address is the 64-hex canonical part of the URI.
             // e.g. ant://<64-hex-address>
+            if let Some(f) = on_event {
+                f(DownloadEvent::Status("Checking antd data endpoint..."));
+            }
             let canonical = location_info
                 .canonical
                 .as_deref()
@@ -38,6 +51,9 @@ pub fn download_content(uri: &str) -> CliResult<Vec<u8>> {
                     if let Ok(json) = resp.into_json::<serde_json::Value>() {
                         if let Some(b64_data) = json["data"].as_str() {
                             if let Ok(decoded) = BASE64.decode(b64_data) {
+                                if let Some(f) = on_event {
+                                    f(DownloadEvent::Status("Processing small data..."));
+                                }
                                 return Ok(decoded);
                             }
                         }
@@ -46,29 +62,53 @@ pub fn download_content(uri: &str) -> CliResult<Vec<u8>> {
                 Err(_) => {} // Fallback to file download if GET fails
             }
 
-            // Fallback: Download via public file POST endpoint (for multi-chunk files)
-            let temp_file = NamedTempFile::new().map_err(|e| CliError::Io(e))?;
-            let temp_path = temp_file.path().to_string_lossy().to_string();
-
-            let payload = serde_json::json!({
-                "address": addr,
-                "dest_path": temp_path,
-            });
-
-            let resp = ureq::post("http://localhost:8082/v1/files/public/get").send_json(payload);
-
-            match resp {
-                Ok(_) => {
-                    let bytes = fs::read(&temp_path).map_err(|e| CliError::Io(e))?;
-                    Ok(bytes)
-                }
-                Err(e) => Err(CliError::Daemon(format!(
-                    "Failed to download ant:// resource from local antd: {}. Is antd running?",
-                    e
-                ))),
+            // Fallback: Stream via public data streaming endpoint
+            if let Some(f) = on_event {
+                f(DownloadEvent::Status("Downloading from Autonomi network..."));
             }
+            let stream_url = format!("http://localhost:8082/v1/data/public/{}/stream", addr);
+            let resp = match ureq::get(&stream_url).call() {
+                Ok(r) => r,
+                Err(antd_err) => {
+                    let detail = match &antd_err {
+                        ureq::Error::Status(code, _) => {
+                            format!("antd returned status code {}", code)
+                        }
+                        ureq::Error::Transport(t)
+                            if t.kind() == ureq::ErrorKind::ConnectionFailed =>
+                        {
+                            "antd daemon is not running".to_string()
+                        }
+                        _ => format!("antd daemon error: {}", antd_err),
+                    };
+                    if let Some(f) = on_event {
+                        f(DownloadEvent::Status(&format!("{}, falling back to ant CLI...", detail)));
+                    }
+                    if let Some(f) = on_event {
+                        f(DownloadEvent::SubprocessOutput);
+                    }
+                    return download_via_ant_cli(addr, on_event).map_err(|cli_err| {
+                        CliError::Daemon(format!(
+                            "antd REST API failed ({}); ant CLI also failed: {}",
+                            detail, cli_err
+                        ))
+                    });
+                }
+            };
+
+            if let Some(f) = on_event {
+                f(DownloadEvent::Status("Downloading..."));
+            }
+            let mut bytes = Vec::new();
+            resp.into_reader()
+                .read_to_end(&mut bytes)
+                .map_err(|e| CliError::Io(e))?;
+            Ok(bytes)
         }
         "file" => {
+            if let Some(f) = on_event {
+                f(DownloadEvent::Status("Reading local file..."));
+            }
             // Local file. Strip file:// if present.
             let path_str = uri.strip_prefix("file://").unwrap_or(uri);
             let path = Path::new(path_str);
@@ -100,22 +140,23 @@ pub fn verify_uri_exists(uri: &str) -> CliResult<()> {
             Ok(())
         }
         "ant" => {
-            let canonical = location_info
-                .canonical
-                .as_deref()
-                .ok_or_else(|| CliError::Validation(format!("Invalid ant:// URI: {}", uri)))?;
-            let addr = canonical.strip_prefix("ant://").unwrap();
-
-            // Check health of local antd daemon first
-            let get_data_url = format!("http://localhost:8082/v1/data/public/{}", addr);
-            let resp = ureq::head(&get_data_url).call();
+            // Verify antd daemon is running via health endpoint.
+            // Resource existence is checked during the actual download.
+            let health_url = "http://localhost:8082/health";
+            let resp = ureq::get(health_url).call();
             match resp {
-                Ok(_) => Ok(()),
-                Err(ureq::Error::Status(404, _)) => Err(CliError::Network(
-                    "ant:// resource not found on network".to_string(),
+                Ok(resp) if resp.status() == 200 => Ok(()),
+                Ok(_) => Err(CliError::Daemon(
+                    "antd daemon returned unhealthy status".to_string(),
                 )),
+                Err(ureq::Error::Transport(e)) if e.kind() == ureq::ErrorKind::ConnectionFailed => {
+                    Err(CliError::Daemon(
+                        "antd daemon is not running. Start it with 'antd start'."
+                            .to_string(),
+                    ))
+                }
                 Err(e) => Err(CliError::Daemon(format!(
-                    "antd daemon error or unreachable: {}",
+                    "antd daemon unreachable: {}",
                     e
                 ))),
             }
@@ -136,4 +177,42 @@ pub fn verify_uri_exists(uri: &str) -> CliResult<()> {
             scheme
         ))),
     }
+}
+
+fn download_via_ant_cli(addr: &str, on_event: Option<&dyn Fn(DownloadEvent)>) -> CliResult<Vec<u8>> {
+    let tmp = NamedTempFile::new().map_err(CliError::Io)?;
+    let tmp_path = tmp.path().to_owned();
+
+    if let Some(f) = on_event {
+        f(DownloadEvent::Status("Downloading via ant CLI..."));
+    }
+    if let Some(f) = on_event {
+        f(DownloadEvent::SubprocessOutput);
+    }
+
+    let status = Command::new("ant")
+        .args(["file", "download", "-o"])
+        .arg(&tmp_path)
+        .arg(addr)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CliError::Daemon(
+                    "ant CLI not found. Install it or ensure antd daemon is running.".to_string(),
+                )
+            } else {
+                CliError::Io(e)
+            }
+        })?;
+
+    if !status.success() {
+        return Err(CliError::Daemon(format!(
+            "ant file download failed (exit: {:?})",
+            status.code()
+        )));
+    }
+
+    fs::read(&tmp_path).map_err(CliError::Io)
 }

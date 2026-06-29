@@ -2,6 +2,7 @@ use crate::cmd::{CliError, CliResult};
 use crate::output::print_output;
 use crate::startup::StartupState;
 use serde_json::json;
+use std::process::Command;
 
 pub fn run(cli: crate::Cli, state: StartupState) -> CliResult<()> {
     // 1. Database stats
@@ -40,6 +41,12 @@ pub fn run(cli: crate::Cli, state: StartupState) -> CliResult<()> {
         "offline".to_string()
     };
 
+    let ant_cli_found = Command::new("ant")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
     // 3. Serialize output
     let status_json = json!({
         "x0x_daemon": {
@@ -57,6 +64,9 @@ pub fn run(cli: crate::Cli, state: StartupState) -> CliResult<()> {
             "running": state.antd_running,
             "network": ant_network,
             "version": ant_version,
+        },
+        "ant_cli": {
+            "installed": ant_cli_found,
         },
         "minilm_model": {
             "loaded": state.minilm_loaded,
@@ -110,6 +120,12 @@ pub fn run(cli: crate::Cli, state: StartupState) -> CliResult<()> {
                 );
             } else {
                 println!("  ant daemon:  {} offline", console::style("x").red());
+            }
+
+            if ant_cli_found {
+                println!("  ant CLI:     {} installed", console::style("✓").green());
+            } else {
+                println!("  ant CLI:     {} not found", console::style("x").red());
             }
 
             if state.minilm_loaded {

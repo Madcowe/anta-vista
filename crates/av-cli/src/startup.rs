@@ -95,6 +95,34 @@ fn load_config(cli: &crate::Cli) -> CliResult<(AvConfig, Option<PathBuf>)> {
     }
 }
 
+pub fn start_antd_daemon() -> bool {
+    let try_start = |bin: &str| -> bool {
+        match std::process::Command::new(bin).arg("start").spawn() {
+            Ok(_) => {
+                for _ in 0..6 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if ping_antd() {
+                        return true;
+                    }
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    };
+
+    if try_start("antd") {
+        return true;
+    }
+    if let Some(base_dirs) = directories::BaseDirs::new() {
+        let local_antd = base_dirs.home_dir().join(".local/bin/antd");
+        if local_antd.exists() {
+            return try_start(local_antd.to_str().unwrap_or("antd"));
+        }
+    }
+    false
+}
+
 fn ping_x0x_daemon(cfg: &X0xConfig) -> bool {
     let url = format!("{}/health", cfg.api_base);
     match ureq::get(&url)
