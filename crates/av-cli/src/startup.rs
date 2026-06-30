@@ -4,6 +4,8 @@ use av_net_x0x::client::X0xConfig;
 use dialoguer::Confirm;
 use serde_json::json;
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct StartupState {
@@ -59,7 +61,7 @@ pub fn run_startup_checks(cli: &crate::Cli) -> CliResult<StartupState> {
         crate::listener::is_running()
     };
 
-    let state = StartupState {
+    let mut state = StartupState {
         config,
         config_path,
         x0x_config,
@@ -69,7 +71,7 @@ pub fn run_startup_checks(cli: &crate::Cli) -> CliResult<StartupState> {
     };
 
     // 5. Handle missing dependencies based on interactive/non-interactive mode
-    enforce_dependencies(cli, &state)?;
+    enforce_dependencies(cli, &mut state)?;
 
     Ok(state)
 }
@@ -123,6 +125,56 @@ pub fn start_antd_daemon() -> bool {
     false
 }
 
+fn x0x_binary_available() -> bool {
+    let bin = if cfg!(target_os = "windows") {
+        "x0x.exe"
+    } else {
+        "x0x"
+    };
+    std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn install_x0x() -> bool {
+    if !cfg!(target_os = "windows") {
+        // Linux/macOS: use the install script
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("curl -sfL https://x0x.md | sh -s -- --start")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+        let ok = matches!(status, Ok(s) if s.success());
+        if ok {
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        ok
+    } else {
+        // Windows: download zip via PowerShell, extract to ~\.local\bin
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command"])
+            .arg(concat!(
+                "$zip = \"$env:TEMP\\x0x.zip\"; ",
+                "$target = \"$env:USERPROFILE\\.local\\bin\"; ",
+                "mkdir -Force $target | Out-Null; ",
+                "Invoke-WebRequest -Uri \"https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip\" -OutFile $zip; ",
+                "tar -xf $zip -C $target --strip-components=1; ",
+                "Remove-Item $zip -Force",
+            ))
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+        let ok = matches!(status, Ok(s) if s.success());
+        if ok {
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        ok
+    }
+}
+
 fn ping_x0x_daemon(cfg: &X0xConfig) -> bool {
     let url = format!("{}/health", cfg.api_base);
     match ureq::get(&url)
@@ -150,7 +202,7 @@ fn check_minilm_cached() -> bool {
     true
 }
 
-fn enforce_dependencies(cli: &crate::Cli, state: &StartupState) -> CliResult<()> {
+fn enforce_dependencies(cli: &crate::Cli, state: &mut StartupState) -> CliResult<()> {
     // If x0xd is not running:
     // Some commands MUST have x0xd running to communicate (resolve, search, name, index, rate, purge).
     // Let's see which command is being executed.
@@ -162,67 +214,140 @@ fn enforce_dependencies(cli: &crate::Cli, state: &StartupState) -> CliResult<()>
     };
 
     if needs_x0x && state.x0x_config.is_none() {
-        if cli.non_interactive {
-            let json_err = json!({
-                "ok": false,
-                "error": "x0x_daemon_not_running",
-                "detail": "Could not connect to x0x daemon. Please start it with 'x0x start'."
-            });
-            println!("{}", serde_json::to_string_pretty(&json_err).unwrap());
-            std::process::exit(1);
-        } else {
-            println!("x0x daemon is not running.");
-            let offer_start = Confirm::new()
-                .with_prompt("Would you like to try starting the x0x daemon?")
-                .default(true)
-                .interact()
-                .map_err(|e| CliError::Other(e.to_string()))?;
+        if x0x_binary_available() {
+            // x0x is installed but not running
+            if cli.non_interactive {
+                let json_err = json!({
+                    "ok": false,
+                    "error": "x0x_daemon_not_running",
+                    "detail": "x0x daemon is not running. Please start it with 'x0x start'."
+                });
+                println!("{}", serde_json::to_string_pretty(&json_err).unwrap());
+                std::process::exit(1);
+            } else {
+                println!("x0x daemon is not running.");
+                let offer_start = Confirm::new()
+                    .with_prompt("Would you like to start it?")
+                    .default(true)
+                    .interact()
+                    .map_err(|e| CliError::Other(e.to_string()))?;
 
-            if offer_start {
-                // Try to start x0x daemon
-                if start_x0x_daemon() {
-                    println!("x0x daemon started successfully.");
+                if offer_start {
+                    if start_x0x_daemon() {
+                        println!("x0x daemon started successfully.");
+                        // Retry config
+                        if let Ok(cfg) = X0xConfig::from_data_dir() {
+                            state.x0x_config = Some(cfg);
+                        }
+                    } else {
+                        return Err(CliError::Daemon(
+                            "Failed to start x0x daemon. Please run 'x0x start' manually."
+                                .to_string(),
+                        ));
+                    }
                 } else {
                     return Err(CliError::Daemon(
-                        "Failed to start x0x daemon. Please run 'x0x start' manually.".to_string(),
+                        "x0x daemon is required for this command. Exiting.".to_string(),
                     ));
                 }
+            }
+        } else {
+            // x0x is not installed at all
+            if cli.non_interactive {
+                let json_err = json!({
+                    "ok": false,
+                    "error": "x0x_not_installed",
+                    "detail": concat!(
+                        "x0x is not installed. ",
+                        "Install it: curl -sfL https://x0x.md | sh",
+                    )
+                });
+                println!("{}", serde_json::to_string_pretty(&json_err).unwrap());
+                std::process::exit(1);
             } else {
-                return Err(CliError::Daemon(
-                    "x0x daemon is required for this command. Exiting.".to_string(),
-                ));
+                println!("x0x is not installed.");
+                let offer_install = Confirm::new()
+                    .with_prompt("Would you like to install and start it?")
+                    .default(true)
+                    .interact()
+                    .map_err(|e| CliError::Other(e.to_string()))?;
+
+                if offer_install {
+                    println!("Installing x0x... (this may take a moment)");
+                    if install_x0x() {
+                        println!("x0x installed and started successfully.");
+                        // Retry config
+                        if let Ok(cfg) = X0xConfig::from_data_dir() {
+                            if ping_x0x_daemon(&cfg) {
+                                state.x0x_config = Some(cfg);
+                            }
+                        }
+                        if state.x0x_config.is_none() {
+                            return Err(CliError::Daemon(
+                                "x0x was installed but the daemon is not responding. \
+                                 Please check manually with 'x0x health'."
+                                    .to_string(),
+                            ));
+                        }
+                    } else {
+                        println!();
+                        println!("Installation failed. You can install x0x manually:");
+                        println!();
+                        println!("  Linux/macOS:  curl -sfL https://x0x.md | sh");
+                        #[cfg(target_os = "windows")]
+                        println!("  Windows: Download from https://github.com/saorsa-labs/x0x/releases");
+                        println!();
+                        return Err(CliError::Daemon(
+                            "x0x installation failed. Please install manually.".to_string(),
+                        ));
+                    }
+                } else {
+                    println!();
+                    println!("You can install x0x later:");
+                    println!();
+                    println!("  Linux/macOS:  curl -sfL https://x0x.md | sh");
+                    #[cfg(target_os = "windows")]
+                    println!("  Windows: Download from https://github.com/saorsa-labs/x0x/releases");
+                    println!();
+                    return Err(CliError::Daemon(
+                        "x0x is required for this command. Exiting.".to_string(),
+                    ));
+                }
             }
         }
     }
-
-    // ant daemon is only required for indexing ant:// URIs.
-    // We will do a contextual check inside the index/name commands instead of failing here.
 
     Ok(())
 }
 
 fn start_x0x_daemon() -> bool {
-    // Check if x0x command is available
-    let output = std::process::Command::new("x0x").arg("start").spawn();
+    let retry_until = std::time::Instant::now() + Duration::from_secs(8);
 
-    match output {
-        Ok(_) => {
-            // Wait a moment for it to start up and listen
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            true
-        }
-        Err(_) => {
-            // Check if ~/.local/bin/x0x exists
-            if let Some(base_dirs) = directories::BaseDirs::new() {
-                let local_x0x = base_dirs.home_dir().join(".local/bin/x0x");
-                if local_x0x.exists() {
-                    if let Ok(_) = std::process::Command::new(local_x0x).arg("start").spawn() {
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        return true;
+    let try_path = |bin: &str| -> bool {
+        match std::process::Command::new(bin).arg("start").spawn() {
+            Ok(_) => {
+                while std::time::Instant::now() < retry_until {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if let Ok(cfg) = X0xConfig::from_data_dir() {
+                        if ping_x0x_daemon(&cfg) {
+                            return true;
+                        }
                     }
                 }
+                false
             }
-            false
+            Err(_) => false,
+        }
+    };
+
+    if try_path("x0x") {
+        return true;
+    }
+    if let Some(base_dirs) = directories::BaseDirs::new() {
+        let local_x0x = base_dirs.home_dir().join(".local/bin/x0x");
+        if local_x0x.exists() {
+            return try_path(local_x0x.to_str().unwrap_or("x0x"));
         }
     }
+    false
 }
