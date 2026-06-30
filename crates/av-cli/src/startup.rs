@@ -125,6 +125,45 @@ pub fn start_antd_daemon() -> bool {
     false
 }
 
+pub fn ant_cli_binary_available() -> bool {
+    let bin = if cfg!(target_os = "windows") {
+        "ant.exe"
+    } else {
+        "ant"
+    };
+    std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub fn install_ant_cli() -> bool {
+    if !cfg!(target_os = "windows") {
+        // Linux/macOS: use the official install script
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                "curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash",
+            )
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+        matches!(status, Ok(s) if s.success())
+    } else {
+        // Windows: use the official PowerShell install script
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command"])
+            .arg(
+                "irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex",
+            )
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+        matches!(status, Ok(s) if s.success())
+    }
+}
+
 fn x0x_binary_available() -> bool {
     let bin = if cfg!(target_os = "windows") {
         "x0x.exe"

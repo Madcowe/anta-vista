@@ -1,4 +1,5 @@
 use crate::cmd::{CliError, CliResult};
+use crate::startup::ant_cli_binary_available;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::fs;
 use std::io::Read;
@@ -140,26 +141,28 @@ pub fn verify_uri_exists(uri: &str) -> CliResult<()> {
             Ok(())
         }
         "ant" => {
-            // Verify antd daemon is running via health endpoint.
-            // Resource existence is checked during the actual download.
+            // Check if antd daemon is running via health endpoint.
             let health_url = "http://localhost:8082/health";
-            let resp = ureq::get(health_url).call();
-            match resp {
-                Ok(resp) if resp.status() == 200 => Ok(()),
-                Ok(_) => Err(CliError::Daemon(
-                    "antd daemon returned unhealthy status".to_string(),
-                )),
-                Err(ureq::Error::Transport(e)) if e.kind() == ureq::ErrorKind::ConnectionFailed => {
-                    Err(CliError::Daemon(
-                        "antd daemon is not running. Start it with 'antd start'."
-                            .to_string(),
-                    ))
-                }
-                Err(e) => Err(CliError::Daemon(format!(
-                    "antd daemon unreachable: {}",
-                    e
-                ))),
+            let healthy = match ureq::get(health_url).call() {
+                Ok(resp) => resp.status() == 200,
+                _ => false,
+            };
+            if healthy {
+                return Ok(());
             }
+            // antd not running — accept ant CLI as fallback
+            if ant_cli_binary_available() {
+                return Ok(());
+            }
+            // Neither is available — give a clear error with install instructions
+            let msg = concat!(
+                "No download backend available. ",
+                "Start antd ('antd --cors') or install ant CLI: ",
+                "curl -fsSL https://raw.githubusercontent.com/",
+                "WithAutonomi/ant-client/main/install.sh | bash. ",
+                "See also: https://github.com/WithAutonomi/ant-sdk/releases"
+            );
+            Err(CliError::Daemon(msg.to_string()))
         }
         "file" => {
             let path_str = uri.strip_prefix("file://").unwrap_or(uri);

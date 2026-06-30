@@ -16,7 +16,7 @@ use serde_json::json;
 use crate::cmd::{CliError, CliResult};
 use crate::download::{download_content, verify_uri_exists, DownloadEvent};
 use crate::output::print_output;
-use crate::startup::{start_antd_daemon, StartupState};
+use crate::startup::{ant_cli_binary_available, install_ant_cli, start_antd_daemon, StartupState};
 
 pub fn run(
     cli: crate::Cli,
@@ -31,38 +31,131 @@ pub fn run(
         .ok_or_else(|| CliError::Database("Failed to determine database path".to_string()))?;
     let conn = av_store::open(&db_path).map_err(|e| CliError::Database(e.to_string()))?;
 
-    // --- Step 0: Ensure antd is running for ant:// URIs --------------------
+    // --- Step 0: Ensure antd or ant CLI is available for ant:// URIs ----
     let uri_lower = uri.to_lowercase();
     if uri_lower.starts_with("ant://") || uri_lower.starts_with("autonomi://") {
-        if !state.antd_running {
+        let mut antd_started = state.antd_running;
+
+        if !antd_started {
             if cli.non_interactive {
-                let err = json!({
-                    "ok": false,
-                    "error": "antd_daemon_not_running",
-                    "detail": "Could not connect to antd daemon. Please start it with 'antd start'."
-                });
-                println!("{}", serde_json::to_string_pretty(&err).unwrap());
-                std::process::exit(1);
+                if ant_cli_binary_available() {
+                    // Proceed — download_via_ant_cli is the fallback
+                } else {
+                    let err = json!({
+                        "ok": false,
+                        "error": "no_download_backend",
+                        "detail": concat!(
+                            "Neither antd daemon nor ant CLI are available. ",
+                            "Install ant CLI: curl -fsSL https://raw.githubusercontent.com/",
+                            "WithAutonomi/ant-client/main/install.sh | bash. ",
+                            "Or install antd from: https://github.com/WithAutonomi/ant-sdk/releases"
+                        )
+                    });
+                    println!("{}", serde_json::to_string_pretty(&err).unwrap());
+                    std::process::exit(1);
+                }
             } else {
                 println!("antd daemon is not running.");
-                let offer = Confirm::new()
+
+                // Offer to start antd
+                let offer_antd = Confirm::new()
                     .with_prompt("Would you like to try starting the antd daemon?")
                     .default(true)
                     .interact()
                     .map_err(|e| CliError::Other(e.to_string()))?;
-                if offer {
+
+                if offer_antd {
                     if start_antd_daemon() {
                         println!("antd daemon started successfully.");
+                        antd_started = true;
                     } else {
-                        return Err(CliError::Daemon(
-                            "Failed to start antd daemon. Please run 'antd start' manually."
-                                .to_string(),
-                        ));
+                        println!("Failed to start antd daemon.");
                     }
-                } else {
-                    return Err(CliError::Daemon(
-                        "antd daemon is required for indexing ant:// URIs. Exiting.".to_string(),
-                    ));
+                }
+
+                // If antd didn't start, offer ant CLI fallback
+                if !antd_started {
+                    if ant_cli_binary_available() {
+                        let use_cli = Confirm::new()
+                            .with_prompt(
+                                "ant CLI is installed. Use it to download instead?",
+                            )
+                            .default(true)
+                            .interact()
+                            .map_err(|e| CliError::Other(e.to_string()))?;
+
+                        if !use_cli {
+                            println!();
+                            println!("You can start antd manually:");
+                            println!("  antd --cors");
+                            println!();
+                            println!("Or download antd from:");
+                            println!("  https://github.com/WithAutonomi/ant-sdk/releases");
+                            println!();
+                            return Err(CliError::Daemon(
+                                "antd daemon is required for indexing ant:// URIs. Exiting."
+                                    .to_string(),
+                            ));
+                        }
+                    } else {
+                        println!("ant CLI is not installed.");
+                        let install_cli = Confirm::new()
+                            .with_prompt(
+                                "Would you like to install the ant CLI tool?",
+                            )
+                            .default(true)
+                            .interact()
+                            .map_err(|e| CliError::Other(e.to_string()))?;
+
+                        if install_cli {
+                            println!("Installing ant CLI... (this may take a moment)");
+                            if install_ant_cli() {
+                                println!("ant CLI installed successfully.");
+                            } else {
+                                println!();
+                                println!("Installation failed. You can install ant CLI manually:");
+                                println!();
+                                #[cfg(not(target_os = "windows"))]
+                                println!(
+                                    "  curl -fsSL https://raw.githubusercontent.com/\
+                                     WithAutonomi/ant-client/main/install.sh | bash"
+                                );
+                                #[cfg(target_os = "windows")]
+                                println!(
+                                    "  irm https://raw.githubusercontent.com/\
+                                     WithAutonomi/ant-client/main/install.ps1 | iex"
+                                );
+                                println!();
+                                return Err(CliError::Daemon(
+                                    "ant CLI installation failed. \
+                                     Please install ant CLI or start antd manually."
+                                        .to_string(),
+                                ));
+                            }
+                        } else {
+                            println!();
+                            println!("You can download antd from:");
+                            println!("  https://github.com/WithAutonomi/ant-sdk/releases");
+                            println!();
+                            println!("Or install ant CLI manually:");
+                            #[cfg(not(target_os = "windows"))]
+                            println!(
+                                "  curl -fsSL https://raw.githubusercontent.com/\
+                                 WithAutonomi/ant-client/main/install.sh | bash"
+                            );
+                            #[cfg(target_os = "windows")]
+                            println!(
+                                "  irm https://raw.githubusercontent.com/\
+                                 WithAutonomi/ant-client/main/install.ps1 | iex"
+                            );
+                            println!();
+                            return Err(CliError::Daemon(
+                                "antd daemon or ant CLI is required for indexing ant:// URIs. \
+                                 Exiting."
+                                    .to_string(),
+                            ));
+                        }
+                    }
                 }
             }
         }
