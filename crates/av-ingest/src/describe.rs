@@ -33,18 +33,57 @@ pub fn semantic_label(mime: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Truncate text at a sentence boundary, at most `max_chars` characters.
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(max_chars).collect();
+    let search_end = max_chars.saturating_sub(10).min(truncated.len());
+    if let Some(pos) = truncated[..search_end].rfind(". ") {
+        format!("{}...", &truncated[..=pos])
+    } else if let Some(pos) = truncated[..search_end].rfind("\n\n") {
+        format!("{}...", &truncated[..pos])
+    } else if let Some(pos) = truncated[..search_end].rfind('!') {
+        format!("{}...", &truncated[..=pos])
+    } else if let Some(pos) = truncated[..search_end].rfind('?') {
+        format!("{}...", &truncated[..=pos])
+    } else {
+        format!("{}...", truncated)
+    }
+}
+
 /// Synthesize a canonical natural-language description for a resource.
 pub fn synthesize(mime: &str, filename: Option<&str>, meta: &ExtractedMeta) -> String {
     let subtype = mime.split('/').nth(1).unwrap_or("unknown");
     let (with_fn_label, no_fn_label) = semantic_label(mime);
     let major = mime.split('/').next().unwrap_or("");
 
-    // Get filename tokens
-    let fn_tokens = filename.and_then(|f| tokenize_filename_opt(f));
+    // For text-based documents with content preview, use it
+    if let Some(preview) = &meta.content_preview {
+        if major == "text" || mime == "application/pdf" {
+            let excerpt = truncate_text(preview, 800);
+            if !excerpt.is_empty() {
+                let fn_tokens = filename.and_then(|f| tokenize_filename_opt(f));
+                if let Some(ctx) = &fn_tokens {
+                    return format!("a {} from {}: {}", no_fn_label, ctx, excerpt);
+                }
+                if let Some(title) = &meta.title {
+                    let clean = title.trim();
+                    if !clean.is_empty() {
+                        return format!("a {} titled \"{}\": {}", no_fn_label, clean, excerpt);
+                    }
+                }
+                return format!("a {}: {}", no_fn_label, excerpt);
+            }
+        }
+    }
 
+    // Fall through to existing filename/title logic for non-text content
+    let fn_tokens = filename.and_then(|f| tokenize_filename_opt(f));
     match &fn_tokens {
         Some(tokens) => {
-            // Audio files drop the "in X format" suffix per spec
             if major == "audio" {
                 format!("a {} {} file", tokens, with_fn_label)
             } else {
@@ -52,7 +91,6 @@ pub fn synthesize(mime: &str, filename: Option<&str>, meta: &ExtractedMeta) -> S
             }
         }
         None => {
-            // No useful filename; use metadata title if available
             if let Some(title) = &meta.title {
                 let clean = title.trim();
                 if !clean.is_empty() {
