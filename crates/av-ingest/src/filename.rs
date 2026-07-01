@@ -16,7 +16,11 @@ pub fn tokenize_filename(filename: &str) -> String {
     // Clean and filter
     let words: Vec<String> = tokens
         .iter()
-        .map(|t| t.trim().to_lowercase())
+        .map(|t| {
+            t.trim()
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
         .filter(|t| !t.is_empty() && t.len() > 1 && !t.chars().all(|c| c.is_ascii_digit()))
         .collect();
 

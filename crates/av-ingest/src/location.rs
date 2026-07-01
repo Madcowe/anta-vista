@@ -17,10 +17,11 @@ pub fn analyze_location(location: &str) -> LocationInfo {
     let scheme = av_core::types::normalize_scheme(raw_scheme);
 
     if scheme != "ant" {
+        let inferred_filename = extract_url_context(rest);
         return LocationInfo {
             scheme: Some(scheme),
             canonical: Some(location.to_string()),
-            inferred_filename: None,
+            inferred_filename,
         };
     }
 
@@ -135,6 +136,86 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+fn extract_url_context(rest: &str) -> Option<String> {
+    let (before_fragment, _) = split_once_any(rest, &['#']);
+    let (before_query, _) = split_once_any(before_fragment, &['?']);
+    let (authority, path) = split_path(before_query);
+
+    let authority_tokens: Vec<&str> = authority
+        .split('.')
+        .filter(|s| !s.is_empty() && *s != "www")
+        .collect();
+
+    let segments: Vec<&str> = path
+        .map(|p| p.split('/').filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+
+    let (context_segments, filename_segment) = if let Some((last, rest)) = segments.split_last() {
+        if last.contains('.') {
+            (rest.to_vec(), Some(*last))
+        } else {
+            (segments.clone(), None)
+        }
+    } else {
+        (vec![], None)
+    };
+
+    let meaningful: Vec<&str> = context_segments
+        .iter()
+        .filter(|s| is_meaningful_segment(s))
+        .copied()
+        .collect();
+
+    let mut parts: Vec<String> = Vec::new();
+
+    for t in &authority_tokens {
+        if let Some(decoded) = percent_decode(t) {
+            if is_meaningful_segment(&decoded) {
+                parts.push(decoded);
+            }
+        }
+    }
+
+    for s in &meaningful {
+        if let Some(decoded) = percent_decode(s) {
+            parts.push(decoded);
+        }
+    }
+
+    if let Some(fn_seg) = filename_segment {
+        if let Some(decoded) = percent_decode(fn_seg) {
+            if sanitize_filename(&decoded).is_some() {
+                parts.push(decoded);
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn is_meaningful_segment(segment: &str) -> bool {
+    if segment.len() <= 1 || segment == "." || segment == ".." {
+        return false;
+    }
+    if segment.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if segment.len() > 16 && segment.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    if segment.len() == 36
+        && segment.chars().filter(|c| *c == '-').count() == 4
+        && segment.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    {
+        return false;
+    }
+    true
+}
+
 fn is_64_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -196,13 +277,125 @@ mod tests {
     }
 
     #[test]
-    fn leaves_non_ant_locations_without_filename() {
-        let info = analyze_location("https://example.com/lucky.jpg");
+    fn extracts_path_filename_from_http() {
+        let info = analyze_location("https://example.com/images/photo.jpg");
         assert_eq!(info.scheme.as_deref(), Some("https"));
         assert_eq!(
             info.canonical.as_deref(),
-            Some("https://example.com/lucky.jpg")
+            Some("https://example.com/images/photo.jpg")
         );
+        assert_eq!(
+            info.inferred_filename.as_deref(),
+            Some("example com images photo.jpg")
+        );
+    }
+
+    #[test]
+    fn filters_numeric_path_segments() {
+        let info = analyze_location("https://example.com/12345/report.pdf");
+        assert_eq!(
+            info.inferred_filename.as_deref(),
+            Some("example com report.pdf")
+        );
+    }
+
+    #[test]
+    fn filters_hex_path_segments() {
+        let info =
+            analyze_location("https://cdn.example.com/aB3dEfGhIjKlMnOpQrStUvWxYz123456/photo.jpg");
+        assert_eq!(
+            info.inferred_filename.as_deref(),
+            Some("cdn example com photo.jpg")
+        );
+    }
+
+    #[test]
+    fn filters_single_char_segments() {
+        let info = analyze_location("https://example.com/a/b/c/file.txt");
+        assert_eq!(
+            info.inferred_filename.as_deref(),
+            Some("example com file.txt")
+        );
+    }
+
+    #[test]
+    fn strips_www_prefix() {
+        let info = analyze_location("https://www.example.com/images/photo.jpg");
+        assert_eq!(
+            info.inferred_filename.as_deref(),
+            Some("example com images photo.jpg")
+        );
+    }
+
+    #[test]
+    fn handles_wiki_style_path() {
+        let info = analyze_location("https://en.wikipedia.org/wiki/Rust_programming_language");
+        assert_eq!(
+            info.inferred_filename.as_deref(),
+            Some("en wikipedia org wiki rust programming language")
+        );
+    }
+
+    #[test]
+    fn handles_percent_encoded_path() {
+        let info = analyze_location("https://example.com/path%20with%20spaces/file.txt");
+        assert_eq!(
+            info.inferred_filename.as_deref(),
+            Some("example com path with spaces file.txt")
+        );
+    }
+
+    #[test]
+    fn handles_localhost_with_port() {
+        let info = analyze_location("http://localhost:8080/images/photo.jpg");
+        assert_eq!(
+            info.inferred_filename.as_deref(),
+            Some("localhost images photo.jpg")
+        );
+    }
+
+    #[test]
+    fn handles_root_path_without_filename() {
+        let info = analyze_location("https://example.com/");
         assert_eq!(info.inferred_filename, None);
+    }
+
+    #[test]
+    fn handles_api_endpoint_without_extension() {
+        let info = analyze_location("https://api.example.com/v2/products");
+        assert_eq!(
+            info.inferred_filename.as_deref(),
+            Some("api example com v2 products")
+        );
+    }
+
+    #[test]
+    fn ant_location_still_extracts_filename() {
+        let info = analyze_location(&format!("ant://{ADDRESS}/lucky.jpg"));
+        assert_eq!(info.inferred_filename.as_deref(), Some("lucky.jpg"));
+        assert_eq!(
+            info.canonical.as_deref(),
+            Some(format!("ant://{ADDRESS}").as_str())
+        );
+    }
+
+    #[test]
+    fn filters_uuid_path_segments() {
+        let info = analyze_location(
+            "https://example.com/550e8400-e29b-41d4-a716-446655440000/report.pdf",
+        );
+        assert_eq!(
+            info.inferred_filename.as_deref(),
+            Some("example com report.pdf")
+        );
+    }
+
+    #[test]
+    fn preserves_deep_nested_paths() {
+        let info = analyze_location("https://archive.org/details/some-book-title/chapter-5.pdf");
+        assert_eq!(
+            info.inferred_filename.as_deref(),
+            Some("archive org details some book title chapter 5.pdf")
+        );
     }
 }
