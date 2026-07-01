@@ -242,10 +242,46 @@ pub fn run(
     }
 
     // --- Step 4: Check for duplicate ----------------------------------------
-    let existing = av_store::repo::resources::get(&conn, &resource.id)
+    // Primary: dedup by location (same URL)
+    let existing_by_loc = av_store::repo::resources::get_by_location(&conn, &uri)
         .map_err(|e| CliError::Database(e.to_string()))?;
 
-    if existing.is_some() && !force {
+    if let Some(existing) = existing_by_loc {
+        if !force {
+            let output_json = json!({
+                "ok": true,
+                "resource_id": existing.id,
+                "location": uri,
+                "mime_type": resource.mime_type,
+                "kind": format!("{:?}", resource.kind),
+                "duplicate": true,
+                "skipped": true,
+            });
+
+            print_output(
+                cli.non_interactive,
+                || {
+                    println!(
+                        "  {} Resource already indexed (use --force to re-index)",
+                        console::style("~").yellow()
+                    );
+                    println!("  resource_id: {}", &existing.id[..16]);
+                },
+                &output_json,
+            );
+            return Ok(());
+        }
+
+        // --force: delete existing record (cascade removes embeddings + feedback)
+        av_store::repo::resources::delete(&conn, &existing.id)
+            .map_err(|e| CliError::Database(e.to_string()))?;
+    }
+
+    // Secondary: dedup by content hash (different URL, same content)
+    let existing_by_hash = av_store::repo::resources::get(&conn, &resource.id)
+        .map_err(|e| CliError::Database(e.to_string()))?;
+
+    if existing_by_hash.is_some() && !force {
         let output_json = json!({
             "ok": true,
             "resource_id": resource.id,
@@ -260,7 +296,7 @@ pub fn run(
             cli.non_interactive,
             || {
                 println!(
-                    "  {} Resource already indexed (use --force to re-index)",
+                    "  {} Content already indexed at a different location (use --force to re-index)",
                     console::style("~").yellow()
                 );
                 println!("  resource_id: {}", &resource.id[..16]);

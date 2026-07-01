@@ -23,6 +23,21 @@ pub fn insert(conn: &Connection, r: &ResourceDescriptor) -> SqlResult<()> {
     Ok(())
 }
 
+pub fn get_by_location(conn: &Connection, location: &str) -> SqlResult<Option<ResourceDescriptor>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, location, location_scheme, location_canonical,
+                mime_type, filename, metadata_json, description_text, created_at
+         FROM resources WHERE location = ?1
+         ORDER BY created_at DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![location])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row_to_resource(row)?))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn get(conn: &Connection, id: &str) -> SqlResult<Option<ResourceDescriptor>> {
     let mut stmt = conn.prepare(
         "SELECT id, kind, location, location_scheme, location_canonical,

@@ -130,6 +130,9 @@ pub enum Commands {
         #[arg(long, help = "Clear only the query cache")]
         cache: bool,
 
+        #[arg(long, help = "Remove duplicate resources sharing the same location")]
+        duplicates: bool,
+
         #[arg(long, help = "Skip confirmation prompt (for scripting)")]
         no_confirm: bool,
     },

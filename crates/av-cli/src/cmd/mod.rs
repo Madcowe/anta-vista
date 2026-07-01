@@ -122,6 +122,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             name,
             all,
             cache,
+            duplicates,
             no_confirm,
         } => purge::run(
             cli.clone(),
@@ -130,6 +131,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             name.clone(),
             *all,
             *cache,
+            *duplicates,
             *no_confirm,
         ),
         Commands::Listen { run_for } => listen::run(startup_state, *run_for),
