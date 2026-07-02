@@ -30,7 +30,10 @@ fn configure(conn: &Connection) -> SqlResult<()> {
 fn migrate(conn: &Connection) -> SqlResult<()> {
     conn.execute_batch(crate::schema::CREATE_APPLIED_MIGRATIONS)?;
 
-    let migrations: &[(&str, &str)] = &[("001_initial", crate::schema::MIGRATION_001_INITIAL)];
+    let migrations: &[(&str, &str)] = &[
+        ("001_initial", crate::schema::MIGRATION_001_INITIAL),
+        ("002_relevance", crate::schema::MIGRATION_002_RELEVANCE),
+    ];
 
     for (name, sql) in migrations {
         let already_applied: bool = conn

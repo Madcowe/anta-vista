@@ -27,10 +27,11 @@ pub const AUTONOMI_SCHEME: &str = "autonomi";
 // ---------------------------------------------------------------------------
 // Ranking weights (semantic search — must sum to 1.0)
 // ---------------------------------------------------------------------------
-pub const WEIGHT_SEMANTIC: f32 = 0.65;
+pub const WEIGHT_SEMANTIC: f32 = 0.55;
 pub const WEIGHT_AGREEMENT: f32 = 0.15;
 pub const WEIGHT_FEEDBACK: f32 = 0.10;
 pub const WEIGHT_TRUST: f32 = 0.10;
+pub const WEIGHT_RELEVANCE: f32 = 0.10;
 
 // ---------------------------------------------------------------------------
 // Naming ranking weights (must sum to 1.0)

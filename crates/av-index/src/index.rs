@@ -32,7 +32,7 @@ impl<'a> LocalIndex<'a> {
             .embed_text(query)
             .map_err(|e| crate::error::IndexError::Embed(e.to_string()))?;
         let pid = profile_id(self.provider.profile());
-        search_top_k(self.conn, &vector, &pid, k, filter)
+        search_top_k(self.conn, &vector, &pid, k, filter, query)
     }
 
     /// Exact name lookup with optional scheme filter.

@@ -4,5 +4,6 @@ pub mod feedback;
 pub mod names;
 pub mod peers;
 pub mod query_cache;
+pub mod relevance;
 pub mod resources;
 pub mod trust;

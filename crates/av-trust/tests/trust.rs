@@ -151,11 +151,12 @@ fn test_decay_moves_toward_zero() {
 #[test]
 fn test_search_score_components_sum_to_combined() {
     let conn = setup();
-    let components = search_score(&conn, "res-001", 0.8, None).expect("score");
-    let expected = 0.65 * components.semantic
+    let components = search_score(&conn, "res-001", 0.8, None, None).expect("score");
+    let expected = 0.55 * components.semantic
         + 0.15 * components.agreement
         + 0.10 * components.feedback
-        + 0.10 * components.trust;
+        + 0.10 * components.trust
+        + 0.10 * components.relevance;
     assert!((components.combined - expected).abs() < 1e-5);
 }
 
@@ -169,8 +170,8 @@ fn test_ranking_shifts_after_positive_feedback() {
     insert_feedback(&conn, "res-A", "fb-2", FeedbackKind::Useful);
     // res-B: no feedback
 
-    let score_a = search_score(&conn, "res-A", 0.7, None).expect("a").combined;
-    let score_b = search_score(&conn, "res-B", 0.7, None).expect("b").combined;
+    let score_a = search_score(&conn, "res-A", 0.7, None, None).expect("a").combined;
+    let score_b = search_score(&conn, "res-B", 0.7, None, None).expect("b").combined;
 
     assert!(
         score_a > score_b,
@@ -185,10 +186,10 @@ fn test_ranking_shifts_after_negative_feedback() {
     insert_feedback(&conn, "res-bad", "fb-1", FeedbackKind::Incorrect);
     insert_feedback(&conn, "res-bad", "fb-2", FeedbackKind::Incorrect);
 
-    let score_bad = search_score(&conn, "res-bad", 0.7, None)
+    let score_bad = search_score(&conn, "res-bad", 0.7, None, None)
         .expect("bad")
         .combined;
-    let score_good = search_score(&conn, "res-good", 0.7, None)
+    let score_good = search_score(&conn, "res-good", 0.7, None, None)
         .expect("good")
         .combined;
 

@@ -46,6 +46,7 @@ pub fn run(
                 "agreement": r.agreement_score,
                 "feedback": r.feedback_score,
                 "trust": r.trust_score,
+                "relevance": r.relevance_score,
             },
             "source": "local",
         }));
@@ -140,6 +141,41 @@ pub fn run(
         },
         &output_json,
     );
+
+    // Interactive relevance feedback
+    if !cli.non_interactive && !all_results.is_empty() {
+        use std::io::Write;
+        print!("\nWhich result was most relevant? (1-{}, or Enter for none): ", all_results.len());
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        let input = input.trim();
+
+        if let Ok(n) = input.parse::<usize>() {
+            if n >= 1 && n <= all_results.len() {
+                let idx = n - 1;
+                if let Some(rid) = all_results[idx]["resource_id"].as_str() {
+                    let normalized = query.trim().to_lowercase();
+                    match av_store::repo::relevance::upsert(&conn, &normalized, rid, 1.0) {
+                        Ok(()) => {
+                            println!(
+                                "  {} Marked result {} as relevant for this query",
+                                console::style("✓").green(),
+                                n,
+                            );
+                        }
+                        Err(e) => {
+                            println!(
+                                "  {} Failed to store relevance: {}",
+                                console::style("✗").red(),
+                                e,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     Ok(())
 }

@@ -15,6 +15,7 @@ pub struct SearchResult {
     pub agreement_score: f32,
     pub feedback_score: f32,
     pub trust_score: f32,
+    pub relevance_score: f32,
 }
 
 /// Search for the top-k resources most similar to `query_vector`.
@@ -25,6 +26,7 @@ pub fn search_top_k(
     profile_id: &str,
     k: usize,
     filter: &QueryFilter,
+    query: &str,
 ) -> IndexResult<Vec<SearchResult>> {
     let embeddings = load_all_embeddings(conn, profile_id)?;
 
@@ -57,14 +59,16 @@ pub fn search_top_k(
         }
 
         // Full weighted score
-        let components = av_trust::ranking::search_score(conn, &resource_id, semantic_sim, None)
-            .unwrap_or_else(|_| av_trust::ranking::ScoreComponents {
-                semantic: semantic_sim.clamp(0.0, 1.0),
-                agreement: 0.5,
-                feedback: 0.5,
-                trust: 0.5,
-                combined: semantic_sim.clamp(0.0, 1.0),
-            });
+        let components =
+            av_trust::ranking::search_score(conn, &resource_id, semantic_sim, None, Some(query))
+                .unwrap_or_else(|_| av_trust::ranking::ScoreComponents {
+                    semantic: semantic_sim.clamp(0.0, 1.0),
+                    agreement: 0.5,
+                    feedback: 0.5,
+                    trust: 0.5,
+                    relevance: 0.5,
+                    combined: semantic_sim.clamp(0.0, 1.0),
+                });
 
         results.push(SearchResult {
             score: components.combined,
@@ -72,6 +76,7 @@ pub fn search_top_k(
             agreement_score: components.agreement,
             feedback_score: components.feedback,
             trust_score: components.trust,
+            relevance_score: components.relevance,
             resource,
         });
     }

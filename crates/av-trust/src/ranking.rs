@@ -9,13 +9,14 @@ pub struct ScoreComponents {
     pub agreement: f32,
     pub feedback: f32,
     pub trust: f32,
+    pub relevance: f32,
     /// Final combined score
     pub combined: f32,
 }
 
 /// Compute the full ranking score for a resource.
 ///
-/// Formula: 0.65·semantic + 0.15·agreement + 0.10·feedback + 0.10·trust
+/// Formula: 0.55·semantic + 0.15·agreement + 0.10·feedback + 0.10·trust + 0.10·relevance
 ///
 /// All inputs must be normalised to [0, 1].
 pub fn search_score(
@@ -23,24 +24,41 @@ pub fn search_score(
     resource_id: &str,
     semantic_similarity: f32,  // already in [-1,1]; clamp to [0,1] first
     by_agent_id: Option<&str>, // agent who provided the resource (for trust lookup)
+    query: Option<&str>,       // query text for relevance look-up
 ) -> TrustResult<ScoreComponents> {
     let semantic = semantic_similarity.clamp(0.0, 1.0);
     let agreement = agreement_score(conn, resource_id)?;
     let feedback = feedback_score(conn, resource_id)?;
     let trust = agent_trust_component(conn, by_agent_id);
+    let relevance = relevance_component(conn, query, resource_id);
 
     let combined = WEIGHT_SEMANTIC * semantic
         + WEIGHT_AGREEMENT * agreement
         + WEIGHT_FEEDBACK * feedback
-        + WEIGHT_TRUST * trust;
+        + WEIGHT_TRUST * trust
+        + WEIGHT_RELEVANCE * relevance;
 
     Ok(ScoreComponents {
         semantic,
         agreement,
         feedback,
         trust,
+        relevance,
         combined,
     })
+}
+
+/// Look up relevance judgment: 1.0 if positive, 0.5 (neutral) if none.
+fn relevance_component(conn: &Connection, query: Option<&str>, resource_id: &str) -> f32 {
+    let q = match query {
+        Some(q) if !q.is_empty() => q,
+        _ => return 0.5,
+    };
+    let normalized = q.trim().to_lowercase();
+    match av_store::repo::relevance::get_score(conn, &normalized, resource_id) {
+        Ok(Some(s)) if s > 0.0 => s.clamp(0.0, 1.0),
+        _ => 0.5,
+    }
 }
 
 /// Naming ranking score (no semantic component).
