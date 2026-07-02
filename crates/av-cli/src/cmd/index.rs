@@ -27,6 +27,7 @@ pub fn run(
     no_verify: bool,
     force: bool,
 ) -> CliResult<()> {
+    let uri = av_ingest::location::normalize_uri(&uri);
     let db_path = av_core::paths::db_path()
         .ok_or_else(|| CliError::Database("Failed to determine database path".to_string()))?;
     let conn = av_store::open(&db_path).map_err(|e| CliError::Database(e.to_string()))?;

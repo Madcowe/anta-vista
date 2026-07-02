@@ -5,7 +5,21 @@ pub struct LocationInfo {
     pub inferred_filename: Option<String>,
 }
 
+/// If the input has no `://` scheme but starts with 64 hex characters
+/// (with optional `/path`, `?query`, or `#fragment`), treat it as an `ant://` URI.
+pub fn normalize_uri(uri: &str) -> String {
+    if uri.contains("://") {
+        return uri.to_string();
+    }
+    let (head, _) = split_once_any(uri, &['/', '?', '#']);
+    if is_64_hex(head) {
+        return format!("ant://{}", uri);
+    }
+    uri.to_string()
+}
+
 pub fn analyze_location(location: &str) -> LocationInfo {
+    let location = normalize_uri(location);
     let Some((raw_scheme, rest)) = location.split_once("://") else {
         return LocationInfo {
             scheme: None,
