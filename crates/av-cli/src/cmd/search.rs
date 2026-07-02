@@ -3,6 +3,7 @@ use crate::network::execute_search;
 use crate::output::print_output;
 use crate::startup::StartupState;
 use av_embed::minilm::MiniLmProvider;
+use av_embed::provider::EmbeddingProvider;
 use av_query::cluster::{cluster_responses, needs_clustering};
 use serde_json::json;
 
@@ -64,6 +65,7 @@ pub fn run(
             "resource_id": c.result.resource_id,
             "location": c.result.location,
             "description": c.result.description_text,
+            "mime_type": c.result.mime_type,
             "score": c.avg_score,
             "agreement_count": c.agreement_count,
             "source": "network",
@@ -142,7 +144,7 @@ pub fn run(
         &output_json,
     );
 
-    // Interactive relevance feedback
+    // Interactive relevance feedback + content propagation
     if !cli.non_interactive && !all_results.is_empty() {
         use std::io::Write;
         print!("\nWhich result was most relevant? (1-{}, or Enter for none): ", all_results.len());
@@ -155,6 +157,74 @@ pub fn run(
             if n >= 1 && n <= all_results.len() {
                 let idx = n - 1;
                 if let Some(rid) = all_results[idx]["resource_id"].as_str() {
+                    // Propagate network results into local index
+                    if av_store::repo::resources::get(&conn, rid)
+                        .ok()
+                        .flatten()
+                        .is_none()
+                    {
+                        let description = all_results[idx]["description"]
+                            .as_str()
+                            .unwrap_or("");
+                        let location = all_results[idx]["location"]
+                            .as_str()
+                            .unwrap_or("");
+                        let mime_type = all_results[idx]["mime_type"]
+                            .as_str()
+                            .unwrap_or("application/octet-stream");
+
+                        if !description.is_empty() {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+
+                            match provider.embed_text(description) {
+                                Ok(embedding) => {
+                                    let profile = provider.profile();
+                                    let pid = av_embed::provider::profile_id(&profile);
+                                    let _ = av_store::repo::embeddings::insert_profile(
+                                        &conn, &pid, &profile,
+                                    );
+
+                                    let l2_norm =
+                                        embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+                                    let resource = av_core::types::ResourceDescriptor {
+                                        id: rid.to_string(),
+                                        kind: kind_from_mime(mime_type),
+                                        location: location.to_string(),
+                                        location_scheme: None,
+                                        location_canonical: None,
+                                        mime_type: mime_type.to_string(),
+                                        filename: None,
+                                        metadata_json: serde_json::json!({
+                                            "propagated": true,
+                                            "propagated_at": now,
+                                        }),
+                                        description_text: description.to_string(),
+                                        created_at: now,
+                                    };
+
+                                    let _ = av_store::repo::resources::insert(&conn, &resource);
+                                    let _ = av_store::repo::embeddings::insert(
+                                        &conn,
+                                        &av_core::types::EmbeddingRecord {
+                                            resource_id: rid.to_string(),
+                                            profile_id: pid,
+                                            vector: embedding,
+                                            l2_norm,
+                                            created_at: now,
+                                        },
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to re-embed for propagation: {}", e);
+                                }
+                            }
+                        }
+                    }
+
                     let normalized = query.trim().to_lowercase();
                     match av_store::repo::relevance::upsert(&conn, &normalized, rid, 1.0) {
                         Ok(()) => {
@@ -178,4 +248,14 @@ pub fn run(
     }
 
     Ok(())
+}
+
+fn kind_from_mime(mime: &str) -> av_core::types::ResourceKind {
+    match mime.split('/').next().unwrap_or("") {
+        "text" => av_core::types::ResourceKind::Text,
+        "image" => av_core::types::ResourceKind::Image,
+        "audio" => av_core::types::ResourceKind::Audio,
+        _ if mime.contains("pdf") => av_core::types::ResourceKind::Pdf,
+        _ => av_core::types::ResourceKind::File,
+    }
 }
