@@ -1,8 +1,13 @@
+use std::sync::Arc;
+
 use crate::cmd::{CliError, CliResult};
 use crate::network::execute_search;
 use crate::output::print_output;
 use crate::startup::StartupState;
+use av_core::constants::WEIGHT_RELEVANCE;
 use av_embed::minilm::MiniLmProvider;
+use av_net_x0x::client::X0xNetClient;
+use av_net_x0x::dispatcher::MessageDispatcher;
 use av_query::cluster::{cluster_responses, needs_clustering};
 use serde_json::json;
 
@@ -21,6 +26,9 @@ pub fn run(
 
     // Load real embedding model
     let provider = MiniLmProvider::new().map_err(|e| CliError::Model(e.to_string()))?;
+
+    let name_scheme_filter = scheme.clone()
+        .map(|s| av_index::filter::SchemeFilter::new(vec![s]));
 
     let res = execute_search(
         &cli, &state, &conn, &provider, &query, scheme, kind, mime, limit,
@@ -69,6 +77,38 @@ pub fn run(
             "agreement_count": c.agreement_count,
             "source": "network",
         }));
+    }
+
+    // Append exact name matches with proper scoring + relevance boost
+    let normalized_query = query.trim().to_lowercase();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let sf = name_scheme_filter.unwrap_or_default();
+    if let Ok(name_results) = av_index::naming::lookup_name(&conn, &query, &sf, now) {
+        for nr in name_results {
+            if all_results
+                .iter()
+                .any(|r| r["location"].as_str() == Some(&nr.record.target))
+            {
+                continue;
+            }
+            let rel = av_store::repo::relevance::name_get_score(&conn, &normalized_query, &nr.record.record_id)
+                .ok()
+                .flatten()
+                .unwrap_or(0.5);
+            let adjusted_score = nr.score * (1.0 - WEIGHT_RELEVANCE) + rel * WEIGHT_RELEVANCE;
+            all_results.push(json!({
+                "resource_id": format!("name:{}", nr.record.record_id),
+                "location": nr.record.target,
+                "description": nr.record.original_name,
+                "mime_type": "text/plain",
+                "score": adjusted_score,
+                "source": "name",
+                "name_record": serde_json::to_value(&nr.record).unwrap_or_default(),
+            }));
+        }
     }
 
     all_results.sort_by(|a, b| {
@@ -135,6 +175,20 @@ pub fn run(
                             &resource_id[..resource_id.len().min(16)]
                         );
                     }
+                    "name" => {
+                        println!(
+                            "  {}. [{}] {} → {} (score: {:.3})",
+                            rank + 1,
+                            console::style("name").magenta(),
+                            console::style(description).cyan().bold(),
+                            console::style(location).green(),
+                            score,
+                        );
+                        println!(
+                            "     resource_id: {}",
+                            &resource_id[..resource_id.len().min(16)]
+                        );
+                    }
                     _ => {}
                 }
                 println!();
@@ -156,48 +210,83 @@ pub fn run(
             if n >= 1 && n <= all_results.len() {
                 let idx = n - 1;
                 if let Some(rid) = all_results[idx]["resource_id"].as_str() {
-                    // Propagate network results into local index
-                    if av_store::repo::resources::get(&conn, rid)
-                        .ok()
-                        .flatten()
-                        .is_none()
-                    {
-                        let description = all_results[idx]["description"]
-                            .as_str()
-                            .unwrap_or("");
-                        let location = all_results[idx]["location"]
-                            .as_str()
-                            .unwrap_or("");
-                        let mime_type = all_results[idx]["mime_type"]
-                            .as_str()
-                            .unwrap_or("application/octet-stream");
+                    let source = all_results[idx]["source"].as_str().unwrap_or("");
 
-                        if !description.is_empty() {
-                            if let Err(e) =
-                                crate::cmd::propagate::propagate_resource(
-                                    &conn, &provider, rid, location, description, mime_type,
-                                )
-                            {
-                                tracing::warn!("Failed to propagate resource: {e}");
+                    if source == "name" {
+                        // Name result: re-broadcast the name claim to the network
+                        if let Ok(record) = serde_json::from_value::<av_core::types::NameRecord>(
+                            all_results[idx]["name_record"].clone(),
+                        )
+                        {
+                            // Store relevance first (record is used by value in publish_name_claim)
+                            let normalized = query.trim().to_lowercase();
+                            if let Err(e) = av_store::repo::relevance::name_upsert(&conn, &normalized, &record.record_id, 1.0) {
+                                tracing::warn!("Failed to store name relevance: {e}");
                             }
-                        }
-                    }
-
-                    let normalized = query.trim().to_lowercase();
-                    match av_store::repo::relevance::upsert(&conn, &normalized, rid, 1.0) {
-                        Ok(()) => {
+                            let local_agent_id = state.x0x_config
+                                .as_ref()
+                                .map(|c| c.agent_id.as_str())
+                                .unwrap_or("local");
+                            if record.by_agent_id != local_agent_id {
+                                if let Some(ref x0x_cfg) = state.x0x_config {
+                                    let net_client = Arc::new(X0xNetClient::new(x0x_cfg.clone()));
+                                    let dispatcher = MessageDispatcher::new(net_client);
+                                    let _ = dispatcher.subscribe_all();
+                                    if let Err(e) = dispatcher.publish_name_claim(record) {
+                                        tracing::warn!("Failed to broadcast name claim: {}", e);
+                                    }
+                                }
+                            }
                             println!(
-                                "  {} Marked result {} as relevant for this query",
+                                "  {} Marked name result {} as relevant — propagated to network",
                                 console::style("✓").green(),
                                 n,
                             );
                         }
-                        Err(e) => {
-                            println!(
-                                "  {} Failed to store relevance: {}",
-                                console::style("✗").red(),
-                                e,
-                            );
+                    } else {
+                        // Resource result: propagate into local index
+                        if av_store::repo::resources::get(&conn, rid)
+                            .ok()
+                            .flatten()
+                            .is_none()
+                        {
+                            let description = all_results[idx]["description"]
+                                .as_str()
+                                .unwrap_or("");
+                            let location = all_results[idx]["location"]
+                                .as_str()
+                                .unwrap_or("");
+                            let mime_type = all_results[idx]["mime_type"]
+                                .as_str()
+                                .unwrap_or("application/octet-stream");
+
+                            if !description.is_empty() {
+                                if let Err(e) =
+                                    crate::cmd::propagate::propagate_resource(
+                                        &conn, &provider, rid, location, description, mime_type,
+                                    )
+                                {
+                                    tracing::warn!("Failed to propagate resource: {e}");
+                                }
+                            }
+                        }
+
+                        let normalized = query.trim().to_lowercase();
+                        match av_store::repo::relevance::upsert(&conn, &normalized, rid, 1.0) {
+                            Ok(()) => {
+                                println!(
+                                    "  {} Marked result {} as relevant for this query",
+                                    console::style("✓").green(),
+                                    n,
+                                );
+                            }
+                            Err(e) => {
+                                println!(
+                                    "  {} Failed to store relevance: {}",
+                                    console::style("✗").red(),
+                                    e,
+                                );
+                            }
                         }
                     }
                 }

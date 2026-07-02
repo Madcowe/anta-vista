@@ -33,6 +33,7 @@ fn migrate(conn: &Connection) -> SqlResult<()> {
     let migrations: &[(&str, &str)] = &[
         ("001_initial", crate::schema::MIGRATION_001_INITIAL),
         ("002_relevance", crate::schema::MIGRATION_002_RELEVANCE),
+        ("003_name_relevance", crate::schema::MIGRATION_003_NAME_RELEVANCE),
     ];
 
     for (name, sql) in migrations {

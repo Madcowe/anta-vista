@@ -33,3 +33,39 @@ pub fn get_score(conn: &Connection, query: &str, resource_id: &str) -> SqlResult
         Ok(None)
     }
 }
+
+/// Upsert a relevance judgment for a (query, name_record_id) pair.
+/// Uses `name_relevance_judgments` table (no FK constraint — name record IDs
+/// are UUIDs, not SHA-256 resource hashes).
+pub fn name_upsert(conn: &Connection, query: &str, record_id: &str, score: f32) -> SqlResult<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT OR REPLACE INTO name_relevance_judgments
+            (normalized_query, record_id, score, created_at, updated_at)
+         VALUES (?1, ?2, ?3,
+            COALESCE((SELECT created_at FROM name_relevance_judgments
+                      WHERE normalized_query = ?1 AND record_id = ?2), ?4),
+            ?4)",
+        params![query, record_id, score, now],
+    )?;
+    Ok(())
+}
+
+/// Get the relevance score for a (query, name_record_id) pair.
+/// Returns `None` when no judgment exists (neutral).
+pub fn name_get_score(conn: &Connection, query: &str, record_id: &str) -> SqlResult<Option<f32>> {
+    let mut stmt = conn.prepare(
+        "SELECT score FROM name_relevance_judgments
+         WHERE normalized_query = ?1 AND record_id = ?2",
+    )?;
+    let mut rows = stmt.query(params![query, record_id])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
+}

@@ -2,6 +2,7 @@ use crate::cmd::{CliError, CliResult};
 use crate::network::execute_resolve;
 use crate::output::print_output;
 use crate::startup::StartupState;
+use av_core::constants::WEIGHT_RELEVANCE;
 use av_core::paths::db_path;
 use serde_json::json;
 
@@ -46,6 +47,25 @@ pub fn run(
     }
     let merged_results = av_index::naming::lookup_name(&conn, &name, &scheme_filter, now_secs())
         .map_err(|e| CliError::Database(e.to_string()))?;
+
+    // Apply relevance boost from feedback
+    let normalized = av_core::types::normalize_name(&name);
+    let mut merged_results: Vec<av_index::naming::NameResult> = merged_results
+        .into_iter()
+        .map(|mut nr| {
+            let rel = av_store::repo::relevance::name_get_score(&conn, &normalized, &nr.record.record_id)
+                .ok()
+                .flatten()
+                .unwrap_or(0.5);
+            nr.score = nr.score * (1.0 - WEIGHT_RELEVANCE) + rel * WEIGHT_RELEVANCE;
+            nr
+        })
+        .collect();
+
+    // Re-sort after relevance boost (scores may shift)
+    merged_results.sort_by(|a, b| {
+        b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let winners = merged_results.into_iter().take(limit).collect::<Vec<_>>();
 

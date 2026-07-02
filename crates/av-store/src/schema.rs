@@ -120,3 +120,14 @@ CREATE TABLE IF NOT EXISTS relevance_judgments (
     FOREIGN KEY (resource_id) REFERENCES resources(id) ON DELETE CASCADE
 );
 ";
+
+pub const MIGRATION_003_NAME_RELEVANCE: &str = "
+CREATE TABLE IF NOT EXISTS name_relevance_judgments (
+    normalized_query TEXT NOT NULL,
+    record_id        TEXT NOT NULL,
+    score            REAL NOT NULL DEFAULT 1.0,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    PRIMARY KEY (normalized_query, record_id)
+);
+";
