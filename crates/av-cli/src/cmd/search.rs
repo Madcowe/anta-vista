@@ -3,7 +3,6 @@ use crate::network::execute_search;
 use crate::output::print_output;
 use crate::startup::StartupState;
 use av_embed::minilm::MiniLmProvider;
-use av_embed::provider::EmbeddingProvider;
 use av_query::cluster::{cluster_responses, needs_clustering};
 use serde_json::json;
 
@@ -174,53 +173,12 @@ pub fn run(
                             .unwrap_or("application/octet-stream");
 
                         if !description.is_empty() {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs() as i64)
-                                .unwrap_or(0);
-
-                            match provider.embed_text(description) {
-                                Ok(embedding) => {
-                                    let profile = provider.profile();
-                                    let pid = av_embed::provider::profile_id(&profile);
-                                    let _ = av_store::repo::embeddings::insert_profile(
-                                        &conn, &pid, &profile,
-                                    );
-
-                                    let l2_norm =
-                                        embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-                                    let resource = av_core::types::ResourceDescriptor {
-                                        id: rid.to_string(),
-                                        kind: kind_from_mime(mime_type),
-                                        location: location.to_string(),
-                                        location_scheme: None,
-                                        location_canonical: None,
-                                        mime_type: mime_type.to_string(),
-                                        filename: None,
-                                        metadata_json: serde_json::json!({
-                                            "propagated": true,
-                                            "propagated_at": now,
-                                        }),
-                                        description_text: description.to_string(),
-                                        created_at: now,
-                                    };
-
-                                    let _ = av_store::repo::resources::insert(&conn, &resource);
-                                    let _ = av_store::repo::embeddings::insert(
-                                        &conn,
-                                        &av_core::types::EmbeddingRecord {
-                                            resource_id: rid.to_string(),
-                                            profile_id: pid,
-                                            vector: embedding,
-                                            l2_norm,
-                                            created_at: now,
-                                        },
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to re-embed for propagation: {}", e);
-                                }
+                            if let Err(e) =
+                                crate::cmd::propagate::propagate_resource(
+                                    &conn, &provider, rid, location, description, mime_type,
+                                )
+                            {
+                                tracing::warn!("Failed to propagate resource: {e}");
                             }
                         }
                     }
@@ -248,14 +206,4 @@ pub fn run(
     }
 
     Ok(())
-}
-
-fn kind_from_mime(mime: &str) -> av_core::types::ResourceKind {
-    match mime.split('/').next().unwrap_or("") {
-        "text" => av_core::types::ResourceKind::Text,
-        "image" => av_core::types::ResourceKind::Image,
-        "audio" => av_core::types::ResourceKind::Audio,
-        _ if mime.contains("pdf") => av_core::types::ResourceKind::Pdf,
-        _ => av_core::types::ResourceKind::File,
-    }
 }

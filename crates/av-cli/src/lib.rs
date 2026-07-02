@@ -145,4 +145,19 @@ pub enum Commands {
         )]
         run_for: Option<u64>,
     },
+
+    #[command(about = "Propagate a resource into the local index by re-embedding its description")]
+    Propagate {
+        #[arg(help = "Resource SHA-256 hash")]
+        resource_id: String,
+
+        #[arg(help = "Resource URI/location")]
+        location: String,
+
+        #[arg(help = "Resource description text (re-embedded to create the search vector)")]
+        description: String,
+
+        #[arg(long, help = "MIME type (e.g. text/plain, text/html)")]
+        mime: Option<String>,
+    },
 }

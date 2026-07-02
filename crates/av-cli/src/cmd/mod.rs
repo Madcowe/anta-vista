@@ -4,6 +4,7 @@ use thiserror::Error;
 pub mod index;
 pub mod listen;
 pub mod name;
+pub mod propagate;
 pub mod purge;
 pub mod rate;
 pub mod resolve;
@@ -135,5 +136,18 @@ pub fn run(cli: Cli) -> CliResult<()> {
             *no_confirm,
         ),
         Commands::Listen { run_for } => listen::run(startup_state, *run_for),
+        Commands::Propagate {
+            resource_id,
+            location,
+            description,
+            mime,
+        } => propagate::run(
+            cli.clone(),
+            startup_state,
+            resource_id.clone(),
+            location.clone(),
+            description.clone(),
+            mime.clone(),
+        ),
     }
 }
