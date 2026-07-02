@@ -38,13 +38,13 @@ pub fn lookup_name(
                 r.target_scheme = Some(av_core::types::normalize_scheme(s));
             }
             if let Some(ref tc) = r.target_canonical {
-                if tc.starts_with("autonomi://") {
-                    r.target_canonical = Some(tc.replace("autonomi://", "ant://"));
+                if tc.starts_with("ant://") {
+                    r.target_canonical = Some(tc.replacen("ant://", "autonomi://", 1));
                 }
             } else {
-                if r.target.starts_with("autonomi://") {
-                    r.target_canonical = Some(r.target.replace("autonomi://", "ant://"));
-                } else if r.target.starts_with("ant://") {
+                if r.target.starts_with("ant://") {
+                    r.target_canonical = Some(r.target.replacen("ant://", "autonomi://", 1));
+                } else if r.target.starts_with("autonomi://") {
                     r.target_canonical = Some(r.target.clone());
                 }
             }

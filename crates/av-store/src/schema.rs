@@ -131,3 +131,13 @@ CREATE TABLE IF NOT EXISTS name_relevance_judgments (
     PRIMARY KEY (normalized_query, record_id)
 );
 ";
+
+pub const MIGRATION_004_CANONICAL_SCHEME: &str = "
+UPDATE resources
+SET location_canonical = 'autonomi://' || substr(location_canonical, 6)
+WHERE location_canonical LIKE 'ant://%';
+
+UPDATE name_records
+SET target_canonical = 'autonomi://' || substr(target_canonical, 6)
+WHERE target_canonical LIKE 'ant://%';
+";

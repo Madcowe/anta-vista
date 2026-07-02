@@ -20,8 +20,9 @@ pub const MINILM_MODEL_ID: &str = "all-MiniLM-L6-v2";
 // ---------------------------------------------------------------------------
 // URI schemes
 // ---------------------------------------------------------------------------
+/// Input alias accepted for the canonical `autonomi` scheme.
 pub const ANT_SCHEME: &str = "ant";
-/// Alias accepted on input; normalised to `ant` at ingestion time.
+/// Canonical URI scheme for the Autonomi network.
 pub const AUTONOMI_SCHEME: &str = "autonomi";
 
 // ---------------------------------------------------------------------------

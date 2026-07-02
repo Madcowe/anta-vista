@@ -30,20 +30,20 @@ pub fn download_content(uri: &str, on_event: Option<&dyn Fn(DownloadEvent)>) -> 
             std::io::copy(&mut resp.into_reader(), &mut bytes).map_err(|e| CliError::Io(e))?;
             Ok(bytes)
         }
-        "ant" => {
+        "autonomi" => {
             // Address is the 64-hex canonical part of the URI.
-            // e.g. ant://<64-hex-address>
+            // e.g. autonomi://<64-hex-address>
             if let Some(f) = on_event {
                 f(DownloadEvent::Status("Checking antd data endpoint..."));
             }
             let canonical = location_info
                 .canonical
                 .as_deref()
-                .ok_or_else(|| CliError::Validation(format!("Invalid ant:// URI: {}", uri)))?;
+                .ok_or_else(|| CliError::Validation(format!("Invalid autonomi:// URI: {}", uri)))?;
 
             let addr = canonical
-                .strip_prefix("ant://")
-                .ok_or_else(|| CliError::Validation(format!("Invalid ant:// URI: {}", uri)))?;
+                .strip_prefix("autonomi://")
+                .ok_or_else(|| CliError::Validation(format!("Invalid autonomi:// URI: {}", uri)))?;
 
             // Try public data GET first (for single chunk / small data)
             let get_data_url = format!("http://localhost:8082/v1/data/public/{}", addr);
@@ -140,7 +140,7 @@ pub fn verify_uri_exists(uri: &str) -> CliResult<()> {
             }
             Ok(())
         }
-        "ant" => {
+        "autonomi" => {
             // Check if antd daemon is running via health endpoint.
             let health_url = "http://localhost:8082/health";
             let healthy = match ureq::get(health_url).call() {

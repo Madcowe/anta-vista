@@ -6,14 +6,14 @@ pub struct LocationInfo {
 }
 
 /// If the input has no `://` scheme but starts with 64 hex characters
-/// (with optional `/path`, `?query`, or `#fragment`), treat it as an `ant://` URI.
+/// (with optional `/path`, `?query`, or `#fragment`), treat it as an `autonomi://` URI.
 pub fn normalize_uri(uri: &str) -> String {
     if uri.contains("://") {
         return uri.to_string();
     }
     let (head, _) = split_once_any(uri, &['/', '?', '#']);
     if is_64_hex(head) {
-        return format!("ant://{}", uri);
+        return format!("autonomi://{}", uri);
     }
     uri.to_string()
 }
@@ -30,7 +30,7 @@ pub fn analyze_location(location: &str) -> LocationInfo {
 
     let scheme = av_core::types::normalize_scheme(raw_scheme);
 
-    if scheme != "ant" {
+    if scheme != "autonomi" {
         let inferred_filename = extract_url_context(rest);
         return LocationInfo {
             scheme: Some(scheme),
@@ -42,7 +42,7 @@ pub fn analyze_location(location: &str) -> LocationInfo {
     match parse_ant_location(rest) {
         Some(parsed) => LocationInfo {
             scheme: Some(scheme),
-            canonical: Some(format!("ant://{}", parsed.address)),
+            canonical: Some(format!("autonomi://{}", parsed.address)),
             inferred_filename: parsed.filename,
         },
         None => LocationInfo {
@@ -243,10 +243,10 @@ mod tests {
     #[test]
     fn infers_ant_path_filename() {
         let info = analyze_location(&format!("ant://{ADDRESS}/lucky.jpg"));
-        assert_eq!(info.scheme.as_deref(), Some("ant"));
+        assert_eq!(info.scheme.as_deref(), Some("autonomi"));
         assert_eq!(
             info.canonical.as_deref(),
-            Some(format!("ant://{ADDRESS}").as_str())
+            Some(format!("autonomi://{ADDRESS}").as_str())
         );
         assert_eq!(info.inferred_filename.as_deref(), Some("lucky.jpg"));
     }
@@ -256,7 +256,7 @@ mod tests {
         let info = analyze_location(&format!("ant://{ADDRESS}?name=lucky.jpg"));
         assert_eq!(
             info.canonical.as_deref(),
-            Some(format!("ant://{ADDRESS}").as_str())
+            Some(format!("autonomi://{ADDRESS}").as_str())
         );
         assert_eq!(info.inferred_filename.as_deref(), Some("lucky.jpg"));
     }
@@ -264,10 +264,10 @@ mod tests {
     #[test]
     fn normalizes_autonomi_alias() {
         let info = analyze_location(&format!("autonomi://{ADDRESS}?name=lucky.jpg"));
-        assert_eq!(info.scheme.as_deref(), Some("ant"));
+        assert_eq!(info.scheme.as_deref(), Some("autonomi"));
         assert_eq!(
             info.canonical.as_deref(),
-            Some(format!("ant://{ADDRESS}").as_str())
+            Some(format!("autonomi://{ADDRESS}").as_str())
         );
         assert_eq!(info.inferred_filename.as_deref(), Some("lucky.jpg"));
     }
@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(info.inferred_filename.as_deref(), Some("lucky.jpg"));
         assert_eq!(
             info.canonical.as_deref(),
-            Some(format!("ant://{ADDRESS}").as_str())
+            Some(format!("autonomi://{ADDRESS}").as_str())
         );
     }
 

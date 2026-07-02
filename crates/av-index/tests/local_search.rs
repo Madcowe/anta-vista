@@ -226,9 +226,9 @@ fn test_name_lookup_scheme_filter() {
 
     let index = LocalIndex::new(&conn, &provider);
 
-    // Filter to ant only
+    // Filter to autonomi only
     let results = index
-        .resolve_name("my-app", &SchemeFilter::new(["ant"]))
+        .resolve_name("my-app", &SchemeFilter::new(["autonomi"]))
         .expect("lookup");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].record.record_id, "nr-ant");

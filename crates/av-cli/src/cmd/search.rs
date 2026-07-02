@@ -42,9 +42,10 @@ pub fn run(
     let mut all_results: Vec<serde_json::Value> = Vec::new();
 
     for r in &res.local_results {
+        let location = r.resource.location_canonical.as_deref().unwrap_or(&r.resource.location);
         all_results.push(json!({
             "resource_id": r.resource.id,
-            "location": r.resource.location,
+            "location": location,
             "description": r.resource.description_text,
             "mime_type": r.resource.mime_type,
             "kind": format!("{:?}", r.resource.kind),
@@ -97,9 +98,10 @@ pub fn run(
     for candidate in &name_candidates {
         if let Ok(name_results) = av_index::naming::lookup_name(&conn, candidate, &sf, now) {
             for nr in name_results {
+                let name_location = nr.record.target_canonical.as_deref().unwrap_or(&nr.record.target);
                 if all_results
                     .iter()
-                    .any(|r| r["location"].as_str() == Some(&nr.record.target))
+                    .any(|r| r["location"].as_str() == Some(name_location))
                 {
                     continue;
                 }
@@ -110,7 +112,7 @@ pub fn run(
                 let adjusted_score = nr.score * (1.0 - WEIGHT_RELEVANCE) + rel * WEIGHT_RELEVANCE;
                 all_results.push(json!({
                     "resource_id": format!("name:{}", nr.record.record_id),
-                    "location": nr.record.target,
+                    "location": name_location,
                     "description": nr.record.original_name,
                     "mime_type": "text/plain",
                     "score": adjusted_score,

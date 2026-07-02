@@ -249,8 +249,8 @@ pub fn test_scheme_alias(
         Some(event) => {
             let payload: NameResponsePayload = serde_json::from_value(event.envelope.payload.clone()).unwrap();
             let is_normalized = payload.results.iter().any(|r| {
-                r.target_scheme.as_deref() == Some("ant") &&
-                r.target_canonical.as_ref().map(|tc| tc.starts_with("ant://")).unwrap_or(false)
+                r.target_scheme.as_deref() == Some("autonomi") &&
+                r.target_canonical.as_ref().map(|tc| tc.starts_with("autonomi://")).unwrap_or(false)
             });
 
             if is_normalized {
@@ -261,7 +261,7 @@ pub fn test_scheme_alias(
                     transport: "gossip".to_string(),
                     status: TestStatus::Pass,
                     duration_ms,
-                    details: "autonomi:// was correctly normalized to ant:// in the target record".to_string(),
+                    details: "ant:// and autonomi:// are both normalized to autonomi:// canonical form".to_string(),
                     debug: serde_json::json!({ "query_id": query_id, "response": event.envelope }),
                 }
             } else {
@@ -272,7 +272,7 @@ pub fn test_scheme_alias(
                     transport: "gossip".to_string(),
                     status: TestStatus::Fail,
                     duration_ms,
-                    details: "Name target was not normalized from autonomi:// to ant://".to_string(),
+                    details: "Name target was not normalized to autonomi:// canonical form".to_string(),
                     debug: serde_json::json!({ "query_id": query_id, "response": event.envelope }),
                 }
             }

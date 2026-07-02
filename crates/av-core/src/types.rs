@@ -176,11 +176,11 @@ pub fn normalize_name(name: &str) -> String {
     name.nfc().collect::<String>().to_lowercase()
 }
 
-/// Canonicalise URI schemes — maps "autonomi" → "ant", passes others through.
+/// Canonicalise URI schemes — maps "ant" → "autonomi", passes others through.
 pub fn normalize_scheme(scheme: &str) -> String {
     let lower = scheme.to_lowercase();
     match lower.as_str() {
-        "autonomi" => "ant".to_owned(),
+        "ant" => "autonomi".to_owned(),
         _ => lower,
     }
 }
@@ -319,9 +319,9 @@ mod tests {
 
     #[test]
     fn test_scheme_normalization() {
-        assert_eq!(normalize_scheme("autonomi"), "ant");
-        assert_eq!(normalize_scheme("AUTONOMI"), "ant");
+        assert_eq!(normalize_scheme("ant"), "autonomi");
+        assert_eq!(normalize_scheme("ANT"), "autonomi");
+        assert_eq!(normalize_scheme("autonomi"), "autonomi");
         assert_eq!(normalize_scheme("https"), "https");
-        assert_eq!(normalize_scheme("ANT"), "ant");
     }
 }

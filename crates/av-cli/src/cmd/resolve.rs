@@ -77,9 +77,10 @@ pub fn run(
             .skip(1)
             .cloned()
             .map(|w| {
+                let target = w.record.target_canonical.as_deref().unwrap_or(&w.record.target);
                 json!({
                     "record_id": w.record.record_id,
-                    "target": w.record.target,
+                    "target": target,
                     "record_type": format!("{:?}", w.record.record_type),
                     "score": w.score,
                 })
@@ -92,12 +93,14 @@ pub fn run(
     let resolve_json = json!({
         "name": name,
         "normalized_name": av_core::types::normalize_name(&name),
-        "winner": winner.as_ref().map(|w| json!({
+        "winner": winner.as_ref().map(|w| {
+            let target = w.record.target_canonical.as_deref().unwrap_or(&w.record.target);
+            json!({
             "record_id": w.record.record_id,
-            "target": w.record.target,
+            "target": target,
             "record_type": format!("{:?}", w.record.record_type),
             "score": w.score,
-        })),
+        }) }),
         "alternates": alternates,
         "scoring": {
             "mode": "name_v1",
@@ -114,10 +117,11 @@ pub fn run(
         cli.non_interactive,
         || {
             if let Some(ref w) = winner {
+                let target = w.record.target_canonical.as_deref().unwrap_or(&w.record.target);
                 println!(
                     "Resolved {} → {} (score: {:.3})",
                     console::style(&name).cyan().bold(),
-                    console::style(&w.record.target).green().bold(),
+                    console::style(target).green().bold(),
                     w.score
                 );
                 if !alternates.is_empty() {

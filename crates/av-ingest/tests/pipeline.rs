@@ -172,10 +172,10 @@ fn test_ingest_infers_ant_path_filename() {
     let location =
         "ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a/lucky.jpg";
     let resource = ingest_bytes(MINIMAL_JPEG, None, location).unwrap();
-    assert_eq!(resource.location_scheme.as_deref(), Some("ant"));
+    assert_eq!(resource.location_scheme.as_deref(), Some("autonomi"));
     assert_eq!(
         resource.location_canonical.as_deref(),
-        Some("ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a")
+        Some("autonomi://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a")
     );
     assert_eq!(resource.filename.as_deref(), Some("lucky.jpg"));
     assert_eq!(
@@ -192,7 +192,7 @@ fn test_ingest_infers_ant_query_name_filename() {
     assert_eq!(resource.filename.as_deref(), Some("lucky.jpg"));
     assert_eq!(
         resource.location_canonical.as_deref(),
-        Some("ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a")
+        Some("autonomi://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a")
     );
 }
 
@@ -200,11 +200,11 @@ fn test_ingest_infers_ant_query_name_filename() {
 fn test_ingest_infers_autonomi_query_name_filename() {
     let location = "autonomi://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a?name=lucky.jpg";
     let resource = ingest_bytes(MINIMAL_JPEG, None, location).unwrap();
-    assert_eq!(resource.location_scheme.as_deref(), Some("ant"));
+    assert_eq!(resource.location_scheme.as_deref(), Some("autonomi"));
     assert_eq!(resource.filename.as_deref(), Some("lucky.jpg"));
     assert_eq!(
         resource.location_canonical.as_deref(),
-        Some("ant://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a")
+        Some("autonomi://711c7e20006ff3e0ac6c1f3063286a0c1a3e4c409642e8c526173fa60bb7078a")
     );
 }
 

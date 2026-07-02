@@ -171,7 +171,7 @@ fn init_seed_db(conn: &Connection, provider: &dyn EmbeddingProvider, agent_id: &
     };
     av_store::repo::names::insert(conn, &seed_record).expect("store seed name");
 
-    // Name claim 2: alias.av (to test scheme alias normalization autonomi:// -> ant://)
+    // Name claim 2: alias.av (to test scheme alias normalization to autonomi://)
     let alias_record = NameRecord {
         schema_version: 1,
         record_id: "alias-name-record".to_string(),
