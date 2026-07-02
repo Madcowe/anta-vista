@@ -79,35 +79,45 @@ pub fn run(
         }));
     }
 
-    // Append exact name matches with proper scoring + relevance boost
+    // Append name matches with proper scoring + relevance boost
+    // Try the full query first, then each significant token (>=2 chars)
     let normalized_query = query.trim().to_lowercase();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let sf = name_scheme_filter.unwrap_or_default();
-    if let Ok(name_results) = av_index::naming::lookup_name(&conn, &query, &sf, now) {
-        for nr in name_results {
-            if all_results
-                .iter()
-                .any(|r| r["location"].as_str() == Some(&nr.record.target))
-            {
-                continue;
+    let mut name_candidates: Vec<String> = Vec::new();
+    name_candidates.push(query.to_string());
+    for token in query.split_whitespace().filter(|t| t.len() >= 2) {
+        if !name_candidates.iter().any(|c| c == token) {
+            name_candidates.push(token.to_string());
+        }
+    }
+    for candidate in &name_candidates {
+        if let Ok(name_results) = av_index::naming::lookup_name(&conn, candidate, &sf, now) {
+            for nr in name_results {
+                if all_results
+                    .iter()
+                    .any(|r| r["location"].as_str() == Some(&nr.record.target))
+                {
+                    continue;
+                }
+                let rel = av_store::repo::relevance::name_get_score(&conn, &normalized_query, &nr.record.record_id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0.5);
+                let adjusted_score = nr.score * (1.0 - WEIGHT_RELEVANCE) + rel * WEIGHT_RELEVANCE;
+                all_results.push(json!({
+                    "resource_id": format!("name:{}", nr.record.record_id),
+                    "location": nr.record.target,
+                    "description": nr.record.original_name,
+                    "mime_type": "text/plain",
+                    "score": adjusted_score,
+                    "source": "name",
+                    "name_record": serde_json::to_value(&nr.record).unwrap_or_default(),
+                }));
             }
-            let rel = av_store::repo::relevance::name_get_score(&conn, &normalized_query, &nr.record.record_id)
-                .ok()
-                .flatten()
-                .unwrap_or(0.5);
-            let adjusted_score = nr.score * (1.0 - WEIGHT_RELEVANCE) + rel * WEIGHT_RELEVANCE;
-            all_results.push(json!({
-                "resource_id": format!("name:{}", nr.record.record_id),
-                "location": nr.record.target,
-                "description": nr.record.original_name,
-                "mime_type": "text/plain",
-                "score": adjusted_score,
-                "source": "name",
-                "name_record": serde_json::to_value(&nr.record).unwrap_or_default(),
-            }));
         }
     }
 
