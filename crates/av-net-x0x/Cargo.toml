@@ -1,6 +1,6 @@
 [package]
 name = "av-net-x0x"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "x0x network transport layer for anta-vista"
 
