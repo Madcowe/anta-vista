@@ -67,13 +67,19 @@ impl X0xConfig {
 }
 
 fn x0x_data_dir() -> NetResult<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA")
+            .map_err(|_| NetError::DaemonUnreachable("APPDATA environment variable not set".into()))?;
+        Ok(std::path::PathBuf::from(appdata).join("x0x"))
+    }
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME")
             .map_err(|_| NetError::DaemonUnreachable("HOME not set".into()))?;
         Ok(std::path::PathBuf::from(home).join("Library/Application Support/x0x"))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         // Linux (XDG)
         let base = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
