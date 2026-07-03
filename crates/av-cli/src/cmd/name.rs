@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::cmd::{CliError, CliResult};
 use crate::download::verify_uri_exists;
 use crate::output::print_output;
-use crate::startup::StartupState;
+use crate::startup::{ant_cli_binary_available, install_ant_cli, start_antd_daemon, StartupState};
 use av_core::types::{normalize_name, NameRecord, NameRecordType};
 use av_net_x0x::client::X0xNetClient;
 use av_net_x0x::dispatcher::MessageDispatcher;
@@ -25,6 +25,100 @@ pub fn run(
     let db_path = av_core::paths::db_path()
         .ok_or_else(|| CliError::Database("Failed to determine database path".to_string()))?;
     let conn = av_store::open(&db_path).map_err(|e| CliError::Database(e.to_string()))?;
+
+    // --- Step 0: Ensure antd or ant CLI is available for ant:// URIs ----
+    let uri_lower = uri.to_lowercase();
+    if uri_lower.starts_with("ant://") || uri_lower.starts_with("autonomi://") {
+        if !state.antd_running {
+            if ant_cli_binary_available() {
+                // ant CLI is available — skip antd prompts, use CLI as download fallback
+            } else if cli.non_interactive {
+                let err = json!({
+                    "ok": false,
+                    "error": "no_download_backend",
+                    "detail": concat!(
+                        "Neither antd daemon nor ant CLI are available. ",
+                        "Install ant CLI: curl -fsSL https://raw.githubusercontent.com/",
+                        "WithAutonomi/ant-client/main/install.sh | bash. ",
+                        "Or install antd from: https://github.com/WithAutonomi/ant-sdk/releases"
+                    )
+                });
+                println!("{}", serde_json::to_string_pretty(&err).unwrap());
+                std::process::exit(1);
+            } else {
+                println!("antd daemon is not running. ant CLI is not installed.");
+                let antd_started = Confirm::new()
+                    .with_prompt("Would you like to try starting the antd daemon?")
+                    .default(true)
+                    .interact()
+                    .map_err(|e| CliError::Other(e.to_string()))?
+                    && start_antd_daemon();
+
+                if antd_started {
+                    println!("antd daemon started successfully.");
+                } else if Confirm::new()
+                    .with_prompt("Would you like to install the ant CLI?")
+                    .default(true)
+                    .interact()
+                    .map_err(|e| CliError::Other(e.to_string()))?
+                    && install_ant_cli()
+                {
+                    // The PowerShell installer may put ant.exe in various locations
+                    // that aren't yet in PATH for the current terminal session. Ensure
+                    // common install directories are visible.
+                    #[cfg(windows)]
+                    {
+                        let candidates = [
+                            format!("{}\\AppData\\Local\\ant\\bin", std::env::var("USERPROFILE").unwrap_or_default()),
+                            format!("{}\\.local\\bin", std::env::var("USERPROFILE").unwrap_or_default()),
+                        ];
+                        let current = std::env::var("PATH").unwrap_or_default();
+                        let mut to_add = Vec::new();
+                        for path in &candidates {
+                            if !path.is_empty()
+                                && std::path::Path::new(path).join("ant.exe").exists()
+                                && !current.split(';').any(|p| p == path.as_str())
+                            {
+                                to_add.push(path.clone());
+                            }
+                        }
+                        if !to_add.is_empty() {
+                            let new_path = to_add.join(";") + ";" + &current;
+                            // SAFETY: single-threaded at startup before any env reads race
+                            unsafe { std::env::set_var("PATH", new_path); }
+                        }
+                    }
+                    println!("ant CLI installed successfully.");
+                } else {
+                    println!();
+                    #[cfg(windows)]
+                    {
+                        println!("Install ant CLI:");
+                        println!(
+                            "  irm https://raw.githubusercontent.com/\
+                             WithAutonomi/ant-client/main/install.ps1 | iex"
+                        );
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        println!("Install ant CLI:");
+                        println!(
+                            "  curl -fsSL https://raw.githubusercontent.com/\
+                             WithAutonomi/ant-client/main/install.sh | bash"
+                        );
+                    }
+                    println!();
+                    println!("Or download antd from:");
+                    println!("  https://github.com/WithAutonomi/ant-sdk/releases");
+                    println!();
+                    return Err(CliError::Daemon(
+                        "antd daemon or ant CLI is required for registering names pointing to ant:// URIs. Exiting."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
 
     // Verify URI reachability unless skipped
     let verified = if no_verify {
