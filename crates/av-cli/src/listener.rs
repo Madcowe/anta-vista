@@ -46,10 +46,24 @@ fn process_alive(pid: u32) -> bool {
         let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
         ret == 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // On non-Unix: fall back to checking /proc (won't reach here in practice
-        // since we target Linux, but keeps it compiling).
+        // On Windows: query using tasklist command and check for the PID in output words
+        if let Ok(output) = std::process::Command::new("tasklist")
+            .args(["/nh", "/fi", &format!("PID eq {}", pid)])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.lines().any(|line| {
+                line.split_whitespace().any(|word| word == pid.to_string())
+            })
+        } else {
+            false
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // On other platforms: fall back to checking /proc
         std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
 }
@@ -91,37 +105,46 @@ fn spawn_background_listener() -> bool {
         Err(_) => return false,
     };
 
-    let dev_null = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/null");
-
-    let null_file = match dev_null {
-        Ok(f) => f,
-        Err(_) => return false,
+    #[cfg(unix)]
+    let result = {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            Command::new(&exe)
+                .arg("listen")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                // Put the child in its own process group so Ctrl-C in the
+                // parent terminal doesn't kill it.
+                .pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                })
+                .spawn()
+        }
     };
 
-    // Spawn `av listen` as a fully detached process:
-    //   - stdin/stdout/stderr → /dev/null
-    //   - process_group(0) → its own process group so it isn't killed when the
-    //     parent terminal closes
-    use std::os::unix::process::CommandExt;
-    let result = unsafe {
+    #[cfg(windows)]
+    let result = {
+        use std::os::windows::process::CommandExt;
         Command::new(&exe)
             .arg("listen")
-            .stdin(null_file.try_clone().unwrap_or_else(|_| {
-                std::fs::File::open("/dev/null").unwrap()
-            }))
-            .stdout(null_file.try_clone().unwrap_or_else(|_| {
-                std::fs::File::open("/dev/null").unwrap()
-            }))
-            .stderr(null_file)
-            // Put the child in its own process group so Ctrl-C in the
-            // parent terminal doesn't kill it.
-            .pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            })
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            // DETACHED_PROCESS (0x00000008) + CREATE_NEW_PROCESS_GROUP (0x00000200)
+            // allows the process to run detached in its own process group.
+            .creation_flags(0x00000008 | 0x00000200)
+            .spawn()
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let result = {
+        Command::new(&exe)
+            .arg("listen")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
     };
 

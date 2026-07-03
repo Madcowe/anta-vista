@@ -26,6 +26,18 @@ pub fn ingest_bytes(
     let location_scheme = location_info.scheme;
     let location_canonical = location_info.canonical;
     let inferred_filename = location_info.inferred_filename;
+
+    let is_autonomi = location_scheme.as_deref() == Some("autonomi");
+    let resource_filename = filename
+        .map(|f| f.to_string())
+        .or_else(|| {
+            if is_autonomi {
+                inferred_filename.clone()
+            } else {
+                None
+            }
+        });
+
     let effective_filename = filename.or(inferred_filename.as_deref());
 
     let meta = extract(bytes, &mime);
@@ -54,7 +66,7 @@ pub fn ingest_bytes(
         location_scheme,
         location_canonical,
         mime_type: mime,
-        filename: effective_filename.map(|f| f.to_string()),
+        filename: resource_filename,
         metadata_json,
         description_text,
         created_at,

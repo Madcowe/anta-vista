@@ -97,6 +97,7 @@ fn test_cli_purge_command() {
             name: None,
             all: false,
             cache: false,
+            duplicates: false,
             no_confirm: true,
         },
     };
@@ -115,6 +116,7 @@ fn test_cli_purge_command() {
         startup_state,
         Some("test-res".to_string()),
         None,
+        false,
         false,
         false,
         true,
@@ -198,6 +200,7 @@ fn test_cli_purge_resource_removes_related_rows() {
             name: None,
             all: false,
             cache: false,
+            duplicates: false,
             no_confirm: true,
         },
     };
@@ -215,6 +218,7 @@ fn test_cli_purge_resource_removes_related_rows() {
         startup_state,
         Some("test-res-related".to_string()),
         None,
+        false,
         false,
         false,
         true,

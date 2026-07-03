@@ -155,14 +155,21 @@ fn extract_url_context(rest: &str) -> Option<String> {
     let (before_query, _) = split_once_any(before_fragment, &['?']);
     let (authority, path) = split_path(before_query);
 
-    let authority_tokens: Vec<&str> = authority
-        .split('.')
-        .filter(|s| !s.is_empty() && *s != "www")
-        .collect();
-
     let segments: Vec<&str> = path
         .map(|p| p.split('/').filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
+
+    if segments.is_empty() {
+        return None;
+    }
+
+    // Strip port from authority if present
+    let (host, _port) = authority.split_once(':').unwrap_or((authority, ""));
+
+    let authority_tokens: Vec<&str> = host
+        .split('.')
+        .filter(|s| !s.is_empty() && *s != "www")
+        .collect();
 
     let (context_segments, filename_segment) = if let Some((last, rest)) = segments.split_last() {
         if last.contains('.') {
@@ -182,24 +189,28 @@ fn extract_url_context(rest: &str) -> Option<String> {
 
     let mut parts: Vec<String> = Vec::new();
 
+    let clean_token = |t: &str| -> String {
+        t.to_lowercase().replace('-', " ").replace('_', " ")
+    };
+
     for t in &authority_tokens {
         if let Some(decoded) = percent_decode(t) {
             if is_meaningful_segment(&decoded) {
-                parts.push(decoded);
+                parts.push(clean_token(&decoded));
             }
         }
     }
 
     for s in &meaningful {
         if let Some(decoded) = percent_decode(s) {
-            parts.push(decoded);
+            parts.push(clean_token(&decoded));
         }
     }
 
     if let Some(fn_seg) = filename_segment {
         if let Some(decoded) = percent_decode(fn_seg) {
             if sanitize_filename(&decoded).is_some() {
-                parts.push(decoded);
+                parts.push(clean_token(&decoded));
             }
         }
     }
@@ -218,7 +229,7 @@ fn is_meaningful_segment(segment: &str) -> bool {
     if segment.chars().all(|c| c.is_ascii_digit()) {
         return false;
     }
-    if segment.len() > 16 && segment.chars().all(|c| c.is_ascii_hexdigit()) {
+    if segment.len() > 16 && segment.chars().all(|c| c.is_ascii_alphanumeric()) {
         return false;
     }
     if segment.len() == 36
