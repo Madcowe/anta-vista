@@ -10,6 +10,7 @@ use av_index::index::LocalIndex;
 use av_net_x0x::client::X0xNetClient;
 use av_net_x0x::dispatcher::MessageDispatcher;
 use av_net_x0x::payloads::{QueryPayload, NameQueryPayload, ResourceResult};
+use av_store::repo::peers;
 
 /// Run the anta-vista peer listener daemon.
 ///
@@ -32,6 +33,7 @@ pub fn run(state: StartupState, run_for_secs: Option<u64>) -> CliResult<()> {
 
     let db_path = av_core::paths::db_path()
         .ok_or_else(|| CliError::Database("Failed to determine database path".to_string()))?;
+    let conn = open_db(&db_path)?;
 
     // Load the embedding model once at startup — it's needed to respond to search queries.
     // Name queries don't need it so we tolerate model load failure gracefully.
@@ -89,6 +91,8 @@ pub fn run(state: StartupState, run_for_secs: Option<u64>) -> CliResult<()> {
                 continue;
             }
 
+            let _ = peers::upsert(&conn, &event.origin, serde_json::json!({}), now_secs());
+
             match event.envelope.kind {
                 MessageKind::Query => {
                     if let Ok(q) =
@@ -115,6 +119,8 @@ pub fn run(state: StartupState, run_for_secs: Option<u64>) -> CliResult<()> {
             if msg.sender == x0x_cfg.agent_id {
                 continue;
             }
+
+            let _ = peers::upsert(&conn, &msg.sender, serde_json::json!({}), now_secs());
 
             match msg.envelope.kind {
                 MessageKind::Query => {

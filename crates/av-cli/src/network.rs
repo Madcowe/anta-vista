@@ -124,6 +124,7 @@ pub fn execute_search(
                     {
                         if resp.query_id == query_id {
                             network_results.push((msg.sender.clone(), resp.clone()));
+                            let _ = peers::upsert(conn, &msg.sender, serde_json::json!({}), now_secs());
                             if cli.stream {
                                 print_progressive_search_results(&msg.sender, &resp.results);
                             }
@@ -140,6 +141,7 @@ pub fn execute_search(
                     {
                         if resp.query_id == query_id {
                             network_results.push((event.origin.clone(), resp.clone()));
+                            let _ = peers::upsert(conn, &event.origin, serde_json::json!({}), now_secs());
                             if cli.stream {
                                 print_progressive_search_results(&event.origin, &resp.results);
                             }
@@ -235,6 +237,7 @@ pub fn execute_resolve(
                     {
                         if resp.query_id == query_id {
                             network_results.push((msg.sender.clone(), resp.clone()));
+                            let _ = peers::upsert(conn, &msg.sender, serde_json::json!({}), now_secs());
                             if cli.stream {
                                 print_progressive_name_results(&msg.sender, &resp.results);
                             }
@@ -251,6 +254,7 @@ pub fn execute_resolve(
                     ) {
                         if resp.query_id == query_id {
                             network_results.push((event.origin.clone(), resp.clone()));
+                            let _ = peers::upsert(conn, &event.origin, serde_json::json!({}), now_secs());
                             if cli.stream {
                                 print_progressive_name_results(&event.origin, &resp.results);
                             }
@@ -278,6 +282,13 @@ fn print_progressive_search_results(sender: &str, results: &[ResourceResult]) {
             res.score
         );
     }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn print_progressive_name_results(sender: &str, results: &[NameRecord]) {
