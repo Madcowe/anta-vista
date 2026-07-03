@@ -3,7 +3,7 @@ use crate::startup::StartupState;
 use av_core::types::{MessageKind, NameRecord};
 use av_embed::minilm::MiniLmProvider;
 use av_index::index::LocalIndex;
-use av_net_x0x::client::X0xNetClient;
+use av_net_x0x::client::{NetworkClient, X0xNetClient};
 use av_net_x0x::dispatcher::MessageDispatcher;
 use av_net_x0x::payloads::{NameResponsePayload, ResourceResult, ResponsePayload};
 use av_store::repo::peers;
@@ -89,15 +89,32 @@ pub fn execute_search(
             vec![]
         };
 
-        // Query direct peers
+        // Query direct peers (parallel connect + sequential send)
         if let Ok(peer_list) = peers::list_recent(conn, 10) {
-            for peer in peer_list {
-                if let Err(e) = dispatcher.connect_agent(&peer.peer_id) {
-                    tracing::debug!("Failed to connect to peer {}: {:?}", peer.peer_id, e);
-                    continue;
+            let recent: Vec<_> = peer_list
+                .into_iter()
+                .filter(|p| p.last_seen_at >= now_secs() - 3600)
+                .collect();
+
+            // Connect to all recent peers in parallel — a thread per peer.
+            let connected: Vec<String> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(recent.len());
+                for peer in &recent {
+                    handles.push(s.spawn(|| {
+                        net_client
+                            .connect_agent(&peer.peer_id)
+                            .ok()
+                            .map(|_| peer.peer_id.clone())
+                    }));
                 }
+                handles.into_iter().filter_map(|h| h.join().ok()).flatten().collect()
+            });
+
+            // Send direct queries sequentially — these should be fast when
+            // the daemon already has a connection to the peer.
+            for peer_id in &connected {
                 let _ = dispatcher.send_direct_query(
-                    &peer.peer_id,
+                    peer_id,
                     query,
                     limit as u32,
                     cli.timeout,
@@ -202,15 +219,31 @@ pub fn execute_resolve(
         )
         .map_err(|e| CliError::Network(e.to_string()))?;
 
-        // Query direct peers
+        // Query direct peers (parallel connect + sequential send)
         if let Ok(peer_list) = peers::list_recent(conn, 10) {
-            for peer in peer_list {
-                if let Err(e) = dispatcher.connect_agent(&peer.peer_id) {
-                    tracing::debug!("Failed to connect to peer {}: {:?}", peer.peer_id, e);
-                    continue;
+            let recent: Vec<_> = peer_list
+                .into_iter()
+                .filter(|p| p.last_seen_at >= now_secs() - 3600)
+                .collect();
+
+            // Connect to all recent peers in parallel — a thread per peer.
+            let connected: Vec<String> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(recent.len());
+                for peer in &recent {
+                    handles.push(s.spawn(|| {
+                        net_client
+                            .connect_agent(&peer.peer_id)
+                            .ok()
+                            .map(|_| peer.peer_id.clone())
+                    }));
                 }
+                handles.into_iter().filter_map(|h| h.join().ok()).flatten().collect()
+            });
+
+            // Send direct queries sequentially.
+            for peer_id in &connected {
                 let _ = dispatcher.send_direct_name_query(
-                    &peer.peer_id,
+                    peer_id,
                     name,
                     Some(record_type),
                     limit as u32,

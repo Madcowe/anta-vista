@@ -31,7 +31,15 @@ pub fn start_listener(
         .name("av-net-x0x-listener".into())
         .spawn(move || {
             let url = format!("{api_base}/events");
-            let resp = match ureq::get(&url)
+            // Use a connect-only timeout so the initial TCP handshake doesn't hang
+            // on Windows. We deliberately do NOT set a read timeout because SSE is
+            // a long-lived streaming connection that must block while waiting for
+            // events from the server.
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(3))
+                .build();
+            let resp = match agent
+                .get(&url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "text/event-stream")
                 .call()

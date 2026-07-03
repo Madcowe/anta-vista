@@ -66,6 +66,30 @@ impl X0xConfig {
     }
 }
 
+/// Build an agent with bounded timeouts for talking to the local x0x daemon.
+/// The daemon is always on localhost (connect is fast), but its endpoints may
+/// block internally (e.g. /agents/connect trying to P2P-connect to a stale
+/// peer).  Without an explicit overall timeout the client would wait for the
+/// daemon's internal timeout (~30 s).  We use:
+///   - timeout_connect(5s)  – localhost never takes this long, just a safety net
+///   - timeout(5s)          – overall request timeout (connect + send + receive)
+fn daemon_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+}
+
+/// Agent specifically for /agents/connect, which is the slowest call — the
+/// daemon may block trying to establish a P2P connection.  We use a tighter
+/// timeout here: if the daemon can't connect in 2 s the peer is probably stale.
+fn connect_agent_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+}
+
 fn x0x_data_dir() -> NetResult<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -92,7 +116,11 @@ fn x0x_data_dir() -> NetResult<std::path::PathBuf> {
 
 fn fetch_agent_id(api_base: &str, token: &str) -> NetResult<String> {
     let url = format!("{api_base}/agent");
-    let resp: serde_json::Value = ureq::get(&url)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(3))
+        .build();
+    let resp: serde_json::Value = agent
+        .get(&url)
         .set("Authorization", &format!("Bearer {token}"))
         .call()
         .map_err(|e| NetError::Http(e.to_string()))?
@@ -120,7 +148,8 @@ impl NetworkClient for X0xNetClient {
         let json_bytes = serde_json::to_vec(envelope)?;
         let payload_b64 = BASE64.encode(&json_bytes);
         let body = json!({ "topic": topic, "payload": payload_b64 });
-        let resp = ureq::post(&format!("{}/publish", self.config.api_base))
+        let resp = daemon_agent()
+            .post(&format!("{}/publish", self.config.api_base))
             .set("Authorization", &format!("Bearer {}", self.config.token))
             .send_json(body)
             .map_err(|e| NetError::Http(e.to_string()))?;
@@ -130,7 +159,8 @@ impl NetworkClient for X0xNetClient {
 
     fn subscribe(&self, topic: &str) -> NetResult<()> {
         let body = json!({ "topic": topic });
-        let resp = ureq::post(&format!("{}/subscribe", self.config.api_base))
+        let resp = daemon_agent()
+            .post(&format!("{}/subscribe", self.config.api_base))
             .set("Authorization", &format!("Bearer {}", self.config.token))
             .send_json(body)
             .map_err(|e| NetError::Http(e.to_string()))?;
@@ -144,7 +174,8 @@ impl NetworkClient for X0xNetClient {
 
     fn connect_agent(&self, agent_id: &str) -> NetResult<()> {
         let body = serde_json::json!({ "agent_id": agent_id });
-        let resp = ureq::post(&format!("{}/agents/connect", self.config.api_base))
+        let resp = connect_agent_agent()
+            .post(&format!("{}/agents/connect", self.config.api_base))
             .set("Authorization", &format!("Bearer {}", self.config.token))
             .send_json(body)
             .map_err(|e| NetError::Http(e.to_string()))?;
@@ -157,7 +188,8 @@ impl NetworkClient for X0xNetClient {
         let payload_b64 = BASE64.encode(&json_bytes);
         let body = serde_json::json!({ "agent_id": to_agent_id, "payload": payload_b64 });
         tracing::debug!(target: "av_net_x0x::client", to = %to_agent_id, kind = ?envelope.kind, "send_direct attempt");
-        let resp = ureq::post(&format!("{}/direct/send", self.config.api_base))
+        let resp = daemon_agent()
+            .post(&format!("{}/direct/send", self.config.api_base))
             .set("Authorization", &format!("Bearer {}", self.config.token))
             .send_json(body)
             .map_err(|e| NetError::Http(e.to_string()))?;

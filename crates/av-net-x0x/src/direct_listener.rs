@@ -28,7 +28,13 @@ pub fn start_direct_listener(
         .name("av-net-x0x-direct-listener".into())
         .spawn(move || {
             let url = format!("{api_base}/direct/events");
-            let resp = match ureq::get(&url)
+            // Use a connect-only timeout so the initial TCP handshake doesn't hang
+            // on Windows. No read timeout — SSE is a long-lived streaming connection.
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(3))
+                .build();
+            let resp = match agent
+                .get(&url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "text/event-stream")
                 .call()

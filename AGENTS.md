@@ -5,7 +5,8 @@
 - **Binary**: `av-cli` publishes the `av` binary (`crates/av-cli/src/main.rs`). All other crates are libraries.
 - All crates use `edition = "2024"`.
 - No `.cargo/config`, no `rustfmt.toml`, no `clippy.toml`.
-- **Crate dependency order** (bottom-up): `av-core` → `av-store` → `av-ingest`, `av-embed` → `av-index`, `av-trust`, `av-net-x0x` → `av-query`, `av-probe`, `av-test-suite`, `av-cli`.
+- **Crate dependency order** (bottom-up): `av-core` → `av-store`, `av-embed`, `av-ingest`, `av-net-x0x` → `av-trust`, `av-index` → `av-query` → `av-cli`, `av-probe`, `av-test-suite`.
+- `ANTA_VISTA_DB_PATH` env var overrides the default SQLite db path (derived from `directories::ProjectDirs` via `av_core::paths::db_path`).
 
 ## Commands
 ```sh
@@ -28,7 +29,7 @@ cargo run --example p2p_two_nodes -p anta-vista-examples   # P2P demo (needs x0x
 ```sh
 av <subcommand> [options]
 ```
-Subcommands: `status`, `resolve <name>`, `search <query>`, `name <uri> <name>`, `index <uri>`, `rate <resource_id> <rating>`, `purge`, `listen`.
+Subcommands: `status`, `resolve <name>`, `search <query>`, `name <uri> <name>`, `index <uri>`, `rate <resource_id> <rating>`, `purge`, `listen`, `propagate <resource_id> <location> <description>`.
 Flags: `--non-interactive` (machine mode; may appear before or after subcommand), `--config <path>`, `--timeout <ms>`, `--stream`, `-v`/`-vv`.
 
 ## Config

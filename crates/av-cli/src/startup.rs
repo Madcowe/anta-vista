@@ -214,9 +214,22 @@ fn install_x0x() -> bool {
     }
 }
 
+/// Build a lightweight ureq agent with a short connect timeout, used
+/// exclusively for local health-check pings. We set only the connect timeout
+/// (not read timeout) so a slow response body doesn't affect other callers,
+/// and to avoid accidentally timing out long-lived connections like SSE.
+/// Without an explicit connect timeout, `ureq` relies on the OS TCP stack —
+/// on Windows this can block for several seconds per attempt on closed ports.
+fn health_check_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_millis(500))
+        .build()
+}
+
 fn ping_x0x_daemon(cfg: &X0xConfig) -> bool {
     let url = format!("{}/health", cfg.api_base);
-    match ureq::get(&url)
+    match health_check_agent()
+        .get(&url)
         .set("Authorization", &format!("Bearer {}", cfg.token))
         .call()
     {
@@ -227,7 +240,10 @@ fn ping_x0x_daemon(cfg: &X0xConfig) -> bool {
 
 fn ping_antd() -> bool {
     // Default antd port is 8082
-    match ureq::get("http://localhost:8082/health").call() {
+    match health_check_agent()
+        .get("http://localhost:8082/health")
+        .call()
+    {
         Ok(resp) => resp.status() == 200,
         Err(_) => false,
     }
