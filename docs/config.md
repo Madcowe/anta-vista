@@ -30,7 +30,8 @@ Weights must sum to exactly 1.0 (enforced by `validate()`).
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `semantic_weight` | `0.65` | Cosine similarity component |
+| `semantic_weight` | `0.55` | Cosine similarity component |
+| `relevance_weight` | `0.10` | Per-query relevance feedback component |
 | `agreement_weight` | `0.15` | Multi-agent agreement component |
 | `feedback_weight` | `0.10` | Explicit user feedback component |
 | `trust_weight` | `0.10` | Agent trust score component |
@@ -53,7 +54,7 @@ Weights must sum to exactly 1.0 (enforced by `validate()`).
 |-------|---------|-------------|
 | `allowed_schemes` | `[]` | URI schemes to accept (empty = allow all) |
 | `blocked_schemes` | `[]` | URI schemes to always reject |
-| `scheme_aliases` | `{autonomi="ant"}` | Alias mapping for URI scheme normalisation |
+| `scheme_aliases` | `{}` | No longer configurable — `ant` → `autonomi` normalisation is hardcoded |
 
 ---
 
@@ -76,10 +77,11 @@ preproc_version = "v1"
 normalized = true
 
 [ranking]
-semantic_weight  = 0.65
+semantic_weight  = 0.55
 agreement_weight = 0.15
 feedback_weight  = 0.10
 trust_weight     = 0.10
+relevance_weight = 0.10
 
 [network]
 query_timeout_ms = 1200
@@ -89,7 +91,6 @@ max_messages_per_minute_per_agent = 120
 [uri]
 allowed_schemes = []
 blocked_schemes = []
-scheme_aliases = { autonomi = "ant" }
 
 [trust]
 decay_per_day   = 0.01

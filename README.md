@@ -6,6 +6,78 @@ Agents share embeddings, claims, and feedback over an encrypted peer-to-peer net
 
 ---
 
+## Install
+
+### Linux (pre-built binary)
+
+```bash
+curl -sfL https://github.com/Madcowe/anta-vista/releases/latest/download/av -o av
+chmod +x av
+sudo mv av /usr/local/bin/
+```
+
+You may need to run `chmod +x` to set execute permissions.
+
+### Windows (pre-built binary)
+
+```powershell
+Invoke-WebRequest -Uri https://github.com/Madcowe/anta-vista/releases/latest/download/av.exe -OutFile av.exe
+# Move av.exe to a directory in your PATH
+```
+
+### macOS
+
+```bash
+cargo build --release -p av-cli
+cp target/release/av ~/.local/bin/
+```
+
+### Quick check
+
+```bash
+av status
+```
+
+## CLI usage
+
+| Command | Description |
+|---------|-------------|
+| `av status` | Show daemon and model health |
+| `av search <query>` | Semantic search for resources |
+| `av resolve <name>` | DNS-like name → URI resolution |
+| `av name <uri> <name>` | Register a name mapping |
+| `av index <uri>` | Ingest and index a URI |
+| `av propagate <id> <loc> <desc>` | Re-index a resource locally |
+| `av rate <id> <rating>` | Submit feedback rating |
+| `av purge` | Clear local database entries |
+| `av listen` | Respond to network queries |
+
+### Workflow
+
+```bash
+# Index content hosted on Autonomi
+av index autonomi://<64-hex-address>
+
+# Search your local index
+av search "my query"
+
+# Register a name pointing to a resource
+av name autonomi://<64-hex-address> my-resource-name
+
+# Resolve a name to its target URI
+av resolve my-resource-name
+```
+
+### Common flags
+
+`--non-interactive` — JSON output (machine mode)  
+`--config <path>` — path to config.toml  
+`--timeout <ms>` — network response timeout  
+`--stream` — show results progressively  
+`-v` / `-vv` — increase log verbosity
+
+---
+
 ## What it does
 
 - **Semantic search** — index any content by description; query with natural language; rank by cosine similarity + trust + feedback + agreement
@@ -42,6 +114,7 @@ Your machine
 | `av-trust` | Trust updates, feedback aggregation, ranking formula |
 | `av-query` | Cold-start clustering, rate limiting, abuse tracking |
 | `av-net-x0x` | x0x network transport (gossip + direct) |
+| `av-cli` | CLI binary (`av`) with all subcommands |
 | `av-probe` | Standalone test tool for multi-machine integration testing |
 
 ---
@@ -57,7 +130,7 @@ cargo run --example local_search -p anta-vista-examples
 Output shows:
 - MIME detection and description synthesis for each document
 - Top-3 semantic matches per query with score breakdown
-- Name resolution for a registered `ant://` record
+- Name resolution for a registered `autonomi://` record
 
 Uses `MockEmbeddingProvider` by default — no model download, runs instantly.
 
@@ -115,10 +188,11 @@ model_version = "v1"
 normalized = true
 
 [ranking]
-semantic_weight  = 0.65   # must sum to 1.0
+semantic_weight  = 0.55   # must sum to 1.0
 agreement_weight = 0.15
 feedback_weight  = 0.10
 trust_weight     = 0.10
+relevance_weight = 0.10
 
 [network]
 query_timeout_ms = 1200
@@ -127,7 +201,6 @@ max_messages_per_minute_per_agent = 120
 
 [uri]
 allowed_schemes = []          # empty = allow all
-scheme_aliases = { autonomi = "ant" }
 
 [trust]
 decay_per_day   = 0.01
