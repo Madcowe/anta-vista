@@ -16,7 +16,7 @@ use serde_json::json;
 use crate::cmd::{CliError, CliResult};
 use crate::download::{download_content, verify_uri_exists, DownloadEvent};
 use crate::output::print_output;
-use crate::startup::{ant_cli_binary_available, start_antd_daemon, StartupState};
+use crate::startup::{ant_cli_binary_available, install_ant_cli, start_antd_daemon, StartupState};
 
 pub fn run(
     cli: crate::Cli,
@@ -53,21 +53,66 @@ pub fn run(
                 std::process::exit(1);
             } else {
                 println!("antd daemon is not running. ant CLI is not installed.");
-                if Confirm::new()
+                let antd_started = Confirm::new()
                     .with_prompt("Would you like to try starting the antd daemon?")
                     .default(true)
                     .interact()
                     .map_err(|e| CliError::Other(e.to_string()))?
-                    && start_antd_daemon()
-                {
+                    && start_antd_daemon();
+
+                if antd_started {
                     println!("antd daemon started successfully.");
+                } else if Confirm::new()
+                    .with_prompt("Would you like to install the ant CLI?")
+                    .default(true)
+                    .interact()
+                    .map_err(|e| CliError::Other(e.to_string()))?
+                    && install_ant_cli()
+                {
+                    // The PowerShell installer may put ant.exe in various locations
+                    // that aren't yet in PATH for the current terminal session. Ensure
+                    // common install directories are visible.
+                    #[cfg(windows)]
+                    {
+                        let candidates = [
+                            format!("{}\\AppData\\Local\\ant\\bin", std::env::var("USERPROFILE").unwrap_or_default()),
+                            format!("{}\\.local\\bin", std::env::var("USERPROFILE").unwrap_or_default()),
+                        ];
+                        let current = std::env::var("PATH").unwrap_or_default();
+                        let mut to_add = Vec::new();
+                        for path in &candidates {
+                            if !path.is_empty()
+                                && std::path::Path::new(path).join("ant.exe").exists()
+                                && !current.split(';').any(|p| p == path.as_str())
+                            {
+                                to_add.push(path.clone());
+                            }
+                        }
+                        if !to_add.is_empty() {
+                            let new_path = to_add.join(";") + ";" + &current;
+                            // SAFETY: single-threaded at startup before any env reads race
+                            unsafe { std::env::set_var("PATH", new_path); }
+                        }
+                    }
+                    println!("ant CLI installed successfully.");
                 } else {
                     println!();
-                    println!("Install ant CLI:");
-                    println!(
-                        "  curl -fsSL https://raw.githubusercontent.com/\
-                         WithAutonomi/ant-client/main/install.sh | bash"
-                    );
+                    #[cfg(windows)]
+                    {
+                        println!("Install ant CLI:");
+                        println!(
+                            "  irm https://raw.githubusercontent.com/\
+                             WithAutonomi/ant-client/main/install.ps1 | iex"
+                        );
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        println!("Install ant CLI:");
+                        println!(
+                            "  curl -fsSL https://raw.githubusercontent.com/\
+                             WithAutonomi/ant-client/main/install.sh | bash"
+                        );
+                    }
                     println!();
                     println!("Or download antd from:");
                     println!("  https://github.com/WithAutonomi/ant-sdk/releases");
