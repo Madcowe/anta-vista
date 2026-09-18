@@ -17,7 +17,7 @@ pub struct Cli {
     #[arg(long, help = "Path to config.toml")]
     pub config: Option<PathBuf>,
 
-    #[arg(long, default_value = "5000", help = "Network response timeout in ms")]
+    #[arg(long, default_value = "10000", help = "Network response timeout in ms")]
     pub timeout: u64,
 
     #[arg(long, help = "Show results progressively as they arrive")]

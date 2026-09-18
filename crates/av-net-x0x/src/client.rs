@@ -186,7 +186,13 @@ impl NetworkClient for X0xNetClient {
     fn send_direct(&self, to_agent_id: &str, envelope: &MessageEnvelope) -> NetResult<()> {
         let json_bytes = serde_json::to_vec(envelope)?;
         let payload_b64 = BASE64.encode(&json_bytes);
-        let body = serde_json::json!({ "agent_id": to_agent_id, "payload": payload_b64 });
+        // `require_durable_app_ack: false` is required to avoid a 409 from peers
+        // that do not advertise v2 durable-ack semantics (x0x >= 0.38).
+        let body = serde_json::json!({
+            "agent_id": to_agent_id,
+            "payload": payload_b64,
+            "require_durable_app_ack": false,
+        });
         tracing::debug!(target: "av_net_x0x::client", to = %to_agent_id, kind = ?envelope.kind, "send_direct attempt");
         let resp = daemon_agent()
             .post(&format!("{}/direct/send", self.config.api_base))

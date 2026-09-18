@@ -8,6 +8,7 @@ use av_net_x0x::dispatcher::MessageDispatcher;
 use av_net_x0x::payloads::{NameResponsePayload, ResourceResult, ResponsePayload};
 use av_store::repo::peers;
 use rusqlite::Connection;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -90,6 +91,7 @@ pub fn execute_search(
         };
 
         // Query direct peers (parallel connect + sequential send)
+        let mut query_ids: HashSet<String> = HashSet::new();
         if let Ok(peer_list) = peers::list_recent(conn, 10) {
             let recent: Vec<_> = peer_list
                 .into_iter()
@@ -113,20 +115,23 @@ pub fn execute_search(
             // Send direct queries sequentially — these should be fast when
             // the daemon already has a connection to the peer.
             for peer_id in &connected {
-                let _ = dispatcher.send_direct_query(
+                if let Ok(query_id) = dispatcher.send_direct_query(
                     peer_id,
                     query,
                     limit as u32,
                     cli.timeout,
                     allowed_schemes.clone(),
-                );
+                ) {
+                    query_ids.insert(query_id);
+                }
             }
         }
 
         // Gossip query
-        let query_id = dispatcher
+        let gossip_query_id = dispatcher
             .publish_query(query, limit as u32, cli.timeout, allowed_schemes)
             .map_err(|e| CliError::Network(e.to_string()))?;
+        query_ids.insert(gossip_query_id);
 
         // Wait loop
         let start_time = Instant::now();
@@ -139,7 +144,7 @@ pub fn execute_search(
                     if let Ok(resp) =
                         serde_json::from_value::<ResponsePayload>(msg.envelope.payload.clone())
                     {
-                        if resp.query_id == query_id {
+                        if query_ids.contains(&resp.query_id) {
                             network_results.push((msg.sender.clone(), resp.clone()));
                             let _ = peers::upsert(conn, &msg.sender, serde_json::json!({}), now_secs());
                             if cli.stream {
@@ -156,7 +161,7 @@ pub fn execute_search(
                     if let Ok(resp) =
                         serde_json::from_value::<ResponsePayload>(event.envelope.payload.clone())
                     {
-                        if resp.query_id == query_id {
+                        if query_ids.contains(&resp.query_id) {
                             network_results.push((event.origin.clone(), resp.clone()));
                             let _ = peers::upsert(conn, &event.origin, serde_json::json!({}), now_secs());
                             if cli.stream {
@@ -220,6 +225,7 @@ pub fn execute_resolve(
         .map_err(|e| CliError::Network(e.to_string()))?;
 
         // Query direct peers (parallel connect + sequential send)
+        let mut query_ids: HashSet<String> = HashSet::new();
         if let Ok(peer_list) = peers::list_recent(conn, 10) {
             let recent: Vec<_> = peer_list
                 .into_iter()
@@ -242,20 +248,23 @@ pub fn execute_resolve(
 
             // Send direct queries sequentially.
             for peer_id in &connected {
-                let _ = dispatcher.send_direct_name_query(
+                if let Ok(query_id) = dispatcher.send_direct_name_query(
                     peer_id,
                     name,
                     Some(record_type),
                     limit as u32,
                     cli.timeout,
-                );
+                ) {
+                    query_ids.insert(query_id);
+                }
             }
         }
 
         // Gossip query
-        let query_id = dispatcher
+        let gossip_query_id = dispatcher
             .publish_name_query(name, Some(record_type), limit as u32, cli.timeout)
             .map_err(|e| CliError::Network(e.to_string()))?;
+        query_ids.insert(gossip_query_id);
 
         // Wait loop
         let start_time = Instant::now();
@@ -268,7 +277,7 @@ pub fn execute_resolve(
                     if let Ok(resp) =
                         serde_json::from_value::<NameResponsePayload>(msg.envelope.payload.clone())
                     {
-                        if resp.query_id == query_id {
+                        if query_ids.contains(&resp.query_id) {
                             network_results.push((msg.sender.clone(), resp.clone()));
                             let _ = peers::upsert(conn, &msg.sender, serde_json::json!({}), now_secs());
                             if cli.stream {
@@ -285,7 +294,7 @@ pub fn execute_resolve(
                     if let Ok(resp) = serde_json::from_value::<NameResponsePayload>(
                         event.envelope.payload.clone(),
                     ) {
-                        if resp.query_id == query_id {
+                        if query_ids.contains(&resp.query_id) {
                             network_results.push((event.origin.clone(), resp.clone()));
                             let _ = peers::upsert(conn, &event.origin, serde_json::json!({}), now_secs());
                             if cli.stream {
