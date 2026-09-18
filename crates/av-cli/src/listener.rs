@@ -85,6 +85,144 @@ pub fn clear_pid() {
     }
 }
 
+/// RAII guard that removes the PID file when dropped. `av listen` holds one of
+/// these for its whole lifetime so a stale PID is never left behind (timeout,
+/// Ctrl-C, or an error bubbling out of the event loop all drop it).
+pub struct PidFileGuard;
+
+impl PidFileGuard {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        clear_pid();
+    }
+}
+
+// ── Stop listener processes ─────────────────────────────────────────────────
+
+/// Terminate the given PID. Sends SIGTERM (or SIGKILL when `force`) and, unless
+/// force, waits up to ~3s for the process to exit, escalating to SIGKILL.
+/// Returns `true` if the process was terminated (or was already gone).
+pub fn terminate_process(pid: u32, force: bool) -> bool {
+    if !process_alive(pid) {
+        return true;
+    }
+    signal(pid, force);
+    if force {
+        return !process_alive(pid);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if !process_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if process_alive(pid) {
+        signal(pid, true);
+        !process_alive(pid)
+    } else {
+        true
+    }
+}
+
+fn signal(pid: u32, kill: bool) {
+    #[cfg(unix)]
+    {
+        // SAFETY: kill() with a well-known signal on an externally-supplied PID.
+        let sig = if kill { libc::SIGKILL } else { libc::SIGTERM };
+        unsafe { libc::kill(pid as libc::pid_t, sig) };
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .arg(if kill { "/F" } else { "/T" })
+            .spawn();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (pid, kill);
+    }
+}
+
+/// Find every running `av listen` process, not just the one in the PID file.
+///
+/// On Unix we scan `/proc/*/cmdline` for processes whose first argument is
+/// `listen` invoked from an `av` binary. On other platforms we fall back to
+/// the PID-file-tracked process only.
+fn find_listener_pids() -> Vec<u32> {
+    let mut pids = Vec::new();
+    #[cfg(unix)]
+    {
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                    continue;
+                };
+                if pid == std::process::id() {
+                    continue;
+                }
+                let cmdline = entry.path().join("cmdline");
+                let Ok(raw) = std::fs::read(&cmdline) else { continue };
+                let args: Vec<&str> = raw
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| std::str::from_utf8(s).unwrap_or(""))
+                    .collect();
+                let is_av = args
+                    .first()
+                    .map(|a0| a0.rsplit(['/', '\\']).next().unwrap_or("").starts_with("av"))
+                    .unwrap_or(false);
+                let listens = args.contains(&"listen");
+                if is_av && listens {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(pid) = read_pid() {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Stop all `av listen` processes (the PID-file tracked one plus every other
+/// running listener). Returns the PIDs that were stopped. The PID file is
+/// cleared once the sweep is complete.
+pub fn stop_all(force: bool) -> Vec<u32> {
+    let mut stopped = Vec::new();
+    for pid in find_listener_pids() {
+        if terminated(pid, force) {
+            stopped.push(pid);
+        }
+    }
+    let tracked: Vec<u32> = read_pid().into_iter().filter(|p| !stopped.contains(p)).collect();
+    for pid in tracked {
+        if terminated(pid, force) {
+            stopped.push(pid);
+        }
+    }
+    clear_pid();
+    stopped
+}
+
+fn terminated(pid: u32, force: bool) -> bool {
+    if process_alive(pid) {
+        terminate_process(pid, force)
+    } else {
+        false
+    }
+}
+
 // ── Ensure a listener is running, spawning one if not ───────────────────────
 
 /// Call this from startup when x0x is available and the current command needs

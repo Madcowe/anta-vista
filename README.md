@@ -51,6 +51,7 @@ av status
 | `av rate <id> <rating>` | Submit feedback rating |
 | `av purge` | Clear local database entries |
 | `av listen` | Respond to network queries |
+| `av stop` | Stop all background av listen processes |
 
 ### Workflow
 

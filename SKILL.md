@@ -49,7 +49,7 @@ av-core
 |------|-------------|
 | `--non-interactive` | JSON output, no prompts (machine mode) |
 | `--config <path>` | Path to config.toml |
-| `--timeout <ms>` | Network response timeout (default 5000) |
+| `--timeout <ms>` | Network response timeout (default 10000) |
 | `--stream` | Show results progressively as they arrive |
 | `-v` / `-vv` | Increase log verbosity (INFO / DEBUG) |
 
@@ -176,12 +176,16 @@ Background responder. Subscribes to all anta-vista gossip topics and responds to
 
 **Auto-start:** `av search`, `av resolve`, `av index`, `av name`, `av rate`, and `av propagate` all automatically spawn `av listen` as a background process when x0x is available — including in non-interactive mode. Once started, it keeps running after the parent command exits, so subsequent commands find it already active.
 
-**If the spawn fails** (e.g. the `av` binary isn't at the expected path), the command still proceeds without network support — no peers are discovered and direct queries will never be sent.
+The autostart checks only whether the recorded listener PID is still alive. It does *not* compare binary versions, so an old `av listen` build can keep running after you upgrade `av` — run `av stop` (or wait for it to exit) and the next network command spawns a fresh listener from the current binary.
 
 ```bash
 av listen                        # run forever (Ctrl-C to stop)
 av listen --run-for 60           # stop after 60 seconds
+av stop                          # stop ALL background av listen processes
+av stop --force                  # SIGKILL immediately, no grace period
 ```
+
+`av stop` runs offline (no x0x daemon needed) and sweeps every running `av listen` process — the PID-file-tracked one plus any others found via a `/proc` cmdline scan — sending SIGTERM then SIGKILL after ~3s, then clearing the PID file.
 
 ## Key distinction: Rate vs Propagate
 

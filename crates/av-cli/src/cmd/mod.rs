@@ -10,6 +10,7 @@ pub mod rate;
 pub mod resolve;
 pub mod search;
 pub mod status;
+pub mod stop;
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -136,6 +137,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             *no_confirm,
         ),
         Commands::Listen { run_for } => listen::run(startup_state, *run_for),
+        Commands::Stop { force } => stop::run(&cli, *force),
         Commands::Propagate {
             resource_id,
             location,

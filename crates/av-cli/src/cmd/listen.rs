@@ -75,6 +75,9 @@ pub fn run(state: StartupState, run_for_secs: Option<u64>) -> CliResult<()> {
 
     // Register our PID so other av commands and `av status` can detect us.
     crate::listener::write_pid(std::process::id());
+    // Ensure the PID file is removed on every exit path (timeout, Ctrl-C, or
+    // an error bubbling up from the loop) so we never leave a stale PID behind.
+    let _pid_guard = crate::listener::PidFileGuard::new();
 
     loop {
         // Honour optional runtime limit.
@@ -144,8 +147,7 @@ pub fn run(state: StartupState, run_for_secs: Option<u64>) -> CliResult<()> {
         }
     }
 
-    // Clean up PID file on graceful exit (run_for timeout).
-    crate::listener::clear_pid();
+    // Clean up happens automatically via the PID guard on any exit path.
     Ok(())
 }
 

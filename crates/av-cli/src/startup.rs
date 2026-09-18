@@ -53,6 +53,7 @@ pub fn run_startup_checks(cli: &crate::Cli) -> CliResult<StartupState> {
         crate::Commands::Status => false,
         crate::Commands::Purge { .. } => false,
         crate::Commands::Listen { .. } => false,
+        crate::Commands::Stop { .. } => false,
         _ => true,
     };
     let listener_running = if needs_listener {
@@ -265,6 +266,7 @@ fn enforce_dependencies(cli: &crate::Cli, state: &mut StartupState) -> CliResult
         crate::Commands::Status => false,
         crate::Commands::Purge { .. } => false, // purge can run offline on local DB
         crate::Commands::Listen { .. } => false, // listen checks x0x itself with a clear error
+        crate::Commands::Stop { .. } => false, // stop must work even with x0x down
         _ => true,
     };
 

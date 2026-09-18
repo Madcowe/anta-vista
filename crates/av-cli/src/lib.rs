@@ -146,6 +146,12 @@ pub enum Commands {
         run_for: Option<u64>,
     },
 
+    #[command(about = "Stop all background av listen processes")]
+    Stop {
+        #[arg(long, help = "Force-kill without waiting for graceful exit")]
+        force: bool,
+    },
+
     #[command(about = "Propagate a resource into the local index by re-embedding its description")]
     Propagate {
         #[arg(help = "Resource SHA-256 hash")]
