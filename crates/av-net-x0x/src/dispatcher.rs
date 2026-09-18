@@ -167,8 +167,31 @@ impl MessageDispatcher {
         allowed_schemes: Vec<String>,
     ) -> NetResult<String> {
         let query_id = uuid::Uuid::new_v4().to_string();
+        self.send_direct_query_with_id(
+            &query_id,
+            to_agent_id,
+            query_text,
+            max_results,
+            timeout_ms,
+            allowed_schemes,
+        )?;
+        Ok(query_id)
+    }
+
+    /// Send a direct search query with a caller-supplied query_id so the caller
+    /// can register the id before the message goes out — useful when delivery
+    /// may be slow (relay-routed) and responses can arrive after the HTTP call.
+    pub fn send_direct_query_with_id(
+        &self,
+        query_id: &str,
+        to_agent_id: &str,
+        query_text: &str,
+        max_results: u32,
+        timeout_ms: u64,
+        allowed_schemes: Vec<String>,
+    ) -> NetResult<()> {
         let payload = QueryPayload {
-            query_id: query_id.clone(),
+            query_id: query_id.to_string(),
             query_text: query_text.to_string(),
             max_results,
             timeout_ms,
@@ -181,7 +204,7 @@ impl MessageDispatcher {
         );
         self.client.send_direct(to_agent_id, &envelope)?;
         tracing::debug!(query_id=%query_id, to=%to_agent_id, "sent direct query");
-        Ok(query_id)
+        Ok(())
     }
 
     /// Send a direct (private) response to a specific agent.
@@ -213,8 +236,30 @@ impl MessageDispatcher {
         timeout_ms: u64,
     ) -> NetResult<String> {
         let query_id = uuid::Uuid::new_v4().to_string();
+        self.send_direct_name_query_with_id(
+            &query_id,
+            to_agent_id,
+            name,
+            record_type,
+            max_results,
+            timeout_ms,
+        )?;
+        Ok(query_id)
+    }
+
+    /// Send a direct name query with a caller-supplied query_id so the caller
+    /// can register the id before the message goes out.
+    pub fn send_direct_name_query_with_id(
+        &self,
+        query_id: &str,
+        to_agent_id: &str,
+        name: &str,
+        record_type: Option<&str>,
+        max_results: u32,
+        timeout_ms: u64,
+    ) -> NetResult<()> {
         let payload = NameQueryPayload {
-            query_id: query_id.clone(),
+            query_id: query_id.to_string(),
             name: name.to_string(),
             normalized_name: normalize_name(name),
             record_type: record_type.map(str::to_string),
@@ -228,7 +273,7 @@ impl MessageDispatcher {
         );
         self.client.send_direct(to_agent_id, &envelope)?;
         tracing::debug!(query_id=%query_id, to=%to_agent_id, name=%name, "sent direct name query");
-        Ok(query_id)
+        Ok(())
     }
 
     /// Send a direct name response to a specific agent.

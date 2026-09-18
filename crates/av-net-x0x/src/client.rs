@@ -90,6 +90,16 @@ fn connect_agent_agent() -> ureq::Agent {
         .build()
 }
 
+/// Agent for `/direct/send`, which the daemon may block on while it routes the
+/// message (e.g. via a gossip inbox / relay).  Give it enough time to complete
+/// the route so we can collect the acknowledgement and trust the query_id.
+fn send_direct_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(90))
+        .build()
+}
+
 fn x0x_data_dir() -> NetResult<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -140,6 +150,68 @@ pub struct X0xNetClient {
 impl X0xNetClient {
     pub fn new(config: X0xConfig) -> Self {
         Self { config }
+    }
+
+    /// Discover candidate av agents from the x0x daemon's own peer discovery
+    /// (`/agents/discovered` + `/presence/online`), excluding ourselves.
+    ///
+    /// Returns them sorted by `last_seen` descending so callers can prefer the
+    /// most recently observed agents when bounding the fan-out.
+    pub fn discover_agent_ids(&self, cap: usize) -> Vec<String> {
+        let mut ranked: Vec<(String, i64)> = Vec::new();
+        for path in ["/agents/discovered", "/presence/online"] {
+            let url = format!("{}{}", self.config.api_base, path);
+            let resp = match daemon_agent()
+                .get(&url)
+                .set("Authorization", &format!("Bearer {}", self.config.token))
+                .call()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(target: "av_net_x0x::client", path, error = %e, "discovery query failed");
+                    continue;
+                }
+            };
+            let value: serde_json::Value = match resp.into_json() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            collect_agent_ids(&value, &mut ranked);
+        }
+        // Deduplicate, dropping any agent that already appears with a fresher last_seen.
+        let mut seen = std::collections::HashSet::new();
+        ranked.retain(|(id, _)| seen.insert(id.clone()) && id != &self.config.agent_id);
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.into_iter().map(|(id, _)| id).take(cap).collect()
+    }
+}
+
+fn is_agent_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Recursively collect `{"agents":[{...,"agent_id":...}]}` style discovery
+/// payloads, carrying each agent's `last_seen` (defaults to 0 when absent).
+fn collect_agent_ids(value: &serde_json::Value, out: &mut Vec<(String, i64)>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(agent_id) = map.get("agent_id").and_then(|v| v.as_str()) {
+                if is_agent_id(agent_id) {
+                    let last_seen = map.get("last_seen").and_then(|v| v.as_i64()).unwrap_or(0);
+                    out.push((agent_id.to_string(), last_seen));
+                    return;
+                }
+            }
+            for v in map.values() {
+                collect_agent_ids(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_agent_ids(item, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -194,7 +266,7 @@ impl NetworkClient for X0xNetClient {
             "require_durable_app_ack": false,
         });
         tracing::debug!(target: "av_net_x0x::client", to = %to_agent_id, kind = ?envelope.kind, "send_direct attempt");
-        let resp = daemon_agent()
+        let resp = send_direct_agent()
             .post(&format!("{}/direct/send", self.config.api_base))
             .set("Authorization", &format!("Bearer {}", self.config.token))
             .send_json(body)

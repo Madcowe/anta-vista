@@ -3,7 +3,7 @@ use crate::startup::StartupState;
 use av_core::types::{MessageKind, NameRecord};
 use av_embed::minilm::MiniLmProvider;
 use av_index::index::LocalIndex;
-use av_net_x0x::client::{NetworkClient, X0xNetClient};
+use av_net_x0x::client::X0xNetClient;
 use av_net_x0x::dispatcher::MessageDispatcher;
 use av_net_x0x::payloads::{NameResponsePayload, ResourceResult, ResponsePayload};
 use av_store::repo::peers;
@@ -90,41 +90,67 @@ pub fn execute_search(
             vec![]
         };
 
-        // Query direct peers (parallel connect + sequential send)
+        // Query peers via direct messaging (parallel connect + send).
+        //
+        // Candidate set = recent peer_cache entries ∪ x0x-discovered agents,
+        // deduped, excluding ourselves.  The x0x daemon can deliver direct
+        // messages to remote agents through relay/coordinator routing even when
+        // a direct P2P connection isn't established, so we send to every
+        // candidate rather than gating on connect_agent success.
+        // Register a fresh query_id per candidate up front (so late-arriving,
+        // relay-routed responses still match), then fire direct sends from
+        // detached threads so the wait loop below overlaps their routing time.
         let mut query_ids: HashSet<String> = HashSet::new();
+        let mut candidates: Vec<String> = Vec::new();
         if let Ok(peer_list) = peers::list_recent(conn, 10) {
             let recent: Vec<_> = peer_list
                 .into_iter()
                 .filter(|p| p.last_seen_at >= now_secs() - 3600)
                 .collect();
-
-            // Connect to all recent peers in parallel — a thread per peer.
-            let connected: Vec<String> = std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(recent.len());
-                for peer in &recent {
-                    handles.push(s.spawn(|| {
-                        net_client
-                            .connect_agent(&peer.peer_id)
-                            .ok()
-                            .map(|_| peer.peer_id.clone())
-                    }));
+            candidates.extend(recent.into_iter().map(|p| p.peer_id));
+        }
+        candidates.extend(net_client.discover_agent_ids(10));
+        let self_id = x0x_cfg.agent_id.clone();
+        let candidates: Vec<String> = candidates
+            .into_iter()
+            .filter(|id| id != &self_id)
+            .fold(Vec::new(), |mut acc, id| {
+                if !acc.contains(&id) {
+                    acc.push(id);
                 }
-                handles.into_iter().filter_map(|h| h.join().ok()).flatten().collect()
+                acc
             });
 
-            // Send direct queries sequentially — these should be fast when
-            // the daemon already has a connection to the peer.
-            for peer_id in &connected {
-                if let Ok(query_id) = dispatcher.send_direct_query(
-                    peer_id,
-                    query,
-                    limit as u32,
-                    cli.timeout,
-                    allowed_schemes.clone(),
-                ) {
-                    query_ids.insert(query_id);
-                }
-            }
+        for peer_id in &candidates {
+            let query_id = uuid::Uuid::new_v4().to_string();
+            query_ids.insert(query_id.clone());
+            let net_client = net_client.clone();
+            let to_agent = peer_id.clone();
+            let query = query.to_string();
+            let allowed_schemes = allowed_schemes.clone();
+            let query_timeout = cli.timeout;
+            let limit_u32 = limit as u32;
+            std::thread::Builder::new()
+                .name(format!("av-search-direct-{to_agent}"))
+                .spawn(move || {
+                    let dispatcher = MessageDispatcher::new(net_client.clone());
+                    // Best-effort connect warm-up; the daemon may still route
+                    // via relay/gossip inbox even if this errors.
+                    let _ = dispatcher.connect_agent(&to_agent);
+                    tracing::debug!(
+                        peer_id=%to_agent, query_id=%query_id,
+                        "sending direct query"
+                    );
+                    let _ = dispatcher.send_direct_query_with_id(
+                        &query_id,
+                        &to_agent,
+                        &query,
+                        limit_u32,
+                        query_timeout,
+                        allowed_schemes,
+                    );
+                })
+                .ok();
         }
 
         // Gossip query
@@ -224,40 +250,57 @@ pub fn execute_resolve(
         )
         .map_err(|e| CliError::Network(e.to_string()))?;
 
-        // Query direct peers (parallel connect + sequential send)
+        // Query direct peers: register a query_id per candidate up front, fire
+        // sends from detached threads (overlapping the wait loop below).
         let mut query_ids: HashSet<String> = HashSet::new();
+        let mut candidates: Vec<String> = Vec::new();
         if let Ok(peer_list) = peers::list_recent(conn, 10) {
             let recent: Vec<_> = peer_list
                 .into_iter()
                 .filter(|p| p.last_seen_at >= now_secs() - 3600)
                 .collect();
-
-            // Connect to all recent peers in parallel — a thread per peer.
-            let connected: Vec<String> = std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(recent.len());
-                for peer in &recent {
-                    handles.push(s.spawn(|| {
-                        net_client
-                            .connect_agent(&peer.peer_id)
-                            .ok()
-                            .map(|_| peer.peer_id.clone())
-                    }));
+            candidates.extend(recent.into_iter().map(|p| p.peer_id));
+        }
+        candidates.extend(net_client.discover_agent_ids(10));
+        let self_id = x0x_cfg.agent_id.clone();
+        let candidates: Vec<String> = candidates
+            .into_iter()
+            .filter(|id| id != &self_id)
+            .fold(Vec::new(), |mut acc, id| {
+                if !acc.contains(&id) {
+                    acc.push(id);
                 }
-                handles.into_iter().filter_map(|h| h.join().ok()).flatten().collect()
+                acc
             });
 
-            // Send direct queries sequentially.
-            for peer_id in &connected {
-                if let Ok(query_id) = dispatcher.send_direct_name_query(
-                    peer_id,
-                    name,
-                    Some(record_type),
-                    limit as u32,
-                    cli.timeout,
-                ) {
-                    query_ids.insert(query_id);
-                }
-            }
+        for peer_id in &candidates {
+            let query_id = uuid::Uuid::new_v4().to_string();
+            query_ids.insert(query_id.clone());
+            let net_client = net_client.clone();
+            let to_agent = peer_id.clone();
+            let name = name.to_string();
+            let record_type = record_type.to_string();
+            let query_timeout = cli.timeout;
+            let limit_u32 = limit as u32;
+            std::thread::Builder::new()
+                .name(format!("av-resolve-direct-{to_agent}"))
+                .spawn(move || {
+                    let dispatcher = MessageDispatcher::new(net_client.clone());
+                    let _ = dispatcher.connect_agent(&to_agent);
+                    tracing::debug!(
+                        peer_id=%to_agent, query_id=%query_id,
+                        "sending direct name query"
+                    );
+                    let _ = dispatcher.send_direct_name_query_with_id(
+                        &query_id,
+                        &to_agent,
+                        &name,
+                        Some(&record_type),
+                        limit_u32,
+                        query_timeout,
+                    );
+                })
+                .ok();
         }
 
         // Gossip query
