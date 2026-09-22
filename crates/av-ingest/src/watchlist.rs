@@ -273,7 +273,8 @@ pub fn apply_tags(resource: &mut ResourceDescriptor, tags: &[String]) {
                 &dummy,
             )
         });
-        resource.description_text = fill_into_window(&base, &items, Some(&tags), EMBED_WINDOW_CHARS);
+        let display_items = crate::series::compact_items(&items);
+        resource.description_text = fill_into_window(&base, &display_items, Some(&tags), EMBED_WINDOW_CHARS);
     } else {
         let tag_str = tags.join(", ");
         resource.description_text = format!("{} tagged as: {}", resource.description_text, tag_str);
@@ -406,7 +407,7 @@ mod tests {
         apply_tags(&mut desc, &tags);
         // Check that tagged description includes “tagged as” before item list.
         assert!(desc.description_text.contains("tagged as: faves, scifi"));
-        assert!(desc.description_text.contains("Movie1.mkv"));
+        assert!(desc.description_text.contains("Movie1"));
     }
 
     #[test]

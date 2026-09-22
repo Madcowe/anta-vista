@@ -160,7 +160,7 @@ pub fn synthesize(mime: &str, filename: Option<&str>, meta: &ExtractedMeta) -> S
         use crate::watchlist::{items_from_meta, base_from_meta};
         let base = base_from_meta(meta)
             .unwrap_or_else(|| watchlist_base(mime, filename, meta));
-        let items = items_from_meta(meta);
+        let items = crate::series::compact_items(&items_from_meta(meta));
         return fill_into_window(&base, &items, None, EMBED_WINDOW_CHARS);
     }
 

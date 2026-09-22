@@ -356,7 +356,7 @@ fn tag_invariant_watchlist() {
     apply_tags(&mut desc, &["scifi".into(), "faves".into()]);
     let text = &desc.description_text;
     assert!(text.contains("tagged as: scifi, faves"));
-    assert!(text.contains("Movie1.mkv")); // at least one item appears
+    assert!(text.contains("Movie1")); // at least one item appears
     assert!(text.chars().count() <= 1024); // EMBED_WINDOW_CHARS
 }
 
@@ -453,7 +453,64 @@ fn ingest_watchlist_bundle_smoke() {
     assert_eq!(desc.mime_type, WATCHLIST_MIME);
     assert!(desc.description_text.contains("watch list"));
     assert!(
-        desc.description_text.contains("My Video (2025) [1080p].mp4")
+        desc.description_text.contains("My Video (2025) [1080p]")
             || desc.description_text.contains("more")
     );
+}
+
+/// Realistic bundle: a series spread over many episodes plus standalone movies
+/// and a hex-suffixed duplicate. Episodes must collapse to a range, movies must
+/// stay, duplicates must dedupe, hex junk must not leak.
+#[test]
+fn ingest_watchlist_compacts_series_and_dedupes_movies() {
+    let bundle = {
+        use std::io::{Cursor, Write};
+        use zip::{ZipWriter, write::SimpleFileOptions};
+        use zip::CompressionMethod;
+
+        let mut buf = Vec::new();
+        let mut writer = ZipWriter::new(Cursor::new(&mut buf));
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+
+        for ep in 1..=15u32 {
+            let name = format!("datamaps/Petticoat Junction S01E{ep:02}.mp4.datamap");
+            writer.start_file(name, opts).unwrap();
+            writer.write_all(&[0]).unwrap();
+        }
+        for name in [
+            "datamaps/The General (1926) {imdb-tt0017925}.mp4.datamap",
+            "datamaps/Nosferatu (1922) {imdb-tt0013442}.mp4.datamap",
+            "datamaps/Night of the Living Dead (1968) {imdb-tt0063350} - [1080p].mp4.datamap",
+            "datamaps/Night of the Living Dead (1968) {imdb-tt0063350} - [1080p].mp4.66cacd06.datamap",
+        ] {
+            writer.start_file(name, opts).unwrap();
+            writer.write_all(&[0]).unwrap();
+        }
+
+        writer.finish().unwrap();
+        buf
+    };
+
+    let desc = ingest_bytes(
+        &bundle,
+        Some("Public Domain.watch-list"),
+        "https://github.com/aautonomicc/Watch-It/raw/main/catalog/Public%20Domain.watch-list",
+    )
+    .unwrap();
+
+    let text = &desc.description_text;
+    // Episodes collapsed into one range.
+    assert!(
+        text.contains("Petticoat Junction season 1 episodes 1-15"),
+        "episodes not collapsed: {text}"
+    );
+    // Movies still listed.
+    assert!(text.contains("The General (1926)"), "movie missing: {text}");
+    assert!(text.contains("Nosferatu (1922)"), "movie missing: {text}");
+    // Duplicate movie deduped to a single entry.
+    let living_dead = text.matches("Night of the Living Dead").count();
+    assert_eq!(living_dead, 1, "duplicate movie not deduped: {text}");
+    // No hex junk / no .mp4 extensions leaking.
+    assert!(!text.contains("66cacd06"), "hex junk leaked: {text}");
+    assert!(!text.contains(".mp4"), "extensions leaked: {text}");
 }

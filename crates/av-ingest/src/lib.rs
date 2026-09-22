@@ -5,6 +5,7 @@ pub mod ingest;
 pub mod location;
 pub mod metadata;
 pub mod mime;
+pub mod series;
 pub mod watchlist;
 
 pub use error::{IngestError, IngestResult};
