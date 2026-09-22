@@ -30,6 +30,8 @@ pub enum ResourceKind {
     Audio,
     File,
     Pdf,
+    /// W@tch (Watch-It) `.watch-list` media bundle.
+    WatchList,
     Other(String),
 }
 

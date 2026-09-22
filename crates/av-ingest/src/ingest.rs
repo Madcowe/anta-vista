@@ -4,7 +4,9 @@ use crate::{
     location::analyze_location,
     metadata::extract,
     mime::{canonicalize_mime, detect_mime, mime_major},
+    watchlist::{classify, to_extracted_meta},
 };
+use av_core::constants::WATCHLIST_MIME;
 use av_core::types::{ResourceDescriptor, ResourceKind};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -17,11 +19,7 @@ pub fn ingest_bytes(
     filename: Option<&str>,
     location: &str,
 ) -> IngestResult<ResourceDescriptor> {
-    let mime_raw = detect_mime(bytes)?;
-    let mime = canonicalize_mime(&mime_raw);
-
-    let kind = kind_from_mime(&mime);
-
+    // Compute location info and effective filename early (they are mime‑independent).
     let location_info = analyze_location(location);
     let location_scheme = location_info.scheme;
     let location_canonical = location_info.canonical;
@@ -37,10 +35,28 @@ pub fn ingest_bytes(
                 None
             }
         });
-
     let effective_filename = filename.or(inferred_filename.as_deref());
 
-    let meta = extract(bytes, &mime);
+    // Try to detect a W@tch `.watch‑list` bundle first.
+    let (mime, kind, meta) = match classify(bytes, effective_filename) {
+        Some(wl_meta) => {
+            let mime = WATCHLIST_MIME.to_string();
+            let kind = ResourceKind::WatchList;
+            // Use the URL's real filename for the base, not the flattened
+            // inferred filename (which would eat the embed window with
+            // host/directory tokens).
+            let display = crate::watchlist::bundle_display_name(filename, location);
+            let meta = to_extracted_meta(&wl_meta, display.as_deref());
+            (mime, kind, meta)
+        }
+        None => {
+            let mime_raw = detect_mime(bytes)?;
+            let mime = canonicalize_mime(&mime_raw);
+            let kind = kind_from_mime(&mime);
+            let meta = extract(bytes, &mime);
+            (mime, kind, meta)
+        }
+    };
 
     let description_text = synthesize(&mime, effective_filename, &meta);
 

@@ -202,8 +202,7 @@ pub fn run(
     };
 
     if !effective_tags.is_empty() {
-        let tag_str = effective_tags.join(", ");
-        resource.description_text = format!("{} tagged as: {}", resource.description_text, tag_str);
+        av_ingest::apply_tags(&mut resource, &effective_tags);
     }
 
     // --- Step 4: Check for duplicate ----------------------------------------

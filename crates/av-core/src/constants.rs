@@ -18,6 +18,19 @@ pub const MINILM_DIM: u16 = 384;
 pub const MINILM_MODEL_ID: &str = "all-MiniLM-L6-v2";
 
 // ---------------------------------------------------------------------------
+// Embedding text window
+// ---------------------------------------------------------------------------
+/// Conservative estimate of the MiniLM encoding window in characters
+/// (~256 tokens at ~4 chars/token). Inputs past this are truncated by the
+/// tokenizer, so watch-list descriptions are filled up to this budget.
+pub const EMBED_WINDOW_CHARS: usize = 1024;
+
+// ---------------------------------------------------------------------------
+// Watch-list (W@tch `.watch-list` bundle) file type
+// ---------------------------------------------------------------------------
+pub const WATCHLIST_MIME: &str = "application/x-watch-list";
+
+// ---------------------------------------------------------------------------
 // URI schemes
 // ---------------------------------------------------------------------------
 /// Input alias accepted for the canonical `autonomi` scheme.

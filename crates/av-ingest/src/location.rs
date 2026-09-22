@@ -95,6 +95,18 @@ fn filename_from_path(path: Option<&str>) -> Option<String> {
     sanitize_filename(&percent_decode(segment)?)
 }
 
+/// Return the percent-decoded last path segment of an arbitrary location URI
+/// (e.g. "Public%20Domain.watch-list" → "Public Domain.watch-list").
+/// Unstable for bare autonomi addresses (no path) → None.
+pub fn last_url_segment(location: &str) -> Option<String> {
+    let (_, rest) = location.split_once("://")?;
+    let (before_query, _) = split_once_any(rest, &['?', '#']);
+    let (_, path) = split_path(before_query);
+    let segment = path?.rsplit('/').find(|segment| !segment.is_empty())?;
+    let decoded = percent_decode(segment)?;
+    sanitize_filename(&decoded)
+}
+
 fn filename_from_query(query: &str) -> Option<String> {
     for pair in query.split('&') {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
