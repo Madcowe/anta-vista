@@ -68,13 +68,16 @@ enforce it — callers must implement their own timeout logic around
 
 ## Platform
 
-### Windows: av-net-x0x excluded from CI test run
+### Windows: av-net-x0x tests are excluded on Windows
 
 The `ureq` SSE listener uses blocking I/O that behaves differently on Windows.
 The crate compiles on Windows but the SSE listener is not test-validated there.
-All other crates are fully tested on Windows.
+All other crates are fully tested on Windows. Run
+`cargo test --workspace --exclude av-net-x0x` there.
 
 ### Model download requires internet
 
-`MiniLmProvider::new()` downloads the ONNX model from Hugging Face on first
-use. Air-gapped environments must pre-cache the model manually.
+`MiniLmProvider::new()` downloads ~87 MB of ONNX weights from Hugging Face on
+first use, then serves every later call from disk. Weights are cached under the
+OS cache dir (`av_core::paths::cache_dir`); set `FASTEMBED_CACHE_DIR` to choose a
+different location. Air-gapped environments must pre-cache the model there.

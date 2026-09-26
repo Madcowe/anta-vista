@@ -1,10 +1,10 @@
 /target
-/.github/workflow
 /issues
 
-# MiniLM model weights downloaded by fastembed. The cache is created relative to
-# the current working directory, so it lands wherever `av` or `cargo test` was
-# run from — the repo root, or a crate directory under test. This must NOT be
-# anchored with a leading slash, or only the root copy is ignored and the rest
-# (87 MB each) show up as untracked files ready to be committed.
+# MiniLM model weights (~87 MB) downloaded by fastembed. `MiniLmProvider` points
+# fastembed at the OS cache dir, but its default is a `.fastembed_cache` folder
+# relative to the *current working directory* — so this still shows up if you run
+# `av` or `cargo test` from a checkout before that override applies, or point
+# FASTEMBED_CACHE_DIR somewhere inside the tree. Not anchored with a leading
+# slash on purpose: a root-only rule leaves the per-crate copies unignored.
 .fastembed_cache/

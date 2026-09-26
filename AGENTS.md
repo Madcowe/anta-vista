@@ -1,7 +1,7 @@
 # Anta-Vista — Agent Guide
 
 ## Workspace
-- Rust workspace, `resolver = "2"`, **no toolchain file** — CI uses `stable` via `dtolnay/rust-toolchain`. All crates `edition = "2024"`, version `0.2.0`.
+- Rust workspace, `resolver = "2"`, **no toolchain file** — build with `stable` (no `rust-toolchain` file pins a version). All crates `edition = "2024"`, version `0.2.0`.
 - No `.cargo/config`, no `rustfmt.toml`, no `clippy.toml`.
 - **Binary**: `av-cli` publishes the `av` binary (`crates/av-cli/src/main.rs`). All other crates are libraries.
 - **Crate dependency graph** (bottom-up, a fan not a chain):
@@ -17,10 +17,10 @@
 
 ## Commands
 ```sh
-cargo check --workspace                   # CI check step
-cargo test --workspace                    # CI test step (Linux + macOS)
+cargo check --workspace                   # type-check everything
+cargo test --workspace                    # full suite (Linux + macOS)
 cargo test --workspace -- --include-ignored  # include real MiniLM + x0x live-daemon tests
-cargo test --workspace --exclude av-net-x0x  # Windows CI: skip x0x-dependent tests
+cargo test --workspace --exclude av-net-x0x  # Windows: skip x0x-dependent tests
 cargo build --release -p av-probe          # distributed test tool
 cargo run --example local_search -p anta-vista-examples    # local demo (mock embeddings)
 cargo run --example p2p_two_nodes -p anta-vista-examples   # P2P demo (needs x0x daemon)
@@ -30,8 +30,8 @@ cargo run --example p2p_two_nodes -p anta-vista-examples   # P2P demo (needs x0x
 - **x0x live-daemon tests** (`av-test-suite/tests/x0x_live_daemon.rs`) are `#[ignore]` **and** body-guarded by `skip_if_no_daemon()`. The guard is *discovery-based*, not a health probe: it checks the x0x data dir (`ProjectDirs::from("", "", "x0x")`) for readable `api.port` + `api-token` files. Runs only with `--include-ignored`.
 - `skip_if_no_daemon()` / `inject_gossip_payload()` / `spawn_named_instance()` live in `av-test-suite/src/x0x_harness.rs`.
 - `av-test-suite` has no `[[test]]` entries in `Cargo.toml` but **does** ship integration tests via auto-discovery (`tests/av_*.rs`, `integration_*.rs`) alongside its shared helpers (`fixtures`, `generators`, `attacks`, `prelude`). Both run under `cargo test -p av-test-suite`.
-- Real MiniLM model tests (`--include-ignored`) download ~22 MB on first run via `fastembed`/ORT → `.fastembed_cache/`.
-- `proptest` is a workspace dependency — property-based tests exist but are not CI-gated separately.
+- Real MiniLM model tests (`--include-ignored`) download ~87 MB on first run via `fastembed`/ORT, cached under the OS cache dir (`av_core::paths::cache_dir`); `FASTEMBED_CACHE_DIR` overrides it.
+- `proptest` is a workspace dependency — property-based tests exist but are not run as a separate gate.
 
 ## CLI
 ```sh
@@ -50,7 +50,7 @@ Flags: `--non-interactive` (JSON machine mode; may appear before or after subcom
 
 - **Reuse the CLI, don't reimplement it.** `web/handlers.rs` calls `cmd::search::collect_results`, `cmd::search::reinforce`, `cmd::rate::record_feedback`, `cmd::rate::is_locally_indexed`, `cmd::index::index_resource` and `cmd::status::database_counts`. If a behaviour changes in `cmd/`, the browser must change with it — extend the shared function rather than adding a web-only copy. `web` deliberately does **not** depend on `av-index`/`av-embed` crates directly.
 - **Startup state is a live snapshot, not a boot constant.** `AppState.startup` is an `RwLock<StartupState>`. Search decides whether to fan out to peers from `startup.x0x_config`, so starting a daemon from the setup banner is useless unless `refresh_network_deps()` runs. Every start/install handler calls it. Handlers take one read guard for the whole request rather than re-reading, so a mid-request change cannot alter the fan-out.
-- **`miniLM` loads lazily** (`EmbeddingCache(OnceLock<Result<Arc<MiniLmProvider>, String>>)`) — binding the socket must not wait on a ~22 MB model. Success *and* failure are cached so a broken cache isn't retried per keystroke.
+- **`miniLM` loads lazily** (`EmbeddingCache(OnceLock<Result<Arc<MiniLmProvider>, String>>)`) — binding the socket must not wait on an ~87 MB model. Success *and* failure are cached so a broken cache isn't retried per keystroke.
 - **Per-request `av_store::open()`** is required (`Connection` isn't `Sync`). This is why `av-store`'s migration bookkeeping uses `INSERT OR IGNORE`: several threads can reach a fresh database at once, all see the migrations as pending, and all of the DDL is idempotent. `web/mod.rs` also pre-warms the database before binding so the race is not hit in practice. Covered by `test_concurrent_opens_of_a_fresh_database` in `av-store/tests/on_disk.rs`.
 - **Shutdown is a poll, not `Server::unblock()`.** `tiny_http::Server::unblock()` releases exactly **one** waiting thread ("If there are several such threads, only one is unblocked"), so a 4-worker pool would hang on `--run-for`. Workers use `recv_timeout(200ms)` against an `AtomicBool` instead.
 - **Host-header guard** rejects anything that isn't a loopback name, which is the DNS-rebinding defence for a loopback-bound server. Keep it in front of every route.
@@ -66,7 +66,7 @@ Flags: `--non-interactive` (JSON machine mode; may appear before or after subcom
 
 ## Key dependencies & quirks
 - `fastembed` v4 with features `["ort-download-binaries", "hf-hub-rustls-tls"]` — declared inline in `av-embed`, not a workspace dep.
-- `rusqlite` with `bundled` feature everywhere — WAL mode + foreign keys enabled per `IMPLEMENTATION_PLAN.md`. Declared inline in `av-trust`/`av-query` despite being a workspace dep; depends on same spec.
+- `rusqlite` with `bundled` feature everywhere — every `av-store` connection enables WAL mode and `PRAGMA foreign_keys` (see `crates/av-store/src/db.rs`). Declared inline in `av-trust`/`av-query` despite being a workspace dep; depends on same spec.
 - `ureq` (sync HTTP) — no tokio or async runtime in the project. The web server is `tiny_http` on plain threads, not an async runtime either.
 - `tiny_http` 0.12 — its `unblock()` releases only one waiting thread, so shutdown is polled instead (see Web interface).
 - `infer` for MIME detection — `kamadak-exif` for image metadata, `id3` for audio (`av-ingest`).

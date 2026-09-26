@@ -90,11 +90,11 @@ fn test_profile_is_minilm() {
     assert!(profile.normalized);
 }
 
-/// Real MiniLM integration test — requires internet access to download model (~22 MB).
-/// Marked #[ignore] so it doesn't run in normal CI.
+/// Real MiniLM integration test — requires internet access to download model (~87 MB).
+/// Marked #[ignore] so it doesn't run in the default test run.
 /// Run with: cargo test -- --ignored
 #[test]
-#[ignore = "requires internet: downloads all-MiniLM-L6-v2 model (~22MB)"]
+#[ignore = "requires internet: downloads all-MiniLM-L6-v2 model (~87MB)"]
 fn test_real_minilm_dim_and_norm() {
     use av_embed::MiniLmProvider;
     let provider = MiniLmProvider::new().expect("load MiniLM model");
@@ -110,7 +110,7 @@ fn test_real_minilm_dim_and_norm() {
 }
 
 #[test]
-#[ignore = "requires internet: downloads all-MiniLM-L6-v2 model (~22MB)"]
+#[ignore = "requires internet: downloads all-MiniLM-L6-v2 model (~87MB)"]
 fn test_real_minilm_deterministic() {
     use av_embed::MiniLmProvider;
     let provider = MiniLmProvider::new().expect("load MiniLM model");
