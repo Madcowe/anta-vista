@@ -1,10 +1,10 @@
-use std::time::{Duration, Instant};
 use crate::cli::Cli;
 use crate::output::{TestResult, TestStatus};
 use crate::tests::helpers::MessageHub;
+use av_core::types::MessageKind;
 use av_net_x0x::dispatcher::MessageDispatcher;
 use av_net_x0x::payloads::ResponsePayload;
-use av_core::types::MessageKind;
+use std::time::{Duration, Instant};
 
 pub fn test_gossip_search(
     args: &Cli,
@@ -35,7 +35,9 @@ pub fn test_gossip_search(
     let timeout = Duration::from_secs(args.wait);
     let matched = hub.wait_for_gossip(timeout, |event| {
         if event.envelope.kind == MessageKind::Response {
-            if let Ok(resp) = serde_json::from_value::<ResponsePayload>(event.envelope.payload.clone()) {
+            if let Ok(resp) =
+                serde_json::from_value::<ResponsePayload>(event.envelope.payload.clone())
+            {
                 return resp.query_id == query_id;
             }
         }
@@ -46,7 +48,8 @@ pub fn test_gossip_search(
 
     match matched {
         Some(event) => {
-            let payload: ResponsePayload = serde_json::from_value(event.envelope.payload.clone()).unwrap();
+            let payload: ResponsePayload =
+                serde_json::from_value(event.envelope.payload.clone()).unwrap();
             let details = if payload.results.is_empty() {
                 "Gossip search query successful, but returned 0 results".to_string()
             } else {
@@ -55,7 +58,7 @@ pub fn test_gossip_search(
                     payload.results[0].description_text, payload.results[0].score
                 )
             };
-            
+
             TestResult {
                 test_id: "S1".to_string(),
                 category: "search".to_string(),
@@ -114,9 +117,20 @@ pub fn test_direct_search(
             if delay > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(delay));
             }
-            match dispatcher.send_direct_query(peer_id, "document about memory safety", 5, args.wait * 1000, vec![]) {
-                Ok(id) => { result = Some(id); break; }
-                Err(e) => { last_err = e.to_string(); }
+            match dispatcher.send_direct_query(
+                peer_id,
+                "document about memory safety",
+                5,
+                args.wait * 1000,
+                vec![],
+            ) {
+                Ok(id) => {
+                    result = Some(id);
+                    break;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
             }
         }
         match result {
@@ -140,7 +154,9 @@ pub fn test_direct_search(
     let timeout = Duration::from_secs(args.wait);
     let matched = hub.wait_for_direct(timeout, |msg| {
         if msg.envelope.kind == MessageKind::Response {
-            if let Ok(resp) = serde_json::from_value::<ResponsePayload>(msg.envelope.payload.clone()) {
+            if let Ok(resp) =
+                serde_json::from_value::<ResponsePayload>(msg.envelope.payload.clone())
+            {
                 return resp.query_id == query_id;
             }
         }
@@ -151,7 +167,8 @@ pub fn test_direct_search(
 
     match matched {
         Some(msg) => {
-            let payload: ResponsePayload = serde_json::from_value(msg.envelope.payload.clone()).unwrap();
+            let payload: ResponsePayload =
+                serde_json::from_value(msg.envelope.payload.clone()).unwrap();
             let details = if payload.results.is_empty() {
                 "Direct search query successful, but returned 0 results".to_string()
             } else {
@@ -160,7 +177,7 @@ pub fn test_direct_search(
                     payload.results[0].description_text, payload.results[0].score
                 )
             };
-            
+
             TestResult {
                 test_id: "S2".to_string(),
                 category: "search".to_string(),
@@ -193,27 +210,30 @@ pub fn test_scheme_filtering(
     let start = Instant::now();
 
     // 1. Broadcast search query allowing only "ant" scheme
-    let query_id = match dispatcher.publish_query("file", 10, args.wait * 1000, vec!["ant".to_string()]) {
-        Ok(id) => id,
-        Err(e) => {
-            return TestResult {
-                test_id: "S3".to_string(),
-                category: "search".to_string(),
-                name: "scheme_filtering".to_string(),
-                transport: "gossip".to_string(),
-                status: TestStatus::Fail,
-                duration_ms: start.elapsed().as_millis() as u64,
-                details: format!("Failed to publish search query: {:?}", e),
-                debug: serde_json::json!({ "error": e.to_string() }),
-            };
-        }
-    };
+    let query_id =
+        match dispatcher.publish_query("file", 10, args.wait * 1000, vec!["ant".to_string()]) {
+            Ok(id) => id,
+            Err(e) => {
+                return TestResult {
+                    test_id: "S3".to_string(),
+                    category: "search".to_string(),
+                    name: "scheme_filtering".to_string(),
+                    transport: "gossip".to_string(),
+                    status: TestStatus::Fail,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    details: format!("Failed to publish search query: {:?}", e),
+                    debug: serde_json::json!({ "error": e.to_string() }),
+                };
+            }
+        };
 
     // 2. Wait for response
     let timeout = Duration::from_secs(args.wait);
     let matched = hub.wait_for_gossip(timeout, |event| {
         if event.envelope.kind == MessageKind::Response {
-            if let Ok(resp) = serde_json::from_value::<ResponsePayload>(event.envelope.payload.clone()) {
+            if let Ok(resp) =
+                serde_json::from_value::<ResponsePayload>(event.envelope.payload.clone())
+            {
                 return resp.query_id == query_id;
             }
         }
@@ -224,10 +244,12 @@ pub fn test_scheme_filtering(
 
     match matched {
         Some(event) => {
-            let payload: ResponsePayload = serde_json::from_value(event.envelope.payload.clone()).unwrap();
-            let all_allowed_schemes = payload.results.iter().all(|r| {
-                r.location_scheme.as_deref() == Some("ant")
-            });
+            let payload: ResponsePayload =
+                serde_json::from_value(event.envelope.payload.clone()).unwrap();
+            let all_allowed_schemes = payload
+                .results
+                .iter()
+                .all(|r| r.location_scheme.as_deref() == Some("ant"));
 
             if payload.results.is_empty() {
                 TestResult {
@@ -237,7 +259,8 @@ pub fn test_scheme_filtering(
                     transport: "gossip".to_string(),
                     status: TestStatus::Pass,
                     duration_ms,
-                    details: "Scheme filter search query returned 0 results as expected".to_string(),
+                    details: "Scheme filter search query returned 0 results as expected"
+                        .to_string(),
                     debug: serde_json::json!({ "query_id": query_id, "response": event.envelope }),
                 }
             } else if all_allowed_schemes {
@@ -248,7 +271,8 @@ pub fn test_scheme_filtering(
                     transport: "gossip".to_string(),
                     status: TestStatus::Pass,
                     duration_ms,
-                    details: "All returned results correctly adhered to the 'ant' scheme filter".to_string(),
+                    details: "All returned results correctly adhered to the 'ant' scheme filter"
+                        .to_string(),
                     debug: serde_json::json!({ "query_id": query_id, "response": event.envelope }),
                 }
             } else {

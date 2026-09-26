@@ -287,11 +287,13 @@ fn golden_sweep_retains_existing_descriptions() {
 
     // JPEG
     let jpeg_bytes = [
-        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
-        0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00,
     ];
     let desc = ingest_bytes(&jpeg_bytes, Some("photo.jpg"), "file:///tmp/photo.jpg").unwrap();
-    assert!(desc.description_text.contains("image") || desc.description_text.contains("photograph"));
+    assert!(
+        desc.description_text.contains("image") || desc.description_text.contains("photograph")
+    );
     assert_eq!(desc.kind, ResourceKind::Image);
     assert_eq!(desc.mime_type, "image/jpeg");
 
@@ -365,8 +367,8 @@ fn tag_invariant_watchlist() {
 #[test]
 fn false_positive_zip() {
     use std::io::{Cursor, Write};
-    use zip::{ZipWriter, write::SimpleFileOptions};
     use zip::CompressionMethod;
+    use zip::{ZipWriter, write::SimpleFileOptions};
 
     let mut buf = Vec::new();
     let mut writer = ZipWriter::new(Cursor::new(&mut buf));
@@ -398,8 +400,8 @@ fn description_deterministic() {
 fn ingest_watchlist_url_uses_real_filename_base() {
     let bundle = {
         use std::io::{Cursor, Write};
-        use zip::{ZipWriter, write::SimpleFileOptions};
         use zip::CompressionMethod;
+        use zip::{ZipWriter, write::SimpleFileOptions};
 
         let mut buf = Vec::new();
         let mut writer = ZipWriter::new(Cursor::new(&mut buf));
@@ -412,8 +414,7 @@ fn ingest_watchlist_url_uses_real_filename_base() {
         buf
     };
 
-    let uri =
-        "https://github.com/aautonomicc/Watch-It/raw/main/catalog/Public%20Domain.watch-list";
+    let uri = "https://github.com/aautonomicc/Watch-It/raw/main/catalog/Public%20Domain.watch-list";
     let desc = ingest_bytes(&bundle, None, uri).unwrap();
     assert_eq!(desc.kind, ResourceKind::WatchList);
     assert_eq!(desc.mime_type, WATCHLIST_MIME);
@@ -424,20 +425,25 @@ fn ingest_watchlist_url_uses_real_filename_base() {
         "unexpected base: {text}"
     );
     assert!(!text.contains("github"), "host leaked into base: {text}");
-    assert!(!text.contains("aautonomicc"), "user leaked into base: {text}");
+    assert!(
+        !text.contains("aautonomicc"),
+        "user leaked into base: {text}"
+    );
 }
 
 #[test]
 fn ingest_watchlist_bundle_smoke() {
     let bundle = {
         use std::io::{Cursor, Write};
-        use zip::{ZipWriter, write::SimpleFileOptions};
         use zip::CompressionMethod;
+        use zip::{ZipWriter, write::SimpleFileOptions};
 
         let mut buf = Vec::new();
         let mut writer = ZipWriter::new(Cursor::new(&mut buf));
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-        writer.start_file("datamaps/My Video (2025) [1080p].mp4.datamap", opts).unwrap();
+        writer
+            .start_file("datamaps/My Video (2025) [1080p].mp4.datamap", opts)
+            .unwrap();
         writer.write_all(&[0]).unwrap();
         writer.finish().unwrap();
         buf
@@ -465,8 +471,8 @@ fn ingest_watchlist_bundle_smoke() {
 fn ingest_watchlist_compacts_series_and_dedupes_movies() {
     let bundle = {
         use std::io::{Cursor, Write};
-        use zip::{ZipWriter, write::SimpleFileOptions};
         use zip::CompressionMethod;
+        use zip::{ZipWriter, write::SimpleFileOptions};
 
         let mut buf = Vec::new();
         let mut writer = ZipWriter::new(Cursor::new(&mut buf));

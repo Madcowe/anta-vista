@@ -111,15 +111,16 @@ pub fn execute_search(
         }
         candidates.extend(net_client.discover_agent_ids(10));
         let self_id = x0x_cfg.agent_id.clone();
-        let candidates: Vec<String> = candidates
-            .into_iter()
-            .filter(|id| id != &self_id)
-            .fold(Vec::new(), |mut acc, id| {
-                if !acc.contains(&id) {
-                    acc.push(id);
-                }
-                acc
-            });
+        let candidates: Vec<String> =
+            candidates
+                .into_iter()
+                .filter(|id| id != &self_id)
+                .fold(Vec::new(), |mut acc, id| {
+                    if !acc.contains(&id) {
+                        acc.push(id);
+                    }
+                    acc
+                });
 
         for peer_id in &candidates {
             let query_id = uuid::Uuid::new_v4().to_string();
@@ -172,7 +173,8 @@ pub fn execute_search(
                     {
                         if query_ids.contains(&resp.query_id) {
                             network_results.push((msg.sender.clone(), resp.clone()));
-                            let _ = peers::upsert(conn, &msg.sender, serde_json::json!({}), now_secs());
+                            let _ =
+                                peers::upsert(conn, &msg.sender, serde_json::json!({}), now_secs());
                             if cli.stream {
                                 print_progressive_search_results(&msg.sender, &resp.results);
                             }
@@ -189,7 +191,12 @@ pub fn execute_search(
                     {
                         if query_ids.contains(&resp.query_id) {
                             network_results.push((event.origin.clone(), resp.clone()));
-                            let _ = peers::upsert(conn, &event.origin, serde_json::json!({}), now_secs());
+                            let _ = peers::upsert(
+                                conn,
+                                &event.origin,
+                                serde_json::json!({}),
+                                now_secs(),
+                            );
                             if cli.stream {
                                 print_progressive_search_results(&event.origin, &resp.results);
                             }
@@ -263,15 +270,16 @@ pub fn execute_resolve(
         }
         candidates.extend(net_client.discover_agent_ids(10));
         let self_id = x0x_cfg.agent_id.clone();
-        let candidates: Vec<String> = candidates
-            .into_iter()
-            .filter(|id| id != &self_id)
-            .fold(Vec::new(), |mut acc, id| {
-                if !acc.contains(&id) {
-                    acc.push(id);
-                }
-                acc
-            });
+        let candidates: Vec<String> =
+            candidates
+                .into_iter()
+                .filter(|id| id != &self_id)
+                .fold(Vec::new(), |mut acc, id| {
+                    if !acc.contains(&id) {
+                        acc.push(id);
+                    }
+                    acc
+                });
 
         for peer_id in &candidates {
             let query_id = uuid::Uuid::new_v4().to_string();
@@ -322,7 +330,8 @@ pub fn execute_resolve(
                     {
                         if query_ids.contains(&resp.query_id) {
                             network_results.push((msg.sender.clone(), resp.clone()));
-                            let _ = peers::upsert(conn, &msg.sender, serde_json::json!({}), now_secs());
+                            let _ =
+                                peers::upsert(conn, &msg.sender, serde_json::json!({}), now_secs());
                             if cli.stream {
                                 print_progressive_name_results(&msg.sender, &resp.results);
                             }
@@ -339,7 +348,12 @@ pub fn execute_resolve(
                     ) {
                         if query_ids.contains(&resp.query_id) {
                             network_results.push((event.origin.clone(), resp.clone()));
-                            let _ = peers::upsert(conn, &event.origin, serde_json::json!({}), now_secs());
+                            let _ = peers::upsert(
+                                conn,
+                                &event.origin,
+                                serde_json::json!({}),
+                                now_secs(),
+                            );
                             if cli.stream {
                                 print_progressive_name_results(&event.origin, &resp.results);
                             }
@@ -361,7 +375,7 @@ fn print_progressive_search_results(sender: &str, results: &[ResourceResult]) {
         println!(
             "{} [Peer {}] {} - {} (score: {:.3})",
             console::style("→").cyan(),
-            &sender[..8],
+            crate::output::abbrev(sender, 8),
             res.location,
             res.description_text,
             res.score
@@ -381,7 +395,7 @@ fn print_progressive_name_results(sender: &str, results: &[NameRecord]) {
         println!(
             "{} [Peer {}] {} → {} (TTL: {}s)",
             console::style("→").cyan(),
-            &sender[..8],
+            crate::output::abbrev(sender, 8),
             rec.original_name,
             rec.target,
             rec.ttl_secs

@@ -39,6 +39,9 @@ mod adversarial {
 
         // Oversized payload should be rejected
         let oversized = vec![0u8; OVERSIZED];
-        assert!(oversized.len() > MAX_PAYLOAD_BYTES, "oversized payload detected");
+        assert!(
+            oversized.len() > MAX_PAYLOAD_BYTES,
+            "oversized payload detected"
+        );
     }
 }

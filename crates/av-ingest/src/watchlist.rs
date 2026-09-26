@@ -37,7 +37,9 @@ pub fn classify(bytes: &[u8], filename_hint: Option<&str>) -> Option<WatchListMe
     let mut list_txt: Option<String> = None;
 
     for i in 0..archive.len() {
-        let Ok(mut file) = archive.by_index(i) else { continue };
+        let Ok(mut file) = archive.by_index(i) else {
+            continue;
+        };
         let name = file.name().to_string();
         let lower = name.to_ascii_lowercase();
 
@@ -176,17 +178,10 @@ pub fn bundle_display_name(filename: Option<&str>, location: &str) -> Option<Str
         .rsplit_once('.')
         .map(|(before, _)| !before.is_empty())
         .unwrap_or(false);
-    if has_ext {
-        bundle_stem(&last)
-    } else {
-        None
-    }
+    if has_ext { bundle_stem(&last) } else { None }
 }
 
-pub fn to_extracted_meta(
-    meta: &WatchListMeta,
-    filename_hint: Option<&str>,
-) -> ExtractedMeta {
+pub fn to_extracted_meta(meta: &WatchListMeta, filename_hint: Option<&str>) -> ExtractedMeta {
     let title = filename_hint.and_then(bundle_stem);
     let title_meta = ExtractedMeta {
         title: title.clone(),
@@ -223,7 +218,11 @@ pub fn items_from_meta(meta: &ExtractedMeta) -> Vec<String> {
         .get("watch_list")
         .and_then(|w| w.get("items"))
         .and_then(|items| items.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -258,7 +257,11 @@ pub fn apply_tags(resource: &mut ResourceDescriptor, tags: &[String]) {
             .get("watch_list")
             .and_then(|w| w.get("items"))
             .and_then(|items| items.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let base = maybe_base.unwrap_or_else(|| {
             // Fallback: reconstruct base from descriptor fields.
@@ -267,14 +270,11 @@ pub fn apply_tags(resource: &mut ResourceDescriptor, tags: &[String]) {
             if let Some(title) = &resource.metadata_json.get("title").and_then(|t| t.as_str()) {
                 dummy.title = Some(title.to_string());
             }
-            watchlist_base(
-                &resource.mime_type,
-                resource.filename.as_deref(),
-                &dummy,
-            )
+            watchlist_base(&resource.mime_type, resource.filename.as_deref(), &dummy)
         });
         let display_items = crate::series::compact_items(&items);
-        resource.description_text = fill_into_window(&base, &display_items, Some(&tags), EMBED_WINDOW_CHARS);
+        resource.description_text =
+            fill_into_window(&base, &display_items, Some(&tags), EMBED_WINDOW_CHARS);
     } else {
         let tag_str = tags.join(", ");
         resource.description_text = format!("{} tagged as: {}", resource.description_text, tag_str);
@@ -289,9 +289,9 @@ pub fn apply_tags(resource: &mut ResourceDescriptor, tags: &[String]) {
 mod tests {
     use super::*;
     use av_core::types::ResourceKind;
-    use std::io::{Write, Cursor};
-    use zip::{ZipWriter, write::SimpleFileOptions};
+    use std::io::{Cursor, Write};
     use zip::CompressionMethod;
+    use zip::{ZipWriter, write::SimpleFileOptions};
 
     fn make_bundle(
         datamap_members: &[&str],
@@ -329,15 +329,21 @@ mod tests {
     fn classify_floor_zip_with_root_datamaps() {
         // Hand‑made floor format: root member.datamap files.
         let bytes = make_bundle(
-            &["Some Show S01E01 (2023) [1080p].mkv.datamap", "Some Movie (2024) [2160p].mp4.datamap"],
+            &[
+                "Some Show S01E01 (2023) [1080p].mkv.datamap",
+                "Some Movie (2024) [2160p].mp4.datamap",
+            ],
             false,
             None,
         );
         let meta = classify(&bytes, None).unwrap();
-        assert_eq!(meta.items, vec![
-            "Some Show S01E01 (2023) [1080p].mkv",
-            "Some Movie (2024) [2160p].mp4",
-        ]);
+        assert_eq!(
+            meta.items,
+            vec![
+                "Some Show S01E01 (2023) [1080p].mkv",
+                "Some Movie (2024) [2160p].mp4",
+            ]
+        );
         assert_eq!(*meta.media_types.get("mkv").unwrap(), 1);
         assert_eq!(*meta.media_types.get("mp4").unwrap(), 1);
     }
@@ -427,6 +433,9 @@ mod tests {
         let original = desc.description_text.clone();
         let tags = vec!["docs".into()];
         apply_tags(&mut desc, &tags);
-        assert_eq!(desc.description_text, format!("{} tagged as: docs", original));
+        assert_eq!(
+            desc.description_text,
+            format!("{} tagged as: docs", original)
+        );
     }
 }

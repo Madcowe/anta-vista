@@ -1,0 +1,249 @@
+/* Retro theme: a late-90s desktop look.
+   Loaded always, but only applies when <html data-theme="retro">.
+   Everything here is real UI surface — no fake chrome, no simulated
+   browser/OS furniture, nothing that pretends to be a status the app
+   does not actually have. */
+
+[data-theme="retro"] {
+  --bg: #008080;
+  --bg-panel: #c0c0c0;
+  --fg: #000;
+  --fg-dim: #333;
+  --accent: #000080;
+  --accent-fg: #fff;
+  --hi: #fff;
+  --shadow: #404040;
+  --ok: #008000;
+  --warn: #804000;
+  --bad: #800000;
+  --mono: "Lucida Console", "Courier New", monospace;
+  --sans: "MS Sans Serif", "Segoe UI", Tahoma, sans-serif;
+}
+
+[data-theme="retro"] body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 15px;
+  /* A faint dither, so large areas do not read as flat 90s teal. */
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 0, 0, 0.04) 1px, transparent 1px);
+  background-size: 2px 2px;
+}
+
+[data-theme="retro"] .bar {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-bottom: 2px solid #000;
+}
+
+[data-theme="retro"] .wordmark {
+  font-family: var(--sans);
+  font-weight: bold;
+  letter-spacing: 0.02em;
+  text-shadow: 1px 1px 0 rgba(0, 0, 0, 0.6);
+}
+
+/* The classic 3D bevel, drawn with borders rather than images. */
+[data-theme="retro"] .btn {
+  font-family: var(--sans);
+  background: var(--bg-panel);
+  color: var(--fg);
+  border: 2px solid;
+  border-color: var(--hi) var(--shadow) var(--shadow) var(--hi);
+  border-radius: 0;
+  padding: 5px 14px;
+  cursor: pointer;
+  min-height: 30px;
+}
+
+[data-theme="retro"] .btn:active:not(:disabled) {
+  border-color: var(--shadow) var(--hi) var(--hi) var(--shadow);
+}
+
+[data-theme="retro"] .btn:focus-visible {
+  outline: 2px dotted #000;
+  outline-offset: 2px;
+}
+
+[data-theme="retro"] .btn:disabled {
+  color: var(--shadow);
+  text-shadow: 1px 1px 0 var(--hi);
+  cursor: not-allowed;
+}
+
+[data-theme="retro"] .btn-primary {
+  font-weight: bold;
+}
+
+[data-theme="retro"] .btn-quiet {
+  background: transparent;
+  border-color: transparent;
+  color: inherit;
+  text-decoration: underline;
+}
+
+[data-theme="retro"] .btn-quiet:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+[data-theme="retro"] .bar .btn-quiet {
+  color: var(--accent-fg);
+}
+
+[data-theme="retro"] input[type="search"],
+[data-theme="retro"] input[type="text"] {
+  font-family: var(--mono);
+  font-size: 14px;
+  background: var(--hi);
+  color: var(--fg);
+  border: 2px solid;
+  border-color: var(--shadow) var(--hi) var(--hi) var(--shadow);
+  border-radius: 0;
+  padding: 6px 8px;
+  min-height: 30px;
+}
+
+[data-theme="retro"] input:focus-visible {
+  outline: 1px dotted #000;
+  outline-offset: -4px;
+}
+
+[data-theme="retro"] .panel,
+[data-theme="retro"] .drawer {
+  background: var(--bg-panel);
+  border: 2px solid;
+  border-color: var(--hi) var(--shadow) var(--shadow) var(--hi);
+  border-radius: 0;
+  padding: 14px;
+}
+
+[data-theme="retro"] .banner {
+  background: var(--warn);
+  color: #fff;
+  border-bottom: 2px solid #000;
+  padding: 10px 16px;
+  font-weight: bold;
+}
+
+[data-theme="retro"] .badge {
+  font-family: var(--mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  background: var(--accent);
+  color: var(--accent-fg);
+  padding: 2px 7px;
+  border-radius: 0;
+}
+
+[data-theme="retro"] .result {
+  background: var(--hi);
+  border: 2px solid;
+  border-color: var(--shadow) var(--hi) var(--hi) var(--shadow);
+  border-radius: 0;
+  padding: 12px;
+}
+
+/* Result titles read as classic links: blue, underlined, visited-purple. */
+[data-theme="retro"] .result-title {
+  color: #0000ee;
+  font-weight: bold;
+}
+
+[data-theme="retro"] .result-title:visited {
+  color: #551a8b;
+}
+
+[data-theme="retro"] .result-title:hover {
+  color: #ee0000;
+}
+
+[data-theme="retro"] .rid,
+[data-theme="retro"] .mime,
+[data-theme="retro"] .score,
+[data-theme="retro"] .hint,
+[data-theme="retro"] .status-line {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+[data-theme="retro"] .command {
+  font-family: var(--mono);
+  background: #000;
+  color: #00ff00;
+  border: 2px inset var(--hi);
+  padding: 10px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+[data-theme="retro"] .dialog {
+  background: var(--bg-panel);
+  border: 2px solid;
+  border-color: var(--hi) var(--shadow) var(--shadow) var(--hi);
+  border-radius: 0;
+  padding: 18px;
+  max-width: 34rem;
+}
+
+[data-theme="retro"] .dialog::backdrop {
+  background: rgba(0, 0, 0, 0.45);
+}
+
+[data-theme="retro"] .result-list {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+
+/* Retro ornaments. Both are driven by real content: the marquee scrolls the
+   live result count, and the cursor marks actual typing. */
+[data-theme="retro"] .marquee {
+  overflow: hidden;
+  white-space: nowrap;
+  border: 2px solid;
+  border-color: var(--shadow) var(--hi) var(--hi) var(--shadow);
+  background: #000;
+  color: #00ff00;
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 3px 0;
+  margin-bottom: 6px;
+}
+
+[data-theme="retro"] .marquee-track {
+  display: inline-block;
+  padding-left: 100%;
+  animation: marquee-scroll 18s linear infinite;
+}
+
+@keyframes marquee-scroll {
+  from { transform: translateX(0); }
+  to { transform: translateX(-100%); }
+}
+
+[data-theme="retro"] #q.typing {
+  /* Blinking block cursor, driven by real key events. */
+  border-right: 8px solid #000;
+  animation: retro-caret 1s steps(1) infinite;
+}
+
+@keyframes retro-caret {
+  50% { border-right-color: transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="retro"] .marquee-track { animation: none; padding-left: 4px; }
+  [data-theme="retro"] #q.typing { animation: none; }
+}
+
+/* An Autonomi location is not a link: there is no open/download path yet. It
+ * looks like a title but reads as unfollowable. */
+[data-theme="retro"] .result-loc {
+  font-weight: bold;
+  cursor: help;
+  text-decoration: underline dotted;
+}

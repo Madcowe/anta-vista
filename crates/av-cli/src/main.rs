@@ -17,6 +17,13 @@ fn main() {
 
     if let Err(e) = av_cli::cmd::run(cli) {
         av_cli::output::print_error(non_interactive, &e);
-        std::process::exit(1);
+        // A missing subcommand is a usage error (clap's convention is 2), not a
+        // runtime failure, so scripts can distinguish "you called me wrong" from
+        // "I tried and failed".
+        let code = match e {
+            av_cli::cmd::CliError::NoSubcommand { .. } => 2,
+            _ => 1,
+        };
+        std::process::exit(code);
     }
 }

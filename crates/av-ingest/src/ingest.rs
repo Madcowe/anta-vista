@@ -26,15 +26,13 @@ pub fn ingest_bytes(
     let inferred_filename = location_info.inferred_filename;
 
     let is_autonomi = location_scheme.as_deref() == Some("autonomi");
-    let resource_filename = filename
-        .map(|f| f.to_string())
-        .or_else(|| {
-            if is_autonomi {
-                inferred_filename.clone()
-            } else {
-                None
-            }
-        });
+    let resource_filename = filename.map(|f| f.to_string()).or_else(|| {
+        if is_autonomi {
+            inferred_filename.clone()
+        } else {
+            None
+        }
+    });
     let effective_filename = filename.or(inferred_filename.as_deref());
 
     // Try to detect a W@tch `.watch‑list` bundle first.

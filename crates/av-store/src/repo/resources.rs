@@ -1,5 +1,5 @@
 use av_core::types::{ResourceDescriptor, ResourceKind};
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{Connection, Result as SqlResult, params};
 
 pub fn insert(conn: &Connection, r: &ResourceDescriptor) -> SqlResult<()> {
     conn.execute(
@@ -156,10 +156,7 @@ mod tests {
 
     #[test]
     fn str_to_kind_unknown_becomes_other() {
-        assert_eq!(
-            str_to_kind("watchlist"),
-            ResourceKind::WatchList
-        );
+        assert_eq!(str_to_kind("watchlist"), ResourceKind::WatchList);
         assert_eq!(
             str_to_kind("mystery"),
             ResourceKind::Other("mystery".to_owned())

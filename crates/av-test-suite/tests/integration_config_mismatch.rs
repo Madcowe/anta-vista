@@ -12,7 +12,11 @@ mod integration {
         let forbidden = vec!["file", "javascript", "data"];
 
         for scheme in forbidden {
-            assert!(!allowed.contains(&scheme), "forbidden scheme {} enforced", scheme);
+            assert!(
+                !allowed.contains(&scheme),
+                "forbidden scheme {} enforced",
+                scheme
+            );
         }
     }
 
@@ -22,14 +26,20 @@ mod integration {
         let invalid_toml = "[unclosed_section";
 
         let result = toml::from_str::<std::collections::BTreeMap<String, String>>(invalid_toml);
-        assert!(result.is_err(), "invalid config rejected, no silent defaults");
+        assert!(
+            result.is_err(),
+            "invalid config rejected, no silent defaults"
+        );
     }
 
     #[test]
     fn test_config_propagation_to_components() {
         // Config settings should be visible to all pipeline components
         let rate_limit = 100;
-        assert!(rate_limit > 0, "config parameter enforced across components");
+        assert!(
+            rate_limit > 0,
+            "config parameter enforced across components"
+        );
     }
 
     #[test]

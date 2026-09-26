@@ -30,7 +30,9 @@ pub struct X0xConfig {
 impl X0xConfig {
     /// Auto-detect from the x0x data directory (Linux / macOS), or via environment variables.
     pub fn from_data_dir() -> NetResult<Self> {
-        if let (Ok(api_base), Ok(token)) = (std::env::var("X0X_API_BASE"), std::env::var("X0X_TOKEN")) {
+        if let (Ok(api_base), Ok(token)) =
+            (std::env::var("X0X_API_BASE"), std::env::var("X0X_TOKEN"))
+        {
             let agent_id = fetch_agent_id(&api_base, &token)?;
             return Ok(Self {
                 api_base,
@@ -103,8 +105,9 @@ fn send_direct_agent() -> ureq::Agent {
 fn x0x_data_dir() -> NetResult<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        let appdata = std::env::var("APPDATA")
-            .map_err(|_| NetError::DaemonUnreachable("APPDATA environment variable not set".into()))?;
+        let appdata = std::env::var("APPDATA").map_err(|_| {
+            NetError::DaemonUnreachable("APPDATA environment variable not set".into())
+        })?;
         Ok(std::path::PathBuf::from(appdata).join("x0x"))
     }
     #[cfg(target_os = "macos")]

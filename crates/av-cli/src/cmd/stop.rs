@@ -1,4 +1,4 @@
-use crate::cmd::{CliResult};
+use crate::cmd::CliResult;
 use crate::output::print_output;
 use serde_json::json;
 

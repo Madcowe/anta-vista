@@ -6,19 +6,24 @@
 #[cfg(test)]
 mod integration {
     use av_test_suite::prelude::*;
-    
 
     #[test]
     fn test_resource_poisoner_ranking() {
         // Resource poisoner publishes misleading description
         let poisoner = ResourcePoisoner::new_with_misleading_description("legitimate-resource");
-        assert!(!poisoner.description.is_empty(), "poisoned description created");
+        assert!(
+            !poisoner.description.is_empty(),
+            "poisoned description created"
+        );
 
         // After trust weighting, should not dominate honest resources
         let poisoner_trust = 0.1;
         let honest_trust = 0.9;
 
-        assert!(honest_trust > poisoner_trust, "honest resources weighted higher");
+        assert!(
+            honest_trust > poisoner_trust,
+            "honest resources weighted higher"
+        );
     }
 
     #[test]

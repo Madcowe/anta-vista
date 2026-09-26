@@ -5,11 +5,11 @@ use proptest::prelude::*;
 /// Strategies for pathological strings
 pub fn pathological_string() -> impl Strategy<Value = String> {
     prop_oneof![
-        Just(String::new()),                          // empty
-        Just("   \t\n".to_string()),                  // whitespace
-        Just("a".repeat(100_000)),                    // very long
-        "[\x00-\x1F]*".prop_map(|s| s),              // control chars
-        r#"[^\x00-\x1F]{1,1000}"#.prop_map(|s| s),  // valid UTF-8
+        Just(String::new()),                       // empty
+        Just("   \t\n".to_string()),               // whitespace
+        Just("a".repeat(100_000)),                 // very long
+        "[\x00-\x1F]*".prop_map(|s| s),            // control chars
+        r#"[^\x00-\x1F]{1,1000}"#.prop_map(|s| s), // valid UTF-8
     ]
 }
 
@@ -34,30 +34,30 @@ pub fn malformed_toml() -> impl Strategy<Value = String> {
 /// Strategies for adversarial agent IDs and timestamps
 pub fn adversarial_agent_id() -> impl Strategy<Value = String> {
     prop_oneof![
-        Just(String::new()),                         // empty
-        Just("not-hex".to_string()),                 // invalid format
-        Just("00".repeat(16)),                       // all zeros
-        Just("ff".repeat(16)),                       // all ones
-        "[a-f0-9]{64}".prop_map(|s| s),             // valid 32-byte hex
+        Just(String::new()),            // empty
+        Just("not-hex".to_string()),    // invalid format
+        Just("00".repeat(16)),          // all zeros
+        Just("ff".repeat(16)),          // all ones
+        "[a-f0-9]{64}".prop_map(|s| s), // valid 32-byte hex
     ]
 }
 
 /// Strategies for timestamp boundary conditions
 pub fn boundary_timestamp() -> impl Strategy<Value = i64> {
     prop_oneof![
-        Just(0i64),                                  // epoch
-        Just(i64::MIN),                              // far past
-        Just(i64::MAX),                              // far future
-        Just(-2_000_000_000i64),                    // before epoch
+        Just(0i64),              // epoch
+        Just(i64::MIN),          // far past
+        Just(i64::MAX),          // far future
+        Just(-2_000_000_000i64), // before epoch
     ]
 }
 
 /// Sybil cluster configuration
 pub fn sybil_cluster_size() -> impl Strategy<Value = usize> {
     prop_oneof![
-        Just(1),    // single agent (no sybil)
-        Just(10),   // small cluster
-        Just(50),   // medium cluster
-        Just(100),  // large cluster
+        Just(1),   // single agent (no sybil)
+        Just(10),  // small cluster
+        Just(50),  // medium cluster
+        Just(100), // large cluster
     ]
 }

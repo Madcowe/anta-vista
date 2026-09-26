@@ -157,9 +157,8 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 /// Synthesize a canonical natural-language description for a resource.
 pub fn synthesize(mime: &str, filename: Option<&str>, meta: &ExtractedMeta) -> String {
     if mime == WATCHLIST_MIME {
-        use crate::watchlist::{items_from_meta, base_from_meta};
-        let base = base_from_meta(meta)
-            .unwrap_or_else(|| watchlist_base(mime, filename, meta));
+        use crate::watchlist::{base_from_meta, items_from_meta};
+        let base = base_from_meta(meta).unwrap_or_else(|| watchlist_base(mime, filename, meta));
         let items = crate::series::compact_items(&items_from_meta(meta));
         return fill_into_window(&base, &items, None, EMBED_WINDOW_CHARS);
     }

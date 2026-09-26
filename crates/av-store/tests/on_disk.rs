@@ -39,6 +39,39 @@ fn test_migration_idempotent_on_disk() {
 }
 
 #[test]
+fn test_concurrent_opens_of_a_fresh_database() {
+    // The web server opens a connection per request, so a burst of requests
+    // against a brand-new database runs `migrate` on several threads at once.
+    // They all see the migrations as pending; only the bookkeeping insert
+    // needs to tolerate the race.
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("concurrent.db");
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let db_path = db_path.clone();
+            std::thread::spawn(move || open(&db_path).map(|_| ()))
+        })
+        .collect();
+
+    for h in handles {
+        h.join()
+            .expect("thread should not panic")
+            .expect("open should succeed");
+    }
+
+    // And the result is a fully migrated database, not a half-applied one.
+    let conn = open(&db_path).expect("final open");
+    let applied: i64 = conn
+        .query_row("SELECT COUNT(*) FROM applied_migrations", [], |r| r.get(0))
+        .expect("count migrations");
+    assert_eq!(
+        applied, 4,
+        "every migration should be recorded exactly once"
+    );
+}
+
+#[test]
 fn test_resource_persists_across_connections() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("persist.db");

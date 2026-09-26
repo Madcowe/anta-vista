@@ -19,8 +19,7 @@ mod daemon {
             return;
         }
 
-        let config = X0xDaemonConfig::discover_default()
-            .expect("daemon not running");
+        let config = X0xDaemonConfig::discover_default().expect("daemon not running");
 
         assert!(!config.api_port.is_empty(), "daemon responding");
     }
@@ -32,8 +31,7 @@ mod daemon {
             return;
         }
 
-        let config = X0xDaemonConfig::discover_default()
-            .expect("daemon not running");
+        let config = X0xDaemonConfig::discover_default().expect("daemon not running");
 
         assert!(!config.api_token.is_empty(), "api token discovered");
     }
@@ -45,8 +43,7 @@ mod daemon {
             return;
         }
 
-        let _config = X0xDaemonConfig::discover_default()
-            .expect("daemon not running");
+        let _config = X0xDaemonConfig::discover_default().expect("daemon not running");
 
         // Real test would POST /subscribe with all topics
         // Then POST /publish and verify SSE event received
@@ -72,8 +69,7 @@ mod daemon {
             return;
         }
 
-        let mut config = X0xDaemonConfig::discover_default()
-            .expect("daemon not running");
+        let mut config = X0xDaemonConfig::discover_default().expect("daemon not running");
 
         config.api_token = "invalid-token".to_string();
 

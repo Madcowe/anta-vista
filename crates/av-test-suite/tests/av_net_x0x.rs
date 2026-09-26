@@ -6,7 +6,6 @@
 #[cfg(test)]
 mod adversarial {
     use av_test_suite::prelude::*;
-    
 
     #[test]
     fn test_envelope_oversized_rejection() {
@@ -22,12 +21,7 @@ mod adversarial {
 
     #[test]
     fn test_malformed_json_payloads() {
-        let malformed = vec![
-            "{broken",
-            "{\"key\": ",
-            "[1, 2, 3",
-            "not json at all",
-        ];
+        let malformed = vec!["{broken", "{\"key\": ", "[1, 2, 3", "not json at all"];
 
         for json_str in malformed {
             let result: Result<serde_json::Value, _> = serde_json::from_str(json_str);
@@ -70,7 +64,10 @@ mod adversarial {
     fn test_empty_signature_on_name_claim() {
         // Empty signature should not panic, but documents current gap (T4 threat)
         let signature: Vec<u8> = vec![];
-        assert!(signature.is_empty(), "empty signature detected (gap vs threat model)");
+        assert!(
+            signature.is_empty(),
+            "empty signature detected (gap vs threat model)"
+        );
     }
 
     #[test]
@@ -82,7 +79,10 @@ mod adversarial {
             .as_secs() as i64;
         let far_past = now - (3600 * 24 * 365); // 1 year ago
 
-        assert!(far_past < now, "far past timestamp detected (expected to fail today)");
+        assert!(
+            far_past < now,
+            "far past timestamp detected (expected to fail today)"
+        );
     }
 
     #[test]
@@ -100,7 +100,10 @@ mod adversarial {
         let envelope_from = "agent-123";
         let transport_origin = "agent-456";
 
-        assert_ne!(envelope_from, transport_origin, "identity mismatch detected");
+        assert_ne!(
+            envelope_from, transport_origin,
+            "identity mismatch detected"
+        );
         // Should reject or at least document this gap
     }
 

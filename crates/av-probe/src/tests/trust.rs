@@ -1,12 +1,12 @@
-use std::time::{Instant, SystemTime, UNIX_EPOCH, Duration};
 use crate::cli::Cli;
 use crate::output::{TestResult, TestStatus};
 use crate::tests::helpers::{MessageHub, prompt_user};
-use av_net_x0x::dispatcher::MessageDispatcher;
-use av_net_x0x::client::X0xConfig;
 use av_core::types::{NameRecord, NameRecordType, TrustState, normalize_name};
 use av_index::{LocalIndex, SchemeFilter};
+use av_net_x0x::client::X0xConfig;
+use av_net_x0x::dispatcher::MessageDispatcher;
 use rusqlite::Connection;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub fn test_unknown_trust(
     args: &Cli,
@@ -33,7 +33,10 @@ pub fn test_unknown_trust(
     };
 
     // 1. Clear any existing trust records for this peer in local DB
-    let _ = conn.execute("DELETE FROM trust WHERE subject_agent_id = ?1", rusqlite::params![peer_id]);
+    let _ = conn.execute(
+        "DELETE FROM trust WHERE subject_agent_id = ?1",
+        rusqlite::params![peer_id],
+    );
 
     // 2. Insert mock name record for this peer
     let name_record = NameRecord {
@@ -47,7 +50,10 @@ pub fn test_unknown_trust(
         target_canonical: Some("ant://trust-test-loc".to_string()),
         ttl_secs: 3600,
         by_agent_id: peer_id.clone(),
-        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
         signature: vec![],
     };
     let _ = av_store::repo::names::insert(conn, &name_record);
@@ -55,11 +61,16 @@ pub fn test_unknown_trust(
     // 3. Resolve name and verify that trust_score defaults to 0.5 (neutral)
     let provider = av_embed::MockEmbeddingProvider::new();
     let index = LocalIndex::new(conn, &provider);
-    let name_results = index.resolve_name("trust-test.av", &SchemeFilter::default()).unwrap();
+    let name_results = index
+        .resolve_name("trust-test.av", &SchemeFilter::default())
+        .unwrap();
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    if let Some(res) = name_results.iter().find(|r| r.record.by_agent_id == *peer_id) {
+    if let Some(res) = name_results
+        .iter()
+        .find(|r| r.record.by_agent_id == *peer_id)
+    {
         // trust score component should be 0.5 for unknown agent
         if (res.trust_score - 0.5).abs() < 0.001 {
             TestResult {
@@ -69,7 +80,10 @@ pub fn test_unknown_trust(
                 transport: "gossip".to_string(),
                 status: TestStatus::Pass,
                 duration_ms,
-                details: format!("Neutral trust score component (0.5) verified for unknown peer {}", peer_id),
+                details: format!(
+                    "Neutral trust score component (0.5) verified for unknown peer {}",
+                    peer_id
+                ),
                 debug: serde_json::json!({ "trust_score": res.trust_score }),
             }
         } else {
@@ -80,7 +94,10 @@ pub fn test_unknown_trust(
                 transport: "gossip".to_string(),
                 status: TestStatus::Fail,
                 duration_ms,
-                details: format!("Expected trust score component 0.5, got {}", res.trust_score),
+                details: format!(
+                    "Expected trust score component 0.5, got {}",
+                    res.trust_score
+                ),
                 debug: serde_json::json!({ "trust_score": res.trust_score }),
             }
         }
@@ -146,7 +163,10 @@ pub fn test_known_trust(
             transport: "gossip".to_string(),
             status: TestStatus::Fail,
             duration_ms: start.elapsed().as_millis() as u64,
-            details: format!("Timed out waiting for trust level to change to 'trusted'. Currently: {}", actual_level),
+            details: format!(
+                "Timed out waiting for trust level to change to 'trusted'. Currently: {}",
+                actual_level
+            ),
             debug: serde_json::json!({ "level": actual_level }),
         };
     }
@@ -156,18 +176,26 @@ pub fn test_known_trust(
         subject_agent_id: peer_id.clone(),
         trust_score: 1.0,
         evidence_count: 1,
-        last_updated_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+        last_updated_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
     };
     let _ = av_store::repo::trust::upsert(conn, &trust_state);
 
     // 4. Resolve name and verify that trust_score is updated to > 0.5 (specifically 1.0 normalized)
     let provider = av_embed::MockEmbeddingProvider::new();
     let index = LocalIndex::new(conn, &provider);
-    let name_results = index.resolve_name("trust-test.av", &SchemeFilter::default()).unwrap();
+    let name_results = index
+        .resolve_name("trust-test.av", &SchemeFilter::default())
+        .unwrap();
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    if let Some(res) = name_results.iter().find(|r| r.record.by_agent_id == *peer_id) {
+    if let Some(res) = name_results
+        .iter()
+        .find(|r| r.record.by_agent_id == *peer_id)
+    {
         // (trust_score + 1.0) / 2.0 = (1.0 + 1.0) / 2.0 = 1.0
         if (res.trust_score - 1.0).abs() < 0.001 {
             TestResult {
@@ -177,7 +205,10 @@ pub fn test_known_trust(
                 transport: "gossip".to_string(),
                 status: TestStatus::Pass,
                 duration_ms,
-                details: format!("High trust score component (1.0) verified for trusted peer {}", peer_id),
+                details: format!(
+                    "High trust score component (1.0) verified for trusted peer {}",
+                    peer_id
+                ),
                 debug: serde_json::json!({ "trust_score": res.trust_score }),
             }
         } else {
@@ -188,7 +219,10 @@ pub fn test_known_trust(
                 transport: "gossip".to_string(),
                 status: TestStatus::Fail,
                 duration_ms,
-                details: format!("Expected trust score component 1.0, got {}", res.trust_score),
+                details: format!(
+                    "Expected trust score component 1.0, got {}",
+                    res.trust_score
+                ),
                 debug: serde_json::json!({ "trust_score": res.trust_score }),
             }
         }
@@ -200,7 +234,8 @@ pub fn test_known_trust(
             transport: "gossip".to_string(),
             status: TestStatus::Fail,
             duration_ms,
-            details: "Could not find name record in local resolution results after trust update".to_string(),
+            details: "Could not find name record in local resolution results after trust update"
+                .to_string(),
             debug: serde_json::json!({}),
         }
     }
@@ -254,7 +289,10 @@ pub fn test_blocked_trust(
             transport: "gossip".to_string(),
             status: TestStatus::Fail,
             duration_ms: start.elapsed().as_millis() as u64,
-            details: format!("Timed out waiting for trust level to change to 'blocked'. Currently: {}", actual_level),
+            details: format!(
+                "Timed out waiting for trust level to change to 'blocked'. Currently: {}",
+                actual_level
+            ),
             debug: serde_json::json!({ "level": actual_level }),
         };
     }
@@ -264,18 +302,26 @@ pub fn test_blocked_trust(
         subject_agent_id: peer_id.clone(),
         trust_score: -1.0,
         evidence_count: 1,
-        last_updated_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+        last_updated_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
     };
     let _ = av_store::repo::trust::upsert(conn, &trust_state);
 
     // 4. Resolve name and verify that trust_score is updated to 0.0 (specifically -1.0 normalized)
     let provider = av_embed::MockEmbeddingProvider::new();
     let index = LocalIndex::new(conn, &provider);
-    let name_results = index.resolve_name("trust-test.av", &SchemeFilter::default()).unwrap();
+    let name_results = index
+        .resolve_name("trust-test.av", &SchemeFilter::default())
+        .unwrap();
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    if let Some(res) = name_results.iter().find(|r| r.record.by_agent_id == *peer_id) {
+    if let Some(res) = name_results
+        .iter()
+        .find(|r| r.record.by_agent_id == *peer_id)
+    {
         // (trust_score + 1.0) / 2.0 = (-1.0 + 1.0) / 2.0 = 0.0
         if (res.trust_score - 0.0).abs() < 0.001 {
             // 5. Reset trust back to unknown so subsequent runs (and the seed's
@@ -288,7 +334,10 @@ pub fn test_blocked_trust(
                 transport: "gossip".to_string(),
                 status: TestStatus::Pass,
                 duration_ms,
-                details: format!("Blocked trust score component (0.0) verified for blocked peer {}", peer_id),
+                details: format!(
+                    "Blocked trust score component (0.0) verified for blocked peer {}",
+                    peer_id
+                ),
                 debug: serde_json::json!({ "trust_score": res.trust_score }),
             }
         } else {
@@ -300,7 +349,10 @@ pub fn test_blocked_trust(
                 transport: "gossip".to_string(),
                 status: TestStatus::Fail,
                 duration_ms,
-                details: format!("Expected trust score component 0.0, got {}", res.trust_score),
+                details: format!(
+                    "Expected trust score component 0.0, got {}",
+                    res.trust_score
+                ),
                 debug: serde_json::json!({ "trust_score": res.trust_score }),
             }
         }
@@ -313,7 +365,8 @@ pub fn test_blocked_trust(
             transport: "gossip".to_string(),
             status: TestStatus::Fail,
             duration_ms,
-            details: "Could not find name record in local resolution results after trust update".to_string(),
+            details: "Could not find name record in local resolution results after trust update"
+                .to_string(),
             debug: serde_json::json!({}),
         }
     }

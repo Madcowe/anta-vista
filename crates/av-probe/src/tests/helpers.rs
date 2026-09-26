@@ -1,10 +1,10 @@
+use av_net_x0x::client::X0xConfig;
+use av_net_x0x::direct_listener::DirectMessage;
+use av_net_x0x::error::NetResult;
+use av_net_x0x::listener::IncomingEvent;
 use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use av_net_x0x::listener::IncomingEvent;
-use av_net_x0x::direct_listener::DirectMessage;
-use av_net_x0x::error::NetResult;
-use av_net_x0x::client::X0xConfig;
 
 pub struct MessageHub {
     pub gossip_rx: Receiver<NetResult<IncomingEvent>>,
@@ -63,7 +63,9 @@ impl MessageHub {
 
         let start = Instant::now();
         while start.elapsed() < timeout {
-            let remaining = timeout.checked_sub(start.elapsed()).unwrap_or(Duration::ZERO);
+            let remaining = timeout
+                .checked_sub(start.elapsed())
+                .unwrap_or(Duration::ZERO);
             if remaining == Duration::ZERO {
                 break;
             }
@@ -116,7 +118,9 @@ impl MessageHub {
 
         let start = Instant::now();
         while start.elapsed() < timeout {
-            let remaining = timeout.checked_sub(start.elapsed()).unwrap_or(Duration::ZERO);
+            let remaining = timeout
+                .checked_sub(start.elapsed())
+                .unwrap_or(Duration::ZERO);
             if remaining == Duration::ZERO {
                 break;
             }
@@ -162,19 +166,24 @@ pub fn prompt_user(peer_id: &str, target_level: &str, config: &X0xConfig) {
     println!("│   {} to '{}'                 │", peer_id, target_level);
     println!("│                                                          │");
     println!("│ Option A (CLI):                                          │");
-    println!("│   x0x trust set {} {}                 │", peer_id, target_level);
+    println!(
+        "│   x0x trust set {} {}                 │",
+        peer_id, target_level
+    );
     println!("│                                                          │");
     println!("│ Option B (curl):                                         │");
     println!("│   curl -X POST \"{}/contacts/trust\" \\", config.api_base);
     println!("│     -H \"Authorization: Bearer {}\" \\", config.token);
     println!("│     -H \"Content-Type: application/json\" \\");
-    println!("│     -d '{{\"agent_id\": \"{}\", \"level\": \"{}\"}}'", peer_id, target_level);
+    println!(
+        "│     -d '{{\"agent_id\": \"{}\", \"level\": \"{}\"}}'",
+        peer_id, target_level
+    );
     println!("│                                                          │");
     println!("│ Press ENTER once executed to resume the test...          │");
     println!("└──────────────────────────────────────────────────────────┘");
     println!();
-    
+
     let mut input = String::new();
     let _ = std::io::stdin().read_line(&mut input);
 }
-

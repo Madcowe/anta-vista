@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{Connection, Result as SqlResult, params};
 
 /// Upsert a relevance judgment for a (query, resource_id) pair.
 pub fn upsert(conn: &Connection, query: &str, resource_id: &str, score: f32) -> SqlResult<()> {

@@ -170,8 +170,12 @@ fn test_ranking_shifts_after_positive_feedback() {
     insert_feedback(&conn, "res-A", "fb-2", FeedbackKind::Useful);
     // res-B: no feedback
 
-    let score_a = search_score(&conn, "res-A", 0.7, None, None).expect("a").combined;
-    let score_b = search_score(&conn, "res-B", 0.7, None, None).expect("b").combined;
+    let score_a = search_score(&conn, "res-A", 0.7, None, None)
+        .expect("a")
+        .combined;
+    let score_b = search_score(&conn, "res-B", 0.7, None, None)
+        .expect("b")
+        .combined;
 
     assert!(
         score_a > score_b,

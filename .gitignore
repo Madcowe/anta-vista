@@ -1,4 +1,10 @@
 /target
 /.github/workflow
-/.fastembed_cache
 /issues
+
+# MiniLM model weights downloaded by fastembed. The cache is created relative to
+# the current working directory, so it lands wherever `av` or `cargo test` was
+# run from — the repo root, or a crate directory under test. This must NOT be
+# anchored with a leading slash, or only the root copy is ignored and the rest
+# (87 MB each) show up as untracked files ready to be committed.
+.fastembed_cache/

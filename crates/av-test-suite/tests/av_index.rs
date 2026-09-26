@@ -12,7 +12,11 @@ mod adversarial {
         let forbidden = vec!["file", "javascript", "data"];
 
         for scheme in forbidden {
-            assert!(!allowed.contains(&scheme), "forbidden scheme {} detected", scheme);
+            assert!(
+                !allowed.contains(&scheme),
+                "forbidden scheme {} detected",
+                scheme
+            );
         }
     }
 
@@ -46,6 +50,9 @@ mod adversarial {
         let allowed_mime = "application/json";
         let forbidden_mime = "application/x-executable";
 
-        assert_ne!(allowed_mime, forbidden_mime, "mime type distinction preserved");
+        assert_ne!(
+            allowed_mime, forbidden_mime,
+            "mime type distinction preserved"
+        );
     }
 }

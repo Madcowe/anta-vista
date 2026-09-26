@@ -2,7 +2,6 @@ use crate::cmd::{CliError, CliResult};
 use av_core::config::AvConfig;
 use av_net_x0x::client::X0xConfig;
 use dialoguer::Confirm;
-use serde_json::json;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -47,15 +46,11 @@ pub fn run_startup_checks(cli: &crate::Cli) -> CliResult<StartupState> {
 
     // 5. Ensure the background listener is running whenever x0x is available and
     //    the current command is one that benefits from peer responses.  We skip
-    //    this for Status (read-only), Purge (offline), and Listen itself (it IS
-    //    the listener — starting another would be redundant).
-    let needs_listener = x0x_config.is_some() && match cli.command {
-        crate::Commands::Status => false,
-        crate::Commands::Purge { .. } => false,
-        crate::Commands::Listen { .. } => false,
-        crate::Commands::Stop { .. } => false,
-        _ => true,
-    };
+    //    this for Status (read-only), Purge (offline), Listen itself (it IS
+    //    the listener — starting another would be redundant), Stop (must work
+    //    while the network is down), and Web (the whole point of the web
+    //    interface is to start up and offer to fix a missing x0x).
+    let needs_listener = x0x_config.is_some() && !is_offline_command(&cli.command);
     let listener_running = if needs_listener {
         crate::listener::ensure_running()
     } else {
@@ -77,7 +72,27 @@ pub fn run_startup_checks(cli: &crate::Cli) -> CliResult<StartupState> {
     Ok(state)
 }
 
-fn load_config(cli: &crate::Cli) -> CliResult<(AvConfig, Option<PathBuf>)> {
+/// Commands that must work without the x0x daemon running, and which should
+/// therefore never auto-spawn the background listener either.
+///
+/// `Web` belongs here because the web interface is the one surface that has to
+/// come up *without* a daemon — it is where the setup flow lives. Every other
+/// network command hard-requires x0x.
+///
+/// A missing subcommand (`None`) is treated the same as `Web`, because bare `av`
+/// dispatches to exactly that.
+pub fn is_offline_command(command: &Option<crate::Commands>) -> bool {
+    matches!(
+        command,
+        None | Some(crate::Commands::Status)
+            | Some(crate::Commands::Purge { .. })
+            | Some(crate::Commands::Listen { .. })
+            | Some(crate::Commands::Stop { .. })
+            | Some(crate::Commands::Web { .. })
+    )
+}
+
+pub fn load_config(cli: &crate::Cli) -> CliResult<(AvConfig, Option<PathBuf>)> {
     if let Some(ref path) = cli.config {
         let config = AvConfig::from_file(path)
             .map_err(|e| CliError::Validation(format!("Failed to load config: {}", e)))?;
@@ -96,6 +111,40 @@ fn load_config(cli: &crate::Cli) -> CliResult<(AvConfig, Option<PathBuf>)> {
     } else {
         Ok((AvConfig::default(), None))
     }
+}
+
+/// The literal command used to install x0x on this platform, suitable for
+/// showing to a user before they consent to running it.
+pub fn x0x_install_command() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "powershell -NoProfile -Command \"Invoke-WebRequest -Uri https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip -OutFile x0x.zip; tar -xf x0x.zip -C $env:USERPROFILE\\.local\\bin; Remove-Item x0x.zip\""
+    } else {
+        "curl -sfL https://x0x.md | sh -s -- --start"
+    }
+}
+
+/// The literal command used to install the ant CLI on this platform.
+pub fn ant_install_command() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "powershell -NoProfile -Command \"irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex\""
+    } else {
+        "curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash"
+    }
+}
+
+/// Run an installer, sending its output to `stdio`.
+///
+/// The CLI passes [`Stdio::inherit`] so the user watches it happen. The web
+/// interface passes [`Stdio::piped`] so the log can be captured and shown in
+/// the response instead of corrupting the server's own stdout.
+fn run_installer(command: &str, stdio: Stdio) -> bool {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdout(stdio)
+        .stderr(Stdio::inherit())
+        .status();
+    matches!(status, Ok(s) if s.success())
 }
 
 pub fn start_antd_daemon() -> bool {
@@ -127,30 +176,26 @@ pub fn start_antd_daemon() -> bool {
 }
 
 pub fn ant_cli_binary_available() -> bool {
-    let bin = if cfg!(target_os = "windows") {
-        "ant.exe"
-    } else {
-        "ant"
-    };
-    std::process::Command::new(bin)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
+    ant_resolve_path()
+        .map(|path| {
+            std::process::Command::new(path)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
         .unwrap_or(false)
 }
 
-pub fn install_ant_cli() -> bool {
+/// Install the ant CLI. `stdio` controls where the installer's own output goes;
+/// see [`run_installer`].
+pub fn install_ant_cli_with(stdio: Stdio) -> bool {
     if !cfg!(target_os = "windows") {
         // Linux/macOS: use the official install script
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(
-                "curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash",
-            )
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status();
-        matches!(status, Ok(s) if s.success())
+        run_installer(
+            "curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash",
+            stdio,
+        )
     } else {
         // Windows: use the official PowerShell install script
         let status = std::process::Command::new("powershell")
@@ -158,14 +203,18 @@ pub fn install_ant_cli() -> bool {
             .arg(
                 "irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex",
             )
-            .stdout(Stdio::inherit())
+            .stdout(stdio)
             .stderr(Stdio::inherit())
             .status();
         matches!(status, Ok(s) if s.success())
     }
 }
 
-fn x0x_binary_available() -> bool {
+pub fn install_ant_cli() -> bool {
+    install_ant_cli_with(Stdio::inherit())
+}
+
+pub fn x0x_binary_available() -> bool {
     let bin = if cfg!(target_os = "windows") {
         "x0x.exe"
     } else {
@@ -178,16 +227,12 @@ fn x0x_binary_available() -> bool {
         .unwrap_or(false)
 }
 
-fn install_x0x() -> bool {
+/// Install x0x. `stdio` controls where the installer's own output goes; see
+/// [`run_installer`].
+pub fn install_x0x_with(stdio: Stdio) -> bool {
     if !cfg!(target_os = "windows") {
         // Linux/macOS: use the install script
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("curl -sfL https://x0x.md | sh -s -- --start")
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status();
-        let ok = matches!(status, Ok(s) if s.success());
+        let ok = run_installer("curl -sfL https://x0x.md | sh -s -- --start", stdio);
         if ok {
             std::thread::sleep(Duration::from_secs(3));
         }
@@ -204,7 +249,7 @@ fn install_x0x() -> bool {
                 "tar -xf $zip -C $target --strip-components=1; ",
                 "Remove-Item $zip -Force",
             ))
-            .stdout(Stdio::inherit())
+            .stdout(stdio)
             .stderr(Stdio::inherit())
             .status();
         let ok = matches!(status, Ok(s) if s.success());
@@ -213,6 +258,10 @@ fn install_x0x() -> bool {
         }
         ok
     }
+}
+
+pub fn install_x0x() -> bool {
+    install_x0x_with(Stdio::inherit())
 }
 
 /// Build a lightweight ureq agent with a short connect timeout, used
@@ -227,7 +276,7 @@ fn health_check_agent() -> ureq::Agent {
         .build()
 }
 
-fn ping_x0x_daemon(cfg: &X0xConfig) -> bool {
+pub fn ping_x0x_daemon(cfg: &X0xConfig) -> bool {
     let url = format!("{}/health", cfg.api_base);
     match health_check_agent()
         .get(&url)
@@ -239,7 +288,7 @@ fn ping_x0x_daemon(cfg: &X0xConfig) -> bool {
     }
 }
 
-fn ping_antd() -> bool {
+pub fn ping_antd() -> bool {
     // Default antd port is 8082
     match health_check_agent()
         .get("http://localhost:8082/health")
@@ -250,7 +299,13 @@ fn ping_antd() -> bool {
     }
 }
 
-fn check_minilm_cached() -> bool {
+/// Whether the MiniLM model is ready to use.
+///
+/// The model is fetched lazily by `fastembed`, so we cannot know for sure
+/// without constructing a provider (which may trigger a ~22 MB download). The
+/// web interface calls this with a real provider it has already built, so the
+/// answer there is genuine; the CLI keeps the optimistic default.
+pub fn check_minilm_cached() -> bool {
     // fastembed caches models in standard cache directories, e.g. ~/.cache/fastembed/
     // Let's check if fastembed dir or hf-hub cache exists.
     // If not, we still assume true since it downloads on first use.
@@ -258,29 +313,153 @@ fn check_minilm_cached() -> bool {
     true
 }
 
+/// A snapshot of every external dependency Anta-Vista needs, for the web
+/// interface's setup flow and status panel.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DependencyStatus {
+    pub x0x_installed: bool,
+    pub x0x_running: bool,
+    pub x0x_api: String,
+    pub x0x_agent_id: String,
+    /// Literal install command for this platform, shown before consent.
+    pub x0x_install_cmd: &'static str,
+    pub ant_cli_installed: bool,
+    pub antd_running: bool,
+    /// Literal install command for this platform, shown before consent.
+    pub ant_install_cmd: &'static str,
+    pub av_listener_running: bool,
+    pub av_listener_pid: Option<u32>,
+}
+
+/// Probe every dependency without prompting or starting anything.
+///
+/// Reuses the same `ping_*` helpers as startup so the answers can never drift
+/// from what the CLI believes.
+pub fn probe_dependencies() -> DependencyStatus {
+    let x0x_cfg = X0xConfig::from_data_dir()
+        .ok()
+        .filter(|cfg| ping_x0x_daemon(cfg));
+
+    DependencyStatus {
+        x0x_installed: x0x_binary_available(),
+        x0x_running: x0x_cfg.is_some(),
+        x0x_api: x0x_cfg
+            .as_ref()
+            .map(|c| c.api_base.clone())
+            .unwrap_or_default(),
+        x0x_agent_id: x0x_cfg
+            .as_ref()
+            .map(|c| c.agent_id.clone())
+            .unwrap_or_default(),
+        x0x_install_cmd: x0x_install_command(),
+        ant_cli_installed: ant_cli_binary_available(),
+        antd_running: ping_antd(),
+        ant_install_cmd: ant_install_command(),
+        av_listener_running: crate::listener::is_running(),
+        av_listener_pid: crate::listener::pid_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| s.trim().parse::<u32>().ok()),
+    }
+}
+
+/// Directories the Windows ant installer may drop `ant.exe` into without the
+/// current process PATH picking it up.
+#[cfg(windows)]
+pub fn ant_candidate_dirs() -> Vec<PathBuf> {
+    let profile = std::env::var("USERPROFILE").unwrap_or_default();
+    vec![
+        PathBuf::from(&profile)
+            .join("AppData")
+            .join("Local")
+            .join("ant")
+            .join("bin"),
+        PathBuf::from(&profile).join(".local").join("bin"),
+    ]
+}
+
+#[cfg(not(windows))]
+pub fn ant_candidate_dirs() -> Vec<PathBuf> {
+    directories::BaseDirs::new()
+        .map(|d| vec![d.home_dir().join(".local").join("bin")])
+        .unwrap_or_default()
+}
+
+/// Prepend the ant candidate directories to this process's PATH.
+///
+/// Only safe to call from a single-threaded context (the CLI calls it during
+/// startup). Server threads must not mutate process-global state, so they should
+/// use [`ant_resolve_path`] instead.
+pub fn refresh_ant_path() {
+    let dirs = ant_candidate_dirs();
+    let current = std::env::var("PATH").unwrap_or_default();
+    let mut to_add = Vec::new();
+    for path in &dirs {
+        let p = path.to_string_lossy().to_string();
+        if !p.is_empty()
+            && path.join("ant.exe").exists()
+            && !current.split(';').any(|existing| existing == p)
+        {
+            to_add.push(p);
+        }
+    }
+    if !to_add.is_empty() {
+        let new_path = to_add.join(";") + ";" + &current;
+        // SAFETY: single-threaded at startup before any env reads race
+        unsafe { std::env::set_var("PATH", new_path) };
+    }
+}
+
+/// Resolve the `ant` executable, consulting the installer's candidate
+/// directories as well as PATH.
+///
+/// Thread-safe, unlike [`refresh_ant_path`], because it builds the candidate
+/// path list per call instead of mutating process-global state.
+pub fn ant_resolve_path() -> Option<PathBuf> {
+    let exe = if cfg!(target_os = "windows") {
+        "ant.exe"
+    } else {
+        "ant"
+    };
+    // Prefer a hit on PATH, matching what a user would get in a fresh shell.
+    if which_on_path(exe) {
+        return Some(PathBuf::from(exe));
+    }
+    ant_candidate_dirs()
+        .into_iter()
+        .find(|d| d.join(exe).exists())
+}
+
+#[cfg(windows)]
+fn which_on_path(exe: &str) -> bool {
+    std::env::var("PATH")
+        .unwrap_or_default()
+        .split(';')
+        .any(|dir| PathBuf::from(dir).join(exe).exists())
+}
+
+#[cfg(not(windows))]
+fn which_on_path(exe: &str) -> bool {
+    std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .any(|dir| PathBuf::from(dir).join(exe).exists())
+}
+
 fn enforce_dependencies(cli: &crate::Cli, state: &mut StartupState) -> CliResult<()> {
     // If x0xd is not running:
-    // Some commands MUST have x0xd running to communicate (resolve, search, name, index, rate, purge).
+    // Some commands MUST have x0xd running to communicate (resolve, search, name, index, rate, propagate).
     // Let's see which command is being executed.
-    let needs_x0x = match cli.command {
-        crate::Commands::Status => false,
-        crate::Commands::Purge { .. } => false, // purge can run offline on local DB
-        crate::Commands::Listen { .. } => false, // listen checks x0x itself with a clear error
-        crate::Commands::Stop { .. } => false, // stop must work even with x0x down
-        _ => true,
-    };
+    let needs_x0x = !is_offline_command(&cli.command);
 
     if needs_x0x && state.x0x_config.is_none() {
         if x0x_binary_available() {
             // x0x is installed but not running
             if cli.non_interactive {
-                let json_err = json!({
-                    "ok": false,
-                    "error": "x0x_daemon_not_running",
-                    "detail": "x0x daemon is not running. Please start it with 'x0x start'."
+                return Err(CliError::MissingDependency {
+                    code: "x0x_daemon_not_running",
+                    detail: "x0x daemon is not running. Please start it with 'x0x start'."
+                        .to_string(),
                 });
-                println!("{}", serde_json::to_string_pretty(&json_err).unwrap());
-                std::process::exit(1);
             } else {
                 println!("x0x daemon is not running.");
                 let offer_start = Confirm::new()
@@ -311,16 +490,14 @@ fn enforce_dependencies(cli: &crate::Cli, state: &mut StartupState) -> CliResult
         } else {
             // x0x is not installed at all
             if cli.non_interactive {
-                let json_err = json!({
-                    "ok": false,
-                    "error": "x0x_not_installed",
-                    "detail": concat!(
+                return Err(CliError::MissingDependency {
+                    code: "x0x_not_installed",
+                    detail: concat!(
                         "x0x is not installed. ",
-                        "Install it: curl -sfL https://x0x.md | sh",
+                        "Install it: curl -sfL https://x0x.md | sh"
                     )
+                    .to_string(),
                 });
-                println!("{}", serde_json::to_string_pretty(&json_err).unwrap());
-                std::process::exit(1);
             } else {
                 println!("x0x is not installed.");
                 let offer_install = Confirm::new()
@@ -352,7 +529,9 @@ fn enforce_dependencies(cli: &crate::Cli, state: &mut StartupState) -> CliResult
                         println!();
                         println!("  Linux/macOS:  curl -sfL https://x0x.md | sh");
                         #[cfg(target_os = "windows")]
-                        println!("  Windows: Download from https://github.com/saorsa-labs/x0x/releases");
+                        println!(
+                            "  Windows: Download from https://github.com/saorsa-labs/x0x/releases"
+                        );
                         println!();
                         return Err(CliError::Daemon(
                             "x0x installation failed. Please install manually.".to_string(),
@@ -364,7 +543,9 @@ fn enforce_dependencies(cli: &crate::Cli, state: &mut StartupState) -> CliResult
                     println!();
                     println!("  Linux/macOS:  curl -sfL https://x0x.md | sh");
                     #[cfg(target_os = "windows")]
-                    println!("  Windows: Download from https://github.com/saorsa-labs/x0x/releases");
+                    println!(
+                        "  Windows: Download from https://github.com/saorsa-labs/x0x/releases"
+                    );
                     println!();
                     return Err(CliError::Daemon(
                         "x0x is required for this command. Exiting.".to_string(),
@@ -377,7 +558,7 @@ fn enforce_dependencies(cli: &crate::Cli, state: &mut StartupState) -> CliResult
     Ok(())
 }
 
-fn start_x0x_daemon() -> bool {
+pub fn start_x0x_daemon() -> bool {
     let retry_until = std::time::Instant::now() + Duration::from_secs(8);
 
     let try_path = |bin: &str| -> bool {

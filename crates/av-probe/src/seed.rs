@@ -1,17 +1,17 @@
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use av_core::types::{NameRecord, NameRecordType, normalize_name, MessageKind};
+use av_core::types::{MessageKind, NameRecord, NameRecordType, normalize_name};
+use av_embed::{EmbeddingProvider, MiniLmProvider, MockEmbeddingProvider, provider::profile_id};
+use av_index::{LocalIndex, QueryFilter, SchemeFilter};
 use av_net_x0x::{
     client::{X0xConfig, X0xNetClient},
+    direct_listener::{DirectMessage, start_direct_listener},
     dispatcher::MessageDispatcher,
-    listener::{start_listener, IncomingEvent},
-    direct_listener::{start_direct_listener, DirectMessage},
-    payloads::{QueryPayload, NameQueryPayload, ResourceResult},
+    listener::{IncomingEvent, start_listener},
+    payloads::{NameQueryPayload, QueryPayload, ResourceResult},
 };
-use av_embed::{EmbeddingProvider, MockEmbeddingProvider, MiniLmProvider, provider::profile_id};
-use av_index::{LocalIndex, QueryFilter, SchemeFilter};
 use rusqlite::Connection;
 
 use crate::cli::Cli;
@@ -40,7 +40,9 @@ pub fn run_seed(args: Cli, config: X0xConfig) {
     let dispatcher = Arc::new(MessageDispatcher::new(client));
 
     // 5. Subscribe to gossip topics
-    dispatcher.subscribe_all().expect("Failed to subscribe to gossip topics");
+    dispatcher
+        .subscribe_all()
+        .expect("Failed to subscribe to gossip topics");
     tracing::info!("Subscribed to gossip topics.");
 
     announce_identity(&config);
@@ -51,9 +53,11 @@ pub fn run_seed(args: Cli, config: X0xConfig) {
     // Spawn a thread to periodically broadcast name claims so the probe can autodetect us
     let dispatcher_clone = dispatcher.clone();
     let conn_clone = shared_conn.clone();
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(10));
-        broadcast_claims(&dispatcher_clone, &conn_clone);
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(10));
+            broadcast_claims(&dispatcher_clone, &conn_clone);
+        }
     });
 
     // 7. Start listeners
@@ -73,7 +77,12 @@ pub fn run_seed(args: Cli, config: X0xConfig) {
     let gossip_handle = thread::spawn(move || {
         for msg in gossip_rx {
             if let Ok(event) = msg {
-                if let Err(e) = handle_gossip_event(event, &handler_dispatcher, &handler_conn, handler_provider.as_ref()) {
+                if let Err(e) = handle_gossip_event(
+                    event,
+                    &handler_dispatcher,
+                    &handler_conn,
+                    handler_provider.as_ref(),
+                ) {
                     tracing::error!("Error handling gossip event: {:?}", e);
                 }
             }
@@ -87,7 +96,12 @@ pub fn run_seed(args: Cli, config: X0xConfig) {
     let direct_handle = thread::spawn(move || {
         for msg in direct_rx {
             if let Ok(event) = msg {
-                if let Err(e) = handle_direct_message(event, &direct_dispatcher, &direct_conn, direct_provider.as_ref()) {
+                if let Err(e) = handle_direct_message(
+                    event,
+                    &direct_dispatcher,
+                    &direct_conn,
+                    direct_provider.as_ref(),
+                ) {
                     tracing::error!("Error handling direct message: {:?}", e);
                 }
             }
@@ -101,7 +115,8 @@ pub fn run_seed(args: Cli, config: X0xConfig) {
         tracing::info!("Received shutdown signal. Exiting seed...");
         let mut running_guard = r.lock().unwrap();
         *running_guard = false;
-    }).expect("Error setting Ctrl-C handler");
+    })
+    .expect("Error setting Ctrl-C handler");
 
     while *running.lock().unwrap() {
         thread::sleep(Duration::from_millis(500));
@@ -114,7 +129,8 @@ pub fn run_seed(args: Cli, config: X0xConfig) {
 
 fn init_seed_db(conn: &Connection, provider: &dyn EmbeddingProvider, agent_id: &str) {
     let pid = profile_id(provider.profile());
-    av_store::repo::embeddings::insert_profile(conn, &pid, provider.profile()).expect("insert profile");
+    av_store::repo::embeddings::insert_profile(conn, &pid, provider.profile())
+        .expect("insert profile");
 
     let samples: &[(&str, &[u8], &str)] = &[
         (
@@ -148,9 +164,12 @@ fn init_seed_db(conn: &Connection, provider: &dyn EmbeddingProvider, agent_id: &
     ];
 
     for (filename, bytes, location) in samples {
-        let resource = av_ingest::ingest_bytes(bytes, Some(filename), location).expect("ingest failed");
+        let resource =
+            av_ingest::ingest_bytes(bytes, Some(filename), location).expect("ingest failed");
         av_store::repo::resources::insert(conn, &resource).expect("store resource");
-        let embedding = provider.embed_resource(&resource.description_text, &resource.id).expect("embed failed");
+        let embedding = provider
+            .embed_resource(&resource.description_text, &resource.id)
+            .expect("embed failed");
         av_store::repo::embeddings::insert(conn, &embedding).expect("store embedding");
     }
 
@@ -166,7 +185,10 @@ fn init_seed_db(conn: &Connection, provider: &dyn EmbeddingProvider, agent_id: &
         target_canonical: Some(format!("ant://{}", agent_id)),
         ttl_secs: 3600,
         by_agent_id: agent_id.to_string(),
-        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
         signature: vec![],
     };
     av_store::repo::names::insert(conn, &seed_record).expect("store seed name");
@@ -183,7 +205,10 @@ fn init_seed_db(conn: &Connection, provider: &dyn EmbeddingProvider, agent_id: &
         target_canonical: Some(format!("ant://{}", agent_id)),
         ttl_secs: 3600,
         by_agent_id: agent_id.to_string(),
-        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
         signature: vec![],
     };
     av_store::repo::names::insert(conn, &alias_record).expect("store alias name");
@@ -227,7 +252,11 @@ fn handle_gossip_event(
     // against the dispatcher's dedup cache and returns Err(Duplicate) on
     // repeat deliveries, so we only process each query once.
     if let Err(e) = dispatcher.validate_incoming(&event.envelope, event.raw_size) {
-        tracing::debug!("Dropping gossip event ({}): {:?}", event.envelope.message_id, e);
+        tracing::debug!(
+            "Dropping gossip event ({}): {:?}",
+            event.envelope.message_id,
+            e
+        );
         return Ok(());
     }
 
@@ -241,10 +270,12 @@ fn handle_gossip_event(
 
             let mut filter = QueryFilter::default();
             if !payload.allowed_schemes.is_empty() {
-                filter.scheme = SchemeFilter::new(payload.allowed_schemes.iter().map(|s| s.as_str()));
+                filter.scheme =
+                    SchemeFilter::new(payload.allowed_schemes.iter().map(|s| s.as_str()));
             }
 
-            let search_results = index.search(&payload.query_text, payload.max_results as usize, &filter)?;
+            let search_results =
+                index.search(&payload.query_text, payload.max_results as usize, &filter)?;
             let results: Vec<ResourceResult> = search_results
                 .into_iter()
                 .map(|r| ResourceResult {
@@ -257,7 +288,10 @@ fn handle_gossip_event(
                 })
                 .collect();
 
-            tracing::info!("Found {} matches. Publishing gossip response...", results.len());
+            tracing::info!(
+                "Found {} matches. Publishing gossip response...",
+                results.len()
+            );
             dispatcher.publish_response(&payload.query_id, results)?;
         }
         MessageKind::NameQuery => {
@@ -270,8 +304,15 @@ fn handle_gossip_event(
             let results = index.resolve_name(&payload.normalized_name, &SchemeFilter::default())?;
             let name_records: Vec<NameRecord> = results.into_iter().map(|r| r.record).collect();
 
-            tracing::info!("Found {} matching name records. Publishing gossip name response...", name_records.len());
-            dispatcher.publish_name_response(&payload.query_id, &payload.normalized_name, name_records.clone())?;
+            tracing::info!(
+                "Found {} matching name records. Publishing gossip name response...",
+                name_records.len()
+            );
+            dispatcher.publish_name_response(
+                &payload.query_id,
+                &payload.normalized_name,
+                name_records.clone(),
+            )?;
 
             // Re-broadcast NameClaim for any matching records so the probe can
             // observe a fresh NameClaim in response to its query (N1 test).
@@ -304,17 +345,23 @@ fn handle_direct_message(
     match msg.envelope.kind {
         MessageKind::Query => {
             let payload: QueryPayload = serde_json::from_value(msg.envelope.payload)?;
-            tracing::info!("Received direct search query from {}: \"{}\"", msg.sender, payload.query_text);
+            tracing::info!(
+                "Received direct search query from {}: \"{}\"",
+                msg.sender,
+                payload.query_text
+            );
 
             let conn_guard = conn.lock().unwrap();
             let index = LocalIndex::new(&conn_guard, provider);
 
             let mut filter = QueryFilter::default();
             if !payload.allowed_schemes.is_empty() {
-                filter.scheme = SchemeFilter::new(payload.allowed_schemes.iter().map(|s| s.as_str()));
+                filter.scheme =
+                    SchemeFilter::new(payload.allowed_schemes.iter().map(|s| s.as_str()));
             }
 
-            let search_results = index.search(&payload.query_text, payload.max_results as usize, &filter)?;
+            let search_results =
+                index.search(&payload.query_text, payload.max_results as usize, &filter)?;
             let results: Vec<ResourceResult> = search_results
                 .into_iter()
                 .map(|r| ResourceResult {
@@ -327,12 +374,20 @@ fn handle_direct_message(
                 })
                 .collect();
 
-            tracing::info!("Found {} matches. Sending direct response to {}...", results.len(), msg.sender);
+            tracing::info!(
+                "Found {} matches. Sending direct response to {}...",
+                results.len(),
+                msg.sender
+            );
             dispatcher.send_direct_response(&msg.sender, &payload.query_id, results)?;
         }
         MessageKind::NameQuery => {
             let payload: NameQueryPayload = serde_json::from_value(msg.envelope.payload)?;
-            tracing::info!("Received direct name query from {} for: \"{}\"", msg.sender, payload.name);
+            tracing::info!(
+                "Received direct name query from {} for: \"{}\"",
+                msg.sender,
+                payload.name
+            );
 
             let conn_guard = conn.lock().unwrap();
             let index = LocalIndex::new(&conn_guard, provider);
@@ -340,8 +395,17 @@ fn handle_direct_message(
             let results = index.resolve_name(&payload.normalized_name, &SchemeFilter::default())?;
             let name_records: Vec<NameRecord> = results.into_iter().map(|r| r.record).collect();
 
-            tracing::info!("Found {} matching name records. Sending direct name response to {}...", name_records.len(), msg.sender);
-            dispatcher.send_direct_name_response(&msg.sender, &payload.query_id, &payload.normalized_name, name_records)?;
+            tracing::info!(
+                "Found {} matching name records. Sending direct name response to {}...",
+                name_records.len(),
+                msg.sender
+            );
+            dispatcher.send_direct_name_response(
+                &msg.sender,
+                &payload.query_id,
+                &payload.normalized_name,
+                name_records,
+            )?;
         }
         _ => {}
     }

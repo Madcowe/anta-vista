@@ -30,9 +30,5 @@ pub fn tokenize_filename(filename: &str) -> String {
 /// Returns None if no useful tokens were found.
 pub fn tokenize_filename_opt(filename: &str) -> Option<String> {
     let s = tokenize_filename(filename);
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }

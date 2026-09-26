@@ -4,6 +4,7 @@ pub mod listener;
 pub mod network;
 pub mod output;
 pub mod startup;
+pub mod web;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -27,7 +28,7 @@ pub struct Cli {
     pub verbose: u8,
 
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -139,10 +140,7 @@ pub enum Commands {
 
     #[command(about = "Listen for and respond to network queries from peers")]
     Listen {
-        #[arg(
-            long,
-            help = "Stop after this many seconds (omit to run until Ctrl-C)"
-        )]
+        #[arg(long, help = "Stop after this many seconds (omit to run until Ctrl-C)")]
         run_for: Option<u64>,
     },
 
@@ -165,5 +163,28 @@ pub enum Commands {
 
         #[arg(long, help = "MIME type (e.g. text/plain, text/html)")]
         mime: Option<String>,
+    },
+
+    #[command(
+        name = "web",
+        visible_alias = "gui",
+        about = "Launch the web interface in a browser"
+    )]
+    Web {
+        #[arg(long, default_value = "127.0.0.1", help = "Interface to bind")]
+        host: String,
+
+        #[arg(
+            long,
+            default_value = "8787",
+            help = "Port to bind (0 picks a free port)"
+        )]
+        port: u16,
+
+        #[arg(long, help = "Do not open a browser, just print the URL")]
+        no_open: bool,
+
+        #[arg(long, help = "Stop after this many seconds (omit to run until Ctrl-C)")]
+        run_for: Option<u64>,
     },
 }

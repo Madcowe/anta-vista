@@ -1,5 +1,5 @@
 use av_core::types::Claim;
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{Connection, Result as SqlResult, params};
 
 pub fn insert(conn: &Connection, c: &Claim) -> SqlResult<()> {
     conn.execute(

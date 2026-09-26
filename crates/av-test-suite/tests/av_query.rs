@@ -19,9 +19,7 @@ mod adversarial {
     #[test]
     fn test_agent_id_rotation_evasion() {
         // Rotating agent IDs to evade rate limiting
-        let agent_ids: Vec<String> = (0..100)
-            .map(|i| format!("{:064x}", i))
-            .collect();
+        let agent_ids: Vec<String> = (0..100).map(|i| format!("{:064x}", i)).collect();
 
         assert_eq!(agent_ids.len(), 100, "rotated agent IDs");
 
@@ -39,7 +37,11 @@ mod adversarial {
         assert_eq!(at_limit.len(), MAX_PAYLOAD_BYTES, "at limit accepted");
 
         let over_limit = vec![0u8; MAX_PAYLOAD_BYTES + 1];
-        assert_eq!(over_limit.len(), MAX_PAYLOAD_BYTES + 1, "over limit should reject");
+        assert_eq!(
+            over_limit.len(),
+            MAX_PAYLOAD_BYTES + 1,
+            "over limit should reject"
+        );
     }
 
     #[test]

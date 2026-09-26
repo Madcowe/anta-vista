@@ -38,6 +38,17 @@ pub enum CliError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// A required external dependency is missing or stopped. `code` is the
+    /// stable machine-readable identifier reported as `"error"` in machine mode,
+    /// so it must not change without updating callers.
+    #[error("{detail}")]
+    MissingDependency { code: &'static str, detail: String },
+
+    /// Bare `av` was invoked in machine mode, where launching the interactive
+    /// web interface is not allowed.
+    #[error("{detail}")]
+    NoSubcommand { detail: String, hint: String },
+
     #[error("CLI error: {0}")]
     Other(String),
 }
@@ -49,13 +60,39 @@ pub fn run(cli: Cli) -> CliResult<()> {
     let startup_state = crate::startup::run_startup_checks(&cli)?;
 
     match &cli.command {
-        Commands::Status => status::run(cli.clone(), startup_state),
-        Commands::Resolve {
+        // Bare `av` launches the web interface, but only in interactive mode.
+        // Machine mode must fail loudly rather than bind a socket and block.
+        None => {
+            if cli.non_interactive {
+                return Err(CliError::NoSubcommand {
+                    detail: "no subcommand given".to_string(),
+                    hint: concat!(
+                        "av launches the web interface when run without a subcommand, ",
+                        "but that is disabled in machine mode. Pass a subcommand ",
+                        "(see 'av --help') or drop --non-interactive to use the web interface."
+                    )
+                    .to_string(),
+                });
+            }
+            crate::web::run(
+                &cli,
+                startup_state,
+                crate::web::WebOptions {
+                    host: "127.0.0.1".to_string(),
+                    port: crate::web::DEFAULT_PORT,
+                    open_browser: true,
+                    run_for: None,
+                },
+                true,
+            )
+        }
+        Some(Commands::Status) => status::run(cli.clone(), startup_state),
+        Some(Commands::Resolve {
             name,
             r#type,
             scheme,
             limit,
-        } => resolve::run(
+        }) => resolve::run(
             cli.clone(),
             startup_state,
             name.clone(),
@@ -63,13 +100,13 @@ pub fn run(cli: Cli) -> CliResult<()> {
             scheme.clone(),
             *limit,
         ),
-        Commands::Search {
+        Some(Commands::Search {
             query,
             scheme,
             kind,
             mime,
             limit,
-        } => search::run(
+        }) => search::run(
             cli.clone(),
             startup_state,
             query.clone(),
@@ -78,13 +115,13 @@ pub fn run(cli: Cli) -> CliResult<()> {
             mime.clone(),
             *limit,
         ),
-        Commands::Name {
+        Some(Commands::Name {
             uri,
             name,
             r#type,
             ttl,
             no_verify,
-        } => name::run(
+        }) => name::run(
             cli.clone(),
             startup_state,
             uri.clone(),
@@ -93,13 +130,13 @@ pub fn run(cli: Cli) -> CliResult<()> {
             *ttl,
             *no_verify,
         ),
-        Commands::Index {
+        Some(Commands::Index {
             uri,
             tags,
             no_download,
             no_verify,
             force,
-        } => index::run(
+        }) => index::run(
             cli.clone(),
             startup_state,
             uri.clone(),
@@ -108,25 +145,25 @@ pub fn run(cli: Cli) -> CliResult<()> {
             *no_verify,
             *force,
         ),
-        Commands::Rate {
+        Some(Commands::Rate {
             resource_id,
             rating,
             query,
-        } => rate::run(
+        }) => rate::run(
             cli.clone(),
             startup_state,
             resource_id.clone(),
             rating.clone(),
             query.clone(),
         ),
-        Commands::Purge {
+        Some(Commands::Purge {
             resource,
             name,
             all,
             cache,
             duplicates,
             no_confirm,
-        } => purge::run(
+        }) => purge::run(
             cli.clone(),
             startup_state,
             resource.clone(),
@@ -136,20 +173,36 @@ pub fn run(cli: Cli) -> CliResult<()> {
             *duplicates,
             *no_confirm,
         ),
-        Commands::Listen { run_for } => listen::run(startup_state, *run_for),
-        Commands::Stop { force } => stop::run(&cli, *force),
-        Commands::Propagate {
+        Some(Commands::Listen { run_for }) => listen::run(startup_state, *run_for),
+        Some(Commands::Stop { force }) => stop::run(&cli, *force),
+        Some(Commands::Propagate {
             resource_id,
             location,
             description,
             mime,
-        } => propagate::run(
+        }) => propagate::run(
             cli.clone(),
             startup_state,
             resource_id.clone(),
             location.clone(),
             description.clone(),
             mime.clone(),
+        ),
+        Some(Commands::Web {
+            host,
+            port,
+            no_open,
+            run_for,
+        }) => crate::web::run(
+            &cli,
+            startup_state,
+            crate::web::WebOptions {
+                host: host.clone(),
+                port: *port,
+                open_browser: !*no_open,
+                run_for: *run_for,
+            },
+            false,
         ),
     }
 }

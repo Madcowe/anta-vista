@@ -34,7 +34,14 @@ pub fn run(
     let provider = MiniLmProvider::new().map_err(|e| CliError::Model(e.to_string()))?;
     let mime = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
 
-    propagate_resource(&conn, &provider, &resource_id, &location, &description, &mime)?;
+    propagate_resource(
+        &conn,
+        &provider,
+        &resource_id,
+        &location,
+        &description,
+        &mime,
+    )?;
 
     if cli.non_interactive {
         println!(

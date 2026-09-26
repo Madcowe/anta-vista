@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const MAX_PREVIEW_CHARS: usize = 2000;
 

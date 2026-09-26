@@ -201,9 +201,7 @@ fn extract_url_context(rest: &str) -> Option<String> {
 
     let mut parts: Vec<String> = Vec::new();
 
-    let clean_token = |t: &str| -> String {
-        t.to_lowercase().replace('-', " ").replace('_', " ")
-    };
+    let clean_token = |t: &str| -> String { t.to_lowercase().replace('-', " ").replace('_', " ") };
 
     for t in &authority_tokens {
         if let Some(decoded) = percent_decode(t) {
@@ -418,9 +416,8 @@ mod tests {
 
     #[test]
     fn filters_uuid_path_segments() {
-        let info = analyze_location(
-            "https://example.com/550e8400-e29b-41d4-a716-446655440000/report.pdf",
-        );
+        let info =
+            analyze_location("https://example.com/550e8400-e29b-41d4-a716-446655440000/report.pdf");
         assert_eq!(
             info.inferred_filename.as_deref(),
             Some("example com report.pdf")

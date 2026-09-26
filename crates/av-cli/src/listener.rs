@@ -11,7 +11,6 @@
 /// persists across terminal sessions. The listener process inherits no terminal
 /// (stdin/stdout/stderr are redirected to /dev/null) so it survives the parent
 /// `av` process exiting.
-
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -54,9 +53,9 @@ fn process_alive(pid: u32) -> bool {
             .output()
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.lines().any(|line| {
-                line.split_whitespace().any(|word| word == pid.to_string())
-            })
+            stdout
+                .lines()
+                .any(|line| line.split_whitespace().any(|word| word == pid.to_string()))
         } else {
             false
         }
@@ -169,7 +168,9 @@ fn find_listener_pids() -> Vec<u32> {
                     continue;
                 }
                 let cmdline = entry.path().join("cmdline");
-                let Ok(raw) = std::fs::read(&cmdline) else { continue };
+                let Ok(raw) = std::fs::read(&cmdline) else {
+                    continue;
+                };
                 let args: Vec<&str> = raw
                     .split(|&b| b == 0)
                     .filter(|s| !s.is_empty())
@@ -177,7 +178,12 @@ fn find_listener_pids() -> Vec<u32> {
                     .collect();
                 let is_av = args
                     .first()
-                    .map(|a0| a0.rsplit(['/', '\\']).next().unwrap_or("").starts_with("av"))
+                    .map(|a0| {
+                        a0.rsplit(['/', '\\'])
+                            .next()
+                            .unwrap_or("")
+                            .starts_with("av")
+                    })
                     .unwrap_or(false);
                 let listens = args.contains(&"listen");
                 if is_av && listens {
@@ -205,7 +211,10 @@ pub fn stop_all(force: bool) -> Vec<u32> {
             stopped.push(pid);
         }
     }
-    let tracked: Vec<u32> = read_pid().into_iter().filter(|p| !stopped.contains(p)).collect();
+    let tracked: Vec<u32> = read_pid()
+        .into_iter()
+        .filter(|p| !stopped.contains(p))
+        .collect();
     for pid in tracked {
         if terminated(pid, force) {
             stopped.push(pid);

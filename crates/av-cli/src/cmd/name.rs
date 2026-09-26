@@ -4,8 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::cmd::{CliError, CliResult};
 use crate::download::verify_uri_exists;
 use crate::output::print_output;
-use crate::startup::{ant_cli_binary_available, install_ant_cli, start_antd_daemon, StartupState};
-use av_core::types::{normalize_name, NameRecord, NameRecordType};
+use crate::startup::{
+    StartupState, ant_cli_binary_available, install_ant_cli, refresh_ant_path, start_antd_daemon,
+};
+use av_core::types::{NameRecord, NameRecordType, normalize_name};
 use av_net_x0x::client::X0xNetClient;
 use av_net_x0x::dispatcher::MessageDispatcher;
 use dialoguer::Confirm;
@@ -33,18 +35,16 @@ pub fn run(
             if ant_cli_binary_available() {
                 // ant CLI is available — skip antd prompts, use CLI as download fallback
             } else if cli.non_interactive {
-                let err = json!({
-                    "ok": false,
-                    "error": "no_download_backend",
-                    "detail": concat!(
+                return Err(CliError::MissingDependency {
+                    code: "no_download_backend",
+                    detail: concat!(
                         "Neither antd daemon nor ant CLI are available. ",
                         "Install ant CLI: curl -fsSL https://raw.githubusercontent.com/",
                         "WithAutonomi/ant-client/main/install.sh | bash. ",
                         "Or install antd from: https://github.com/WithAutonomi/ant-sdk/releases"
                     )
+                    .to_string(),
                 });
-                println!("{}", serde_json::to_string_pretty(&err).unwrap());
-                std::process::exit(1);
             } else {
                 println!("antd daemon is not running. ant CLI is not installed.");
                 let antd_started = Confirm::new()
@@ -64,30 +64,8 @@ pub fn run(
                     && install_ant_cli()
                 {
                     // The PowerShell installer may put ant.exe in various locations
-                    // that aren't yet in PATH for the current terminal session. Ensure
-                    // common install directories are visible.
-                    #[cfg(windows)]
-                    {
-                        let candidates = [
-                            format!("{}\\AppData\\Local\\ant\\bin", std::env::var("USERPROFILE").unwrap_or_default()),
-                            format!("{}\\.local\\bin", std::env::var("USERPROFILE").unwrap_or_default()),
-                        ];
-                        let current = std::env::var("PATH").unwrap_or_default();
-                        let mut to_add = Vec::new();
-                        for path in &candidates {
-                            if !path.is_empty()
-                                && std::path::Path::new(path).join("ant.exe").exists()
-                                && !current.split(';').any(|p| p == path.as_str())
-                            {
-                                to_add.push(path.clone());
-                            }
-                        }
-                        if !to_add.is_empty() {
-                            let new_path = to_add.join(";") + ";" + &current;
-                            // SAFETY: single-threaded at startup before any env reads race
-                            unsafe { std::env::set_var("PATH", new_path); }
-                        }
-                    }
+                    // that aren't yet in PATH for the current terminal session.
+                    refresh_ant_path();
                     println!("ant CLI installed successfully.");
                 } else {
                     println!();

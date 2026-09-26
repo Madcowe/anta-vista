@@ -1,16 +1,16 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use av_core::constants::TOPIC_NAME_CLAIM;
 use av_core::types::MessageKind;
 use av_net_x0x::{
     client::{NetworkClient, X0xConfig, X0xNetClient},
-    direct_listener::{start_direct_listener, DirectMessage},
+    direct_listener::{DirectMessage, start_direct_listener},
     dispatcher::MessageDispatcher,
     error::NetResult,
-    listener::{start_listener, IncomingEvent},
+    listener::{IncomingEvent, start_listener},
     payloads::{NameClaimPayload, NameResponsePayload},
 };
 
@@ -69,10 +69,7 @@ pub fn run_probe(mut args: Cli, config: X0xConfig) {
 
                 // Re-use the QUIC link that was opened during autodetection; wait
                 // a bit more in case the handshake is still in-flight.
-                tracing::info!(
-                    "Ensuring QUIC link to seed node {} is ready...",
-                    peer_id
-                );
+                tracing::info!("Ensuring QUIC link to seed node {} is ready...", peer_id);
                 if let Err(e) = dispatcher.connect_agent(&peer_id) {
                     tracing::warn!(
                         "connect_agent after autodetect returned an error (link may already be up): {:?}",
@@ -202,10 +199,7 @@ fn autodetect_peer(config: &X0xConfig, wait_timeout: Duration) -> Option<Autodet
     let direct_rx = match start_direct_listener(config.api_base.clone(), config.token.clone()) {
         Ok(rx) => rx,
         Err(e) => {
-            tracing::error!(
-                "Could not start direct listener for autodetection: {:?}",
-                e
-            );
+            tracing::error!("Could not start direct listener for autodetection: {:?}", e);
             return None;
         }
     };
@@ -262,8 +256,7 @@ fn autodetect_peer(config: &X0xConfig, wait_timeout: Duration) -> Option<Autodet
                     if attempt > 0 {
                         std::thread::sleep(Duration::from_millis(500 * u64::from(attempt)));
                     }
-                    match dispatcher.send_direct_name_query(&candidate, "seed.av", None, 1, 2_000)
-                    {
+                    match dispatcher.send_direct_name_query(&candidate, "seed.av", None, 1, 2_000) {
                         Ok(_) => {
                             sent = true;
                             break;
@@ -295,8 +288,7 @@ fn autodetect_peer(config: &X0xConfig, wait_timeout: Duration) -> Option<Autodet
                         ) {
                             let is_seed = resp.normalized_name == "seed.av"
                                 && resp.results.iter().any(|r| {
-                                    r.normalized_name == "seed.av"
-                                        && r.by_agent_id == msg.sender
+                                    r.normalized_name == "seed.av" && r.by_agent_id == msg.sender
                                 });
                             if is_seed {
                                 tracing::info!(
@@ -313,10 +305,7 @@ fn autodetect_peer(config: &X0xConfig, wait_timeout: Duration) -> Option<Autodet
                     }
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!(
-                        "Error receiving direct event during autodetection: {:?}",
-                        e
-                    );
+                    tracing::warn!("Error receiving direct event during autodetection: {:?}", e);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break,

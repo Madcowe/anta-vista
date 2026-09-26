@@ -69,7 +69,9 @@ pub fn run(
     } else if duplicates {
         // Find locations that appear more than once, keep the newest
         let mut stmt = conn
-            .prepare("SELECT location, COUNT(*) as cnt FROM resources GROUP BY location HAVING cnt > 1")
+            .prepare(
+                "SELECT location, COUNT(*) as cnt FROM resources GROUP BY location HAVING cnt > 1",
+            )
             .map_err(|e| CliError::Database(e.to_string()))?;
         let dup_locations: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))
@@ -118,8 +120,11 @@ pub fn run(
                     kept += 1;
                     for (rid, _) in &rows[1..] {
                         // CASCADE will remove associated embeddings and feedback
-                        conn.execute("DELETE FROM resources WHERE id = ?1", rusqlite::params![rid])
-                            .map_err(|e| CliError::Database(e.to_string()))?;
+                        conn.execute(
+                            "DELETE FROM resources WHERE id = ?1",
+                            rusqlite::params![rid],
+                        )
+                        .map_err(|e| CliError::Database(e.to_string()))?;
                         removed += 1;
                     }
                     deleted_resources = removed;
@@ -173,8 +178,7 @@ pub fn run(
 
         if resource.is_none() && name.is_none() {
             return Err(CliError::Validation(
-                "Specify --resource, --name, --duplicates, --all, or --cache to purge"
-                    .to_string(),
+                "Specify --resource, --name, --duplicates, --all, or --cache to purge".to_string(),
             ));
         }
     }

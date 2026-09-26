@@ -1,8 +1,40 @@
 use crate::cmd::{CliError, CliResult};
-use crate::output::print_output;
+use crate::output::{abbrev, print_output};
 use crate::startup::StartupState;
 use serde_json::json;
 use std::process::Command;
+
+/// Ask the ant CLI for its version. Returns "unknown" if it can't be determined.
+fn probe_ant_version() -> String {
+    let Some(path) = crate::startup::ant_resolve_path() else {
+        return "unknown".to_string();
+    };
+    Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Row counts for the local index, read fresh from the database.
+pub fn database_counts(conn: &rusqlite::Connection) -> serde_json::Value {
+    let count = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0)
+    };
+    json!({
+        "resources": count("resources"),
+        "name_records": count("name_records"),
+        "embeddings": count("embeddings"),
+        "feedback_events": count("feedback_events"),
+    })
+}
 
 pub fn run(cli: crate::Cli, state: StartupState) -> CliResult<()> {
     // 1. Database stats
@@ -10,42 +42,29 @@ pub fn run(cli: crate::Cli, state: StartupState) -> CliResult<()> {
         .ok_or_else(|| CliError::Database("Failed to determine database path".to_string()))?;
 
     let conn = av_store::open(&db_path).map_err(|e| CliError::Database(e.to_string()))?;
-
-    let resources_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
-        .unwrap_or(0);
-
-    let names_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM name_records", [], |row| row.get(0))
-        .unwrap_or(0);
-
-    let embeddings_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
-        .unwrap_or(0);
-
-    let feedback_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM feedback_events", [], |row| row.get(0))
-        .unwrap_or(0);
+    let database = database_counts(&conn);
+    let resources_count = database["resources"].as_i64().unwrap_or(0);
+    let names_count = database["name_records"].as_i64().unwrap_or(0);
+    let embeddings_count = database["embeddings"].as_i64().unwrap_or(0);
+    let feedback_count = database["feedback_events"].as_i64().unwrap_or(0);
 
     // 2. Fetch ant details
-    let ant_version = if state.antd_running {
-        // Try to get more info from antd health or use placeholder
-        "0.7.1".to_string()
-    } else {
-        "unknown".to_string()
+    let antd_running = state.antd_running;
+    let ant_cli_found = crate::startup::ant_cli_binary_available();
+    // Report a real version, or "unknown" — never invent one. The daemon's own
+    // health endpoint does not carry a version, so prefer the ant CLI when it
+    // is present and otherwise say we could not determine it.
+    let ant_version = match ant_cli_found {
+        true => probe_ant_version(),
+        false if antd_running => "unknown".to_string(),
+        false => "unknown".to_string(),
     };
 
-    let ant_network = if state.antd_running {
+    let ant_network = if antd_running {
         "default".to_string()
     } else {
         "offline".to_string()
     };
-
-    let ant_cli_found = Command::new("ant")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
 
     // 3. Serialize output
     let status_json = json!({
@@ -72,12 +91,7 @@ pub fn run(cli: crate::Cli, state: StartupState) -> CliResult<()> {
             "loaded": state.minilm_loaded,
             "dimensions": 384,
         },
-        "database": {
-            "resources": resources_count,
-            "name_records": names_count,
-            "embeddings": embeddings_count,
-            "feedback_events": feedback_count,
-        },
+        "database": database,
         "config_path": state.config_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "".to_string()),
     });
 
@@ -89,7 +103,7 @@ pub fn run(cli: crate::Cli, state: StartupState) -> CliResult<()> {
                 println!(
                     "  x0x daemon:  {} running (agent: {}, API: {})",
                     console::style("✓").green(),
-                    &x0x.agent_id[..8],
+                    abbrev(&x0x.agent_id, 8),
                     x0x.api_base
                 );
             } else {

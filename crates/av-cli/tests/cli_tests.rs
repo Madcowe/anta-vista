@@ -41,7 +41,7 @@ fn test_cli_status_command() {
         timeout: 1000,
         stream: false,
         verbose: 0,
-        command: av_cli::Commands::Status,
+        command: Some(av_cli::Commands::Status),
     };
 
     let startup_state = av_cli::startup::StartupState {
@@ -92,14 +92,14 @@ fn test_cli_purge_command() {
         timeout: 1000,
         stream: false,
         verbose: 0,
-        command: av_cli::Commands::Purge {
+        command: Some(av_cli::Commands::Purge {
             resource: Some("test-res".to_string()),
             name: None,
             all: false,
             cache: false,
             duplicates: false,
             no_confirm: true,
-        },
+        }),
     };
 
     let startup_state = av_cli::startup::StartupState {
@@ -195,14 +195,14 @@ fn test_cli_purge_resource_removes_related_rows() {
         timeout: 1000,
         stream: false,
         verbose: 0,
-        command: av_cli::Commands::Purge {
+        command: Some(av_cli::Commands::Purge {
             resource: Some("test-res-related".to_string()),
             name: None,
             all: false,
             cache: false,
             duplicates: false,
             no_confirm: true,
-        },
+        }),
     };
     let startup_state = av_cli::startup::StartupState {
         config: av_core::config::AvConfig::default(),
@@ -226,9 +226,11 @@ fn test_cli_purge_resource_removes_related_rows() {
     .unwrap();
 
     let conn2 = av_store::open(&db_path).unwrap();
-    assert!(av_store::repo::resources::get(&conn2, "test-res-related")
-        .unwrap()
-        .is_none());
+    assert!(
+        av_store::repo::resources::get(&conn2, "test-res-related")
+            .unwrap()
+            .is_none()
+    );
     assert!(
         av_store::repo::embeddings::get(&conn2, "test-res-related", "test-profile")
             .unwrap()

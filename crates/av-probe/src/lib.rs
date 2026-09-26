@@ -1,12 +1,12 @@
 pub mod cli;
 pub mod output;
-pub mod seed;
 pub mod probe;
+pub mod seed;
 pub mod tests;
 
+use av_net_x0x::client::X0xConfig;
 use clap::Parser;
 use cli::{Cli, Role};
-use av_net_x0x::client::X0xConfig;
 
 pub fn run() {
     let args = Cli::parse();
@@ -17,10 +17,8 @@ pub fn run() {
     } else {
         "info,av_probe=info,av_net_x0x=info"
     };
-    
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .try_init();
+
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     // Discover the x0x daemon
     let config = match X0xConfig::from_data_dir() {

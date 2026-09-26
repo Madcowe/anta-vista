@@ -20,9 +20,9 @@ mod adversarial {
     #[test]
     fn test_trust_decay_edge_cases() {
         let timestamps = vec![
-            0i64,          // epoch
-            i64::MIN,      // far past
-            i64::MAX,      // far future
+            0i64,           // epoch
+            i64::MIN,       // far past
+            i64::MAX,       // far future
             -2_000_000_000, // before epoch
         ];
 
@@ -38,7 +38,10 @@ mod adversarial {
         let low_trust_agreement = 0.1;
         let high_trust_threshold = 0.5;
 
-        assert!(low_trust_agreement < high_trust_threshold, "trust threshold enforced");
+        assert!(
+            low_trust_agreement < high_trust_threshold,
+            "trust threshold enforced"
+        );
     }
 
     #[test]

@@ -4,12 +4,12 @@ use std::time::Duration;
 use crate::cmd::{CliError, CliResult};
 use crate::startup::StartupState;
 use av_core::types::MessageKind;
-use av_embed::mock::MockEmbeddingProvider;
 use av_embed::minilm::MiniLmProvider;
+use av_embed::mock::MockEmbeddingProvider;
 use av_index::index::LocalIndex;
 use av_net_x0x::client::X0xNetClient;
 use av_net_x0x::dispatcher::MessageDispatcher;
-use av_net_x0x::payloads::{QueryPayload, NameQueryPayload, ResourceResult};
+use av_net_x0x::payloads::{NameQueryPayload, QueryPayload, ResourceResult};
 use av_store::repo::peers;
 
 /// Run the anta-vista peer listener daemon.
@@ -59,9 +59,7 @@ pub fn run(state: StartupState, run_for_secs: Option<u64>) -> CliResult<()> {
     )
     .map_err(|e| CliError::Network(format!("direct listener: {e}")))?;
 
-    let deadline = run_for_secs.map(|s| {
-        std::time::Instant::now() + Duration::from_secs(s)
-    });
+    let deadline = run_for_secs.map(|s| std::time::Instant::now() + Duration::from_secs(s));
 
     println!(
         "av listen: active on agent {} — responding to network queries",
@@ -131,7 +129,13 @@ pub fn run(state: StartupState, run_for_secs: Option<u64>) -> CliResult<()> {
                         serde_json::from_value::<QueryPayload>(msg.envelope.payload.clone())
                     {
                         tracing::debug!(query_id = %q.query_id, from = %msg.sender, "received direct Query");
-                        respond_to_search_query_direct(&dispatcher, &db_path, &embed_provider, &q, &msg.sender)?;
+                        respond_to_search_query_direct(
+                            &dispatcher,
+                            &db_path,
+                            &embed_provider,
+                            &q,
+                            &msg.sender,
+                        )?;
                     }
                 }
                 MessageKind::NameQuery => {
@@ -256,15 +260,18 @@ fn respond_to_name_query(
     let scheme_filter = av_index::filter::SchemeFilter::default();
     let now = now_secs();
 
-    let results = av_index::naming::lookup_name(&conn, &q.name, &scheme_filter, now)
-        .unwrap_or_default();
+    let results =
+        av_index::naming::lookup_name(&conn, &q.name, &scheme_filter, now).unwrap_or_default();
 
     if results.is_empty() {
         return Ok(());
     }
 
-    let records: Vec<av_core::types::NameRecord> =
-        results.into_iter().take(q.max_results as usize).map(|r| r.record).collect();
+    let records: Vec<av_core::types::NameRecord> = results
+        .into_iter()
+        .take(q.max_results as usize)
+        .map(|r| r.record)
+        .collect();
 
     dispatcher
         .publish_name_response(&q.query_id, &q.normalized_name, records)
@@ -282,15 +289,18 @@ fn respond_to_name_query_direct(
     let scheme_filter = av_index::filter::SchemeFilter::default();
     let now = now_secs();
 
-    let results = av_index::naming::lookup_name(&conn, &q.name, &scheme_filter, now)
-        .unwrap_or_default();
+    let results =
+        av_index::naming::lookup_name(&conn, &q.name, &scheme_filter, now).unwrap_or_default();
 
     if results.is_empty() {
         return Ok(());
     }
 
-    let records: Vec<av_core::types::NameRecord> =
-        results.into_iter().take(q.max_results as usize).map(|r| r.record).collect();
+    let records: Vec<av_core::types::NameRecord> = results
+        .into_iter()
+        .take(q.max_results as usize)
+        .map(|r| r.record)
+        .collect();
 
     dispatcher
         .send_direct_name_response(to_agent_id, &q.query_id, &q.normalized_name, records)

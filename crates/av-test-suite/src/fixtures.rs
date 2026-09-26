@@ -31,11 +31,11 @@ pub mod payloads {
     pub const EMPTY_STRING: &str = "";
     pub const WHITESPACE_ONLY: &str = "   \t\n\r   ";
     pub const NULL_BYTE: &str = "hello\0world";
-    pub const LONG_STRING: &str = "a";  // Will be repeated in tests
+    pub const LONG_STRING: &str = "a"; // Will be repeated in tests
     pub const UNICODE_HOMOGLYPHS: &[&str] = &[
-        "𝒜",  // Mathematical Alphanumeric Symbols
-        "Α",  // Greek Alpha
-        "А",  // Cyrillic A
+        "𝒜", // Mathematical Alphanumeric Symbols
+        "Α", // Greek Alpha
+        "А", // Cyrillic A
     ];
 
     /// Magic bytes for file type detection

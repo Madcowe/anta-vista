@@ -18,7 +18,11 @@ mod adversarial {
     #[test]
     fn test_extremely_long_description() {
         let long_desc = "word ".repeat(20_001); // > 100k chars
-        assert!(long_desc.len() > 100_000, "long description should exceed 100k: {}", long_desc.len());
+        assert!(
+            long_desc.len() > 100_000,
+            "long description should exceed 100k: {}",
+            long_desc.len()
+        );
     }
 
     #[test]

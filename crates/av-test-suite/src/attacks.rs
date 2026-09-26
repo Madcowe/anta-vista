@@ -10,10 +10,11 @@ pub struct SybilCluster {
 
 impl SybilCluster {
     pub fn new(size: usize, trust_level: f64) -> Self {
-        let agent_ids = (0..size)
-            .map(|i| format!("{:064x}", i))
-            .collect();
-        Self { agent_ids, trust_level }
+        let agent_ids = (0..size).map(|i| format!("{:064x}", i)).collect();
+        Self {
+            agent_ids,
+            trust_level,
+        }
     }
 
     pub fn add_claim(&self, claim: &str) -> Vec<(String, String)> {
@@ -97,7 +98,10 @@ impl ResourcePoisoner {
             "definitely".to_string(),
             "very".to_string(),
         ];
-        Self { description, fake_tokens }
+        Self {
+            description,
+            fake_tokens,
+        }
     }
 }
 

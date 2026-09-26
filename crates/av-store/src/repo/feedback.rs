@@ -1,5 +1,5 @@
 use av_core::types::{FeedbackEvent, FeedbackKind};
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{Connection, Result as SqlResult, params};
 
 pub fn insert(conn: &Connection, f: &FeedbackEvent) -> SqlResult<()> {
     conn.execute(

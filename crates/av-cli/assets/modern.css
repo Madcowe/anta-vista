@@ -1,0 +1,449 @@
+/* Modern theme: the default. Dark, quiet, and legible.
+   Shared structural rules live here so both themes agree on layout;
+   only colour and ornament differ. */
+
+/* --- shared structure ---------------------------------------------------- */
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.skip {
+  position: absolute;
+  left: -9999px;
+}
+
+.skip:focus {
+  left: 8px;
+  top: 8px;
+  z-index: 100;
+  background: #fff;
+  color: #000;
+  padding: 8px 12px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 20px;
+}
+
+.wordmark {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.wordmark .dot {
+  opacity: 0.5;
+}
+
+.bar-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+main {
+  max-width: 62rem;
+  margin: 0 auto;
+  padding: 20px;
+  display: grid;
+  gap: 20px;
+}
+
+h2 {
+  margin: 0 0 4px;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.btn {
+  font: inherit;
+  cursor: pointer;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  padding: 7px 14px;
+  min-height: 34px;
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.btn:focus-visible,
+input:focus-visible,
+a:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+input[type="search"],
+input[type="text"] {
+  font: inherit;
+  padding: 8px 12px;
+  border-radius: 6px;
+  min-width: 0;
+  min-height: 34px;
+}
+
+.search {
+  display: flex;
+  gap: 8px;
+}
+
+.search input {
+  flex: 1;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.row input {
+  flex: 1 1 16rem;
+}
+
+.hint {
+  margin: 4px 0 10px;
+  font-size: 0.85rem;
+}
+
+.banner {
+  padding: 12px 20px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.status-line {
+  margin: 8px 0 0;
+  font-size: 0.85rem;
+}
+
+.results-heading {
+  margin: 0 0 10px;
+}
+
+.result-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.result-head {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.result-desc {
+  margin: 6px 0;
+}
+
+.result-meta {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+
+.result-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.rate-label,
+.rate-status {
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(26rem, 100%);
+  display: flex;
+  flex-direction: column;
+  z-index: 40;
+}
+
+.drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+}
+
+.drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 16px 16px;
+}
+
+.drawer-foot {
+  padding: 12px 16px;
+  display: flex;
+  gap: 8px;
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+}
+
+.dialog {
+  border: none;
+  border-radius: 10px;
+  padding: 20px;
+  max-width: 34rem;
+  width: calc(100% - 32px);
+}
+
+.dialog::backdrop {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.dialog menu {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  padding: 0;
+  margin: 16px 0 0;
+}
+
+.command {
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 0.82rem;
+}
+
+.check {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-top: 12px;
+  font-size: 0.88rem;
+}
+
+.badge {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+/* --- modern palette ------------------------------------------------------ */
+
+[data-theme="modern"] {
+  color-scheme: dark;
+  --bg: #0e1116;
+  --surface: #161b22;
+  --surface-2: #1c222b;
+  --fg: #e6edf3;
+  --fg-dim: #9aa7b4;
+  --border: #2a323d;
+  --accent: #4493f8;
+  --accent-fg: #06121f;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --bad: #f85149;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+[data-theme="modern"] body {
+  background: var(--bg);
+  color: var(--fg);
+}
+
+[data-theme="modern"] .bar {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+[data-theme="modern"] .btn {
+  background: var(--surface-2);
+  color: var(--fg);
+  border-color: var(--border);
+}
+
+[data-theme="modern"] .btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+[data-theme="modern"] .btn-primary {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+[data-theme="modern"] .btn-quiet {
+  background: transparent;
+  color: var(--fg-dim);
+  border-color: transparent;
+}
+
+[data-theme="modern"] .btn-quiet:hover {
+  background: var(--surface-2);
+  color: var(--fg);
+}
+
+[data-theme="modern"] input[type="search"],
+[data-theme="modern"] input[type="text"] {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+
+[data-theme="modern"] input::placeholder {
+  color: var(--fg-dim);
+}
+
+[data-theme="modern"] .panel,
+[data-theme="modern"] .drawer {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+[data-theme="modern"] .banner {
+  background: rgba(210, 153, 34, 0.14);
+  border-bottom: 1px solid var(--border);
+  color: #f0c674;
+}
+
+[data-theme="modern"] .badge {
+  background: rgba(68, 147, 248, 0.16);
+  color: #79b8ff;
+}
+
+[data-theme="modern"] .result {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+[data-theme="modern"] .result-title {
+  color: var(--fg);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+[data-theme="modern"] .result-title:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+[data-theme="modern"] .rid,
+[data-theme="modern"] .hint,
+[data-theme="modern"] .status-line,
+[data-theme="modern"] .command {
+  font-family: var(--mono);
+}
+
+[data-theme="modern"] .command {
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+
+[data-theme="modern"] .dialog {
+  background: var(--surface);
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+
+[data-theme="modern"] .overlay {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+[data-theme="modern"] .rate-status[data-tone="ok"] {
+  color: var(--ok);
+  opacity: 1;
+}
+
+[data-theme="modern"] .rate-status[data-tone="warn"] {
+  color: var(--warn);
+  opacity: 1;
+}
+
+[data-theme="modern"] .rate-status[data-tone="bad"] {
+  color: var(--bad);
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* "Don't show again" for a repetitive but true warning. Deliberately quiet: it
+ * is a preference, not an action the user needs to notice. */
+.warn-mute {
+  background: none;
+  border: 0;
+  border-bottom: 1px dotted currentColor;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  margin-left: 0.5rem;
+  opacity: 0.7;
+  padding: 0;
+}
+
+.warn-mute:hover {
+  opacity: 1;
+}
+
+.warn-mute:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+/* An Autonomi location has no open/download path yet, so it is shown as
+ * non-interactive text rather than a link that would 501. It keeps the visual
+ * weight of the title so the result does not look broken, and is dimmed to
+ * signal that it cannot be followed. */
+[data-theme="modern"] .result-loc {
+  color: var(--fg);
+  font-weight: 600;
+  cursor: help;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}

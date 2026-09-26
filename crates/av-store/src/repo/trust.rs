@@ -1,5 +1,5 @@
 use av_core::types::TrustState;
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{Connection, Result as SqlResult, params};
 
 pub fn upsert(conn: &Connection, t: &TrustState) -> SqlResult<()> {
     conn.execute(

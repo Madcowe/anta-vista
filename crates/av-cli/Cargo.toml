@@ -18,6 +18,7 @@ av-trust = { workspace = true }
 av-query = { workspace = true }
 av-net-x0x = { workspace = true }
 ureq = { version = "2" }
+tiny_http = "0.12"
 serde = { workspace = true }
 serde_json = { workspace = true }
 dialoguer = { workspace = true }

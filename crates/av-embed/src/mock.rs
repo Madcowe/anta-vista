@@ -1,7 +1,7 @@
 use crate::{
     error::EmbedResult,
     normalize::l2_normalize,
-    provider::{minilm_profile, EmbeddingProvider},
+    provider::{EmbeddingProvider, minilm_profile},
 };
 use av_core::types::EmbeddingProfile;
 use sha2::{Digest, Sha256};

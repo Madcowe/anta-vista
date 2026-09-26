@@ -1,13 +1,31 @@
 use crate::{
     error::{EmbedError, EmbedResult},
     normalize::l2_normalize,
-    provider::{minilm_profile, EmbeddingProvider},
+    provider::{EmbeddingProvider, minilm_profile},
 };
 use av_core::types::EmbeddingProfile;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use std::path::PathBuf;
+
+/// Where the downloaded model weights are kept.
+///
+/// fastembed's default is `.fastembed_cache` **relative to the current working
+/// directory**, so a plain `av search` drops ~87 MB of weights into whatever
+/// directory the user happened to be in — including a git checkout, where it
+/// turns into untracked files that look like they should be committed. Put them
+/// in the OS cache directory instead, next to the rest of our cached state.
+///
+/// An explicit `FASTEMBED_CACHE_DIR` still wins, and if the platform has no
+/// cache directory we return `None` and let fastembed apply its own default.
+fn cache_dir() -> Option<PathBuf> {
+    if std::env::var_os("FASTEMBED_CACHE_DIR").is_some() {
+        return None;
+    }
+    av_core::paths::cache_dir()
+}
 
 /// Embedding provider backed by fastembed's all-MiniLM-L6-v2 ONNX model.
-/// On first construction, downloads the model if not cached (~22 MB).
+/// On first construction, downloads the model if not cached (~87 MB).
 pub struct MiniLmProvider {
     model: TextEmbedding,
     profile: EmbeddingProfile,
@@ -16,10 +34,13 @@ pub struct MiniLmProvider {
 impl MiniLmProvider {
     /// Create a new provider, downloading the model if not already cached.
     pub fn new() -> EmbedResult<Self> {
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(false),
-        )
-        .map_err(|e| EmbedError::ModelNotLoaded(e.to_string()))?;
+        let mut opts =
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(false);
+        if let Some(dir) = cache_dir() {
+            opts = opts.with_cache_dir(dir);
+        }
+        let model =
+            TextEmbedding::try_new(opts).map_err(|e| EmbedError::ModelNotLoaded(e.to_string()))?;
 
         Ok(Self {
             model,

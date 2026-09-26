@@ -1,11 +1,11 @@
-use std::time::{Duration, Instant};
 use crate::cli::Cli;
 use crate::output::{TestResult, TestStatus};
 use crate::tests::helpers::{MessageHub, now_secs};
+use av_core::constants::{SCHEMA_VERSION, TOPIC_QUERY};
+use av_core::types::{MessageEnvelope, MessageKind};
 use av_net_x0x::dispatcher::MessageDispatcher;
 use av_net_x0x::payloads::{QueryPayload, ResponsePayload};
-use av_core::types::{MessageKind, MessageEnvelope};
-use av_core::constants::{SCHEMA_VERSION, TOPIC_QUERY};
+use std::time::{Duration, Instant};
 
 pub fn test_gossip_delivery(
     args: &Cli,
@@ -14,7 +14,7 @@ pub fn test_gossip_delivery(
 ) -> TestResult {
     let start = Instant::now();
     let query_text = "test gossip delivery query";
-    
+
     // 1. Publish query
     let query_id = match dispatcher.publish_query(query_text, 1, args.wait * 1000, vec![]) {
         Ok(id) => id,
@@ -36,7 +36,9 @@ pub fn test_gossip_delivery(
     let timeout = Duration::from_secs(args.wait);
     let matched = hub.wait_for_gossip(timeout, |event| {
         if event.envelope.kind == MessageKind::Response {
-            if let Ok(resp) = serde_json::from_value::<ResponsePayload>(event.envelope.payload.clone()) {
+            if let Ok(resp) =
+                serde_json::from_value::<ResponsePayload>(event.envelope.payload.clone())
+            {
                 return resp.query_id == query_id;
             }
         }
@@ -114,9 +116,20 @@ pub fn test_direct_delivery(
             if delay > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(delay));
             }
-            match dispatcher.send_direct_query(peer_id, "test direct delivery query", 1, args.wait * 1000, vec![]) {
-                Ok(id) => { result = Some(id); break; }
-                Err(e) => { last_err = e.to_string(); }
+            match dispatcher.send_direct_query(
+                peer_id,
+                "test direct delivery query",
+                1,
+                args.wait * 1000,
+                vec![],
+            ) {
+                Ok(id) => {
+                    result = Some(id);
+                    break;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
             }
         }
         match result {
@@ -140,7 +153,9 @@ pub fn test_direct_delivery(
     let timeout = Duration::from_secs(args.wait);
     let matched = hub.wait_for_direct(timeout, |msg| {
         if msg.envelope.kind == MessageKind::Response {
-            if let Ok(resp) = serde_json::from_value::<ResponsePayload>(msg.envelope.payload.clone()) {
+            if let Ok(resp) =
+                serde_json::from_value::<ResponsePayload>(msg.envelope.payload.clone())
+            {
                 return resp.query_id == query_id;
             }
         }
@@ -233,13 +248,17 @@ pub fn test_deduplication(
     let loop_start = Instant::now();
 
     while loop_start.elapsed() < timeout {
-        let remaining = timeout.checked_sub(loop_start.elapsed()).unwrap_or(Duration::ZERO);
+        let remaining = timeout
+            .checked_sub(loop_start.elapsed())
+            .unwrap_or(Duration::ZERO);
         if remaining == Duration::ZERO {
             break;
         }
         let matched = hub.wait_for_gossip(remaining, |event| {
             if event.envelope.kind == MessageKind::Response {
-                if let Ok(resp) = serde_json::from_value::<ResponsePayload>(event.envelope.payload.clone()) {
+                if let Ok(resp) =
+                    serde_json::from_value::<ResponsePayload>(event.envelope.payload.clone())
+                {
                     return resp.query_id == query_id;
                 }
             }
@@ -263,7 +282,8 @@ pub fn test_deduplication(
             transport: "gossip".to_string(),
             status: TestStatus::Pass,
             duration_ms,
-            details: "Duplicate queries were correctly ignored, yielding exactly 1 response".to_string(),
+            details: "Duplicate queries were correctly ignored, yielding exactly 1 response"
+                .to_string(),
             debug: serde_json::json!({ "query_id": query_id, "responses_received": response_count }),
         }
     } else {
@@ -274,7 +294,10 @@ pub fn test_deduplication(
             transport: "gossip".to_string(),
             status: TestStatus::Fail,
             duration_ms,
-            details: format!("Expected exactly 1 response, but received {}", response_count),
+            details: format!(
+                "Expected exactly 1 response, but received {}",
+                response_count
+            ),
             debug: serde_json::json!({ "query_id": query_id, "responses_received": response_count }),
         }
     }

@@ -52,10 +52,12 @@ pub fn compact_items(items: &[String]) -> Vec<String> {
                 season,
                 episode,
             } => {
-                let group = groups.entry(title_key.clone()).or_insert_with(|| TitleGroup {
-                    display: title_display.clone(),
-                    seasons: BTreeMap::new(),
-                });
+                let group = groups
+                    .entry(title_key.clone())
+                    .or_insert_with(|| TitleGroup {
+                        display: title_display.clone(),
+                        seasons: BTreeMap::new(),
+                    });
                 group.seasons.entry(*season).or_default().push(*episode);
             }
         }
@@ -77,9 +79,7 @@ pub fn compact_items(items: &[String]) -> Vec<String> {
                     out.push(display.clone());
                 }
             }
-            ParsedItem::Episode {
-                title_key, ..
-            } => {
+            ParsedItem::Episode { title_key, .. } => {
                 if emitted_titles.insert(title_key.clone()) {
                     let group = &groups[title_key];
                     let mut seasons: Vec<(u32, &Vec<u32>)> =
@@ -134,11 +134,10 @@ fn clean_stem(raw: &str) -> Option<String> {
     }
     // Remove trailing ".<hex>" junk (e.g. "...mp4.66cacd06").
     loop {
-        let Some((head, tail)) = s.rsplit_once('.') else { break };
-        if !tail.is_empty()
-            && tail.chars().all(|c| c.is_ascii_hexdigit())
-            && tail.len() >= 6
-        {
+        let Some((head, tail)) = s.rsplit_once('.') else {
+            break;
+        };
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_hexdigit()) && tail.len() >= 6 {
             s = head.to_string();
         } else {
             break;
@@ -150,11 +149,7 @@ fn clean_stem(raw: &str) -> Option<String> {
             s = head.to_string();
         }
     }
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Find an `S<season>E<episode>` token (case‑insensitive). Returns the byte
@@ -267,11 +262,51 @@ fn is_ignored_token(t: &str) -> bool {
 
 fn is_quality_token(t: &str) -> bool {
     const QUALITY: &[&str] = &[
-        "480p", "576p", "720p", "1080p", "1440p", "2160p", "4320p", "4k", "8k", "uhd", "fhd",
-        "qhd", "hdr", "hdr10", "hdr10plus", "dolbyvision", "web", "webrip", "webdl", "web-dl",
-        "bluray", "brrip", "bdrip", "dvdrip", "hdtv", "hdtvrip", "pdtv", "remux", "x264", "x265",
-        "h264", "h265", "hevc", "avc", "av1", "vp9", "proper", "repack", "extended", "unrated",
-        "directors", "cut", "screener", "cam", "tsrip",
+        "480p",
+        "576p",
+        "720p",
+        "1080p",
+        "1440p",
+        "2160p",
+        "4320p",
+        "4k",
+        "8k",
+        "uhd",
+        "fhd",
+        "qhd",
+        "hdr",
+        "hdr10",
+        "hdr10plus",
+        "dolbyvision",
+        "web",
+        "webrip",
+        "webdl",
+        "web-dl",
+        "bluray",
+        "brrip",
+        "bdrip",
+        "dvdrip",
+        "hdtv",
+        "hdtvrip",
+        "pdtv",
+        "remux",
+        "x264",
+        "x265",
+        "h264",
+        "h265",
+        "hevc",
+        "avc",
+        "av1",
+        "vp9",
+        "proper",
+        "repack",
+        "extended",
+        "unrated",
+        "directors",
+        "cut",
+        "screener",
+        "cam",
+        "tsrip",
     ];
     QUALITY.contains(&t.to_ascii_lowercase().as_str())
 }
@@ -397,7 +432,10 @@ mod tests {
     #[test]
     fn single_episode_uses_episode_form() {
         let items = vec!["The Outer Limit S01E09.mkv".into()];
-        assert_eq!(compact_items(&items), ["The Outer Limit season 1 episode 9"]);
+        assert_eq!(
+            compact_items(&items),
+            ["The Outer Limit season 1 episode 9"]
+        );
     }
 
     #[test]

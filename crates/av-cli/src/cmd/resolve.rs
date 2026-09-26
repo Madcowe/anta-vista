@@ -53,10 +53,11 @@ pub fn run(
     let mut merged_results: Vec<av_index::naming::NameResult> = merged_results
         .into_iter()
         .map(|mut nr| {
-            let rel = av_store::repo::relevance::name_get_score(&conn, &normalized, &nr.record.record_id)
-                .ok()
-                .flatten()
-                .unwrap_or(0.5);
+            let rel =
+                av_store::repo::relevance::name_get_score(&conn, &normalized, &nr.record.record_id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0.5);
             nr.score = nr.score * (1.0 - WEIGHT_RELEVANCE) + rel * WEIGHT_RELEVANCE;
             nr
         })
@@ -64,7 +65,9 @@ pub fn run(
 
     // Re-sort after relevance boost (scores may shift)
     merged_results.sort_by(|a, b| {
-        b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     let winners = merged_results.into_iter().take(limit).collect::<Vec<_>>();
@@ -77,7 +80,11 @@ pub fn run(
             .skip(1)
             .cloned()
             .map(|w| {
-                let target = w.record.target_canonical.as_deref().unwrap_or(&w.record.target);
+                let target = w
+                    .record
+                    .target_canonical
+                    .as_deref()
+                    .unwrap_or(&w.record.target);
                 json!({
                     "record_id": w.record.record_id,
                     "target": target,
@@ -117,7 +124,11 @@ pub fn run(
         cli.non_interactive,
         || {
             if let Some(ref w) = winner {
-                let target = w.record.target_canonical.as_deref().unwrap_or(&w.record.target);
+                let target = w
+                    .record
+                    .target_canonical
+                    .as_deref()
+                    .unwrap_or(&w.record.target);
                 println!(
                     "Resolved {} → {} (score: {:.3})",
                     console::style(&name).cyan().bold(),

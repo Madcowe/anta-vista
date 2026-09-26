@@ -1,6 +1,6 @@
 use crate::cmd::{CliError, CliResult};
 use crate::startup::ant_cli_binary_available;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -65,7 +65,9 @@ pub fn download_content(uri: &str, on_event: Option<&dyn Fn(DownloadEvent)>) -> 
 
             // Fallback: Stream via public data streaming endpoint
             if let Some(f) = on_event {
-                f(DownloadEvent::Status("Downloading from Autonomi network..."));
+                f(DownloadEvent::Status(
+                    "Downloading from Autonomi network...",
+                ));
             }
             let stream_url = format!("http://localhost:8082/v1/data/public/{}/stream", addr);
             let resp = match ureq::get(&stream_url).call() {
@@ -83,7 +85,10 @@ pub fn download_content(uri: &str, on_event: Option<&dyn Fn(DownloadEvent)>) -> 
                         _ => format!("antd daemon error: {}", antd_err),
                     };
                     if let Some(f) = on_event {
-                        f(DownloadEvent::Status(&format!("{}, falling back to ant CLI...", detail)));
+                        f(DownloadEvent::Status(&format!(
+                            "{}, falling back to ant CLI...",
+                            detail
+                        )));
                     }
                     if let Some(f) = on_event {
                         f(DownloadEvent::SubprocessOutput);
@@ -182,7 +187,10 @@ pub fn verify_uri_exists(uri: &str) -> CliResult<()> {
     }
 }
 
-fn download_via_ant_cli(addr: &str, on_event: Option<&dyn Fn(DownloadEvent)>) -> CliResult<Vec<u8>> {
+fn download_via_ant_cli(
+    addr: &str,
+    on_event: Option<&dyn Fn(DownloadEvent)>,
+) -> CliResult<Vec<u8>> {
     let tmp = NamedTempFile::new().map_err(CliError::Io)?;
     let tmp_path = tmp.path().to_owned();
 

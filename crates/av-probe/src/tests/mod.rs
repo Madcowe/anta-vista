@@ -6,9 +6,9 @@ pub mod trust;
 
 use crate::cli::Cli;
 use crate::output::TestResult;
-use helpers::MessageHub;
-use av_net_x0x::dispatcher::MessageDispatcher;
 use av_net_x0x::client::X0xConfig;
+use av_net_x0x::dispatcher::MessageDispatcher;
+use helpers::MessageHub;
 use rusqlite::Connection;
 
 pub fn run_all_tests(
@@ -20,9 +20,7 @@ pub fn run_all_tests(
 ) -> Vec<TestResult> {
     let mut results = Vec::new();
 
-    let run_test = |name: &str| {
-        args.test.is_none() || args.test.as_deref() == Some(name)
-    };
+    let run_test = |name: &str| args.test.is_none() || args.test.as_deref() == Some(name);
 
     // 1. Transport suite
     if run_test("gossip_delivery") {
@@ -62,13 +60,19 @@ pub fn run_all_tests(
 
     // 4. Trust suite
     if run_test("unknown_trust") {
-        results.push(trust::test_unknown_trust(args, dispatcher, hub, conn, x0x_cfg));
+        results.push(trust::test_unknown_trust(
+            args, dispatcher, hub, conn, x0x_cfg,
+        ));
     }
     if run_test("known_trust") {
-        results.push(trust::test_known_trust(args, dispatcher, hub, conn, x0x_cfg));
+        results.push(trust::test_known_trust(
+            args, dispatcher, hub, conn, x0x_cfg,
+        ));
     }
     if run_test("blocked_trust") {
-        results.push(trust::test_blocked_trust(args, dispatcher, hub, conn, x0x_cfg));
+        results.push(trust::test_blocked_trust(
+            args, dispatcher, hub, conn, x0x_cfg,
+        ));
     }
 
     results

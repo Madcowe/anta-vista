@@ -33,8 +33,14 @@ fn migrate(conn: &Connection) -> SqlResult<()> {
     let migrations: &[(&str, &str)] = &[
         ("001_initial", crate::schema::MIGRATION_001_INITIAL),
         ("002_relevance", crate::schema::MIGRATION_002_RELEVANCE),
-        ("003_name_relevance", crate::schema::MIGRATION_003_NAME_RELEVANCE),
-        ("004_canonical_scheme", crate::schema::MIGRATION_004_CANONICAL_SCHEME),
+        (
+            "003_name_relevance",
+            crate::schema::MIGRATION_003_NAME_RELEVANCE,
+        ),
+        (
+            "004_canonical_scheme",
+            crate::schema::MIGRATION_004_CANONICAL_SCHEME,
+        ),
     ];
 
     for (name, sql) in migrations {
@@ -48,8 +54,13 @@ fn migrate(conn: &Connection) -> SqlResult<()> {
 
         if !already_applied {
             conn.execute_batch(sql)?;
+            // `OR IGNORE` because `open` can be called concurrently on the same
+            // file — the web server opens a connection per request, and several
+            // threads can reach a fresh database at once. Both threads see the
+            // migration as pending and both run its DDL, which is idempotent;
+            // without this, the loser of the race fails on the primary key.
             conn.execute(
-                "INSERT INTO applied_migrations (name, applied_at) VALUES (?1, strftime('%s','now'))",
+                "INSERT OR IGNORE INTO applied_migrations (name, applied_at) VALUES (?1, strftime('%s','now'))",
                 rusqlite::params![name],
             )?;
         }

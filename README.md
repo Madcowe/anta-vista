@@ -42,6 +42,7 @@ av status
 
 | Command | Description |
 |---------|-------------|
+| `av web` | Open the browser interface (see [Web interface](#web-interface)) |
 | `av status` | Show daemon and model health |
 | `av search <query>` | Semantic search for resources |
 | `av resolve <name>` | DNS-like name → URI resolution |
@@ -76,6 +77,64 @@ av resolve my-resource-name
 `--timeout <ms>` — network response timeout  
 `--stream` — show results progressively  
 `-v` / `-vv` — increase log verbosity
+
+---
+
+## Web interface
+
+Anta-Vista ships a local web GUI served by the `av` binary itself — no extra
+process, no separate install.
+
+```bash
+av web                        # 127.0.0.1:8787, opens your browser
+av                            # same thing (interactive)
+av gui                        # alias for av web
+av web --port 9000            # pick a port
+av web --host 0.0.0.0         # expose to your LAN (warns first)
+av web --no-open              # do not launch a browser
+av web --run-for 30           # exit after 30s (useful in scripts and tests)
+```
+
+The server binds to loopback by default and rejects requests whose `Host` header
+is not a loopback name, so a malicious page cannot drive it through DNS
+rebinding. Binding to a non-loopback address is allowed but prints a warning,
+because anyone on that network can then reach it.
+
+It also starts with **no dependencies installed**. The setup banner reports what
+is missing and offers the least destructive action that can work: an
+installed-but-stopped daemon is *started*, and only a genuinely missing binary
+offers the installer — and then the dialog shows the exact command for your
+platform before you can confirm anything.
+
+### What it does
+
+- **Search** — the same code path as `av search`, so browser and CLI rank
+  identically. Results show the score and a breakdown of why.
+- **Rate** — `useful` / `not-useful` / `high-confidence` / `low-confidence`.
+  Endorsements are stored, gossiped, and boost the result for the query you
+  searched.
+- **Add a Link** — a real download and ingest, the same as `av index`.
+- **Status drawer** — daemon health, listener state, database counts, and a
+  button to stop background listeners.
+- **Two themes** — a retro mode with a result-count marquee, and a plain modern
+  mode. The toggle remembers your choice, and so does "don't show again" on
+  recurring warnings.
+
+### Limits worth knowing
+
+These are real gaps, not oversights, and the UI says so where it can:
+
+- **Search blocks.** The browser waits for the whole result set; the network
+  fan-out has to finish. Streaming (SSE) is a planned follow-up, not something
+  faked.
+- **Autonomi locations cannot be opened or downloaded from the browser.** The
+  controls are shown disabled rather than wired to an endpoint that would fail.
+  The *Add a Link* path does download, but it needs the `ant` CLI or `antd`.
+- **Peers do not consume feedback yet.** Rating publishes a message, but no
+  remote agent acts on it, so it does not change anyone else's ranking. The UI
+  states this on every broadcast rating.
+- **Name records cannot be rated.** Feedback rows attach to indexed resources;
+  names are tracked separately.
 
 ---
 

@@ -2,11 +2,11 @@
 //!
 //! Helpers for discovering x0xd daemon, managing named instances, and injecting test payloads
 
+use base64::Engine;
+use directories::ProjectDirs;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use base64::Engine;
-use directories::ProjectDirs;
 
 /// Discover x0xd daemon from default or named data directory
 pub struct X0xDaemonConfig {

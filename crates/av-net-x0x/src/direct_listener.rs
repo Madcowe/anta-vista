@@ -104,7 +104,7 @@ fn parse_direct_event(data: &str) -> NetResult<Option<DirectMessage>> {
 
     let sender = match v["sender"].as_str() {
         Some(s) => s.to_string(),
-        None => return Ok(None),  // not a direct_message event (e.g. heartbeat)
+        None => return Ok(None), // not a direct_message event (e.g. heartbeat)
     };
 
     let machine_id = v["machine_id"].as_str().unwrap_or("").to_string();

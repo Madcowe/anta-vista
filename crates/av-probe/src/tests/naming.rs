@@ -1,10 +1,10 @@
-use std::time::{Duration, Instant};
 use crate::cli::Cli;
 use crate::output::{TestResult, TestStatus};
 use crate::tests::helpers::MessageHub;
+use av_core::types::MessageKind;
 use av_net_x0x::dispatcher::MessageDispatcher;
 use av_net_x0x::payloads::{NameClaimPayload, NameResponsePayload};
-use av_core::types::MessageKind;
+use std::time::{Duration, Instant};
 
 pub fn test_gossip_name_claim(
     args: &Cli,
@@ -36,8 +36,11 @@ pub fn test_gossip_name_claim(
     // Wait for the NameClaim broadcast from the seed node.
     let timeout = Duration::from_secs(args.wait);
     let matched = hub.wait_for_gossip(timeout, |event| {
-        if event.envelope.kind == MessageKind::NameClaim && &event.envelope.from_agent_id == peer_id {
-            if let Ok(claim) = serde_json::from_value::<NameClaimPayload>(event.envelope.payload.clone()) {
+        if event.envelope.kind == MessageKind::NameClaim && &event.envelope.from_agent_id == peer_id
+        {
+            if let Ok(claim) =
+                serde_json::from_value::<NameClaimPayload>(event.envelope.payload.clone())
+            {
                 return claim.record.normalized_name == "seed.av";
             }
         }
@@ -64,7 +67,10 @@ pub fn test_gossip_name_claim(
             transport: "gossip".to_string(),
             status: TestStatus::Fail,
             duration_ms,
-            details: format!("Timed out waiting for NameClaim broadcast from seed node ({})", peer_id),
+            details: format!(
+                "Timed out waiting for NameClaim broadcast from seed node ({})",
+                peer_id
+            ),
             debug: serde_json::json!({ "peer_id": peer_id }),
         },
     }
@@ -98,7 +104,9 @@ pub fn test_name_query_response(
     let timeout = Duration::from_secs(args.wait);
     let matched = hub.wait_for_gossip(timeout, |event| {
         if event.envelope.kind == MessageKind::NameResponse {
-            if let Ok(resp) = serde_json::from_value::<NameResponsePayload>(event.envelope.payload.clone()) {
+            if let Ok(resp) =
+                serde_json::from_value::<NameResponsePayload>(event.envelope.payload.clone())
+            {
                 return resp.query_id == query_id;
             }
         }
@@ -159,7 +167,9 @@ pub fn test_case_insensitive(
     let timeout = Duration::from_secs(args.wait);
     let matched = hub.wait_for_gossip(timeout, |event| {
         if event.envelope.kind == MessageKind::NameResponse {
-            if let Ok(resp) = serde_json::from_value::<NameResponsePayload>(event.envelope.payload.clone()) {
+            if let Ok(resp) =
+                serde_json::from_value::<NameResponsePayload>(event.envelope.payload.clone())
+            {
                 return resp.query_id == query_id;
             }
         }
@@ -170,7 +180,8 @@ pub fn test_case_insensitive(
 
     match matched {
         Some(event) => {
-            let payload: NameResponsePayload = serde_json::from_value(event.envelope.payload.clone()).unwrap();
+            let payload: NameResponsePayload =
+                serde_json::from_value(event.envelope.payload.clone()).unwrap();
             if payload.results.is_empty() {
                 TestResult {
                     test_id: "N3".to_string(),
@@ -190,7 +201,8 @@ pub fn test_case_insensitive(
                     transport: "gossip".to_string(),
                     status: TestStatus::Pass,
                     duration_ms,
-                    details: "Case-insensitive name query returned matching records successfully".to_string(),
+                    details: "Case-insensitive name query returned matching records successfully"
+                        .to_string(),
                     debug: serde_json::json!({ "query_id": query_id, "response": event.envelope }),
                 }
             }
@@ -236,7 +248,9 @@ pub fn test_scheme_alias(
     let timeout = Duration::from_secs(args.wait);
     let matched = hub.wait_for_gossip(timeout, |event| {
         if event.envelope.kind == MessageKind::NameResponse {
-            if let Ok(resp) = serde_json::from_value::<NameResponsePayload>(event.envelope.payload.clone()) {
+            if let Ok(resp) =
+                serde_json::from_value::<NameResponsePayload>(event.envelope.payload.clone())
+            {
                 return resp.query_id == query_id;
             }
         }
@@ -247,10 +261,14 @@ pub fn test_scheme_alias(
 
     match matched {
         Some(event) => {
-            let payload: NameResponsePayload = serde_json::from_value(event.envelope.payload.clone()).unwrap();
+            let payload: NameResponsePayload =
+                serde_json::from_value(event.envelope.payload.clone()).unwrap();
             let is_normalized = payload.results.iter().any(|r| {
-                r.target_scheme.as_deref() == Some("autonomi") &&
-                r.target_canonical.as_ref().map(|tc| tc.starts_with("autonomi://")).unwrap_or(false)
+                r.target_scheme.as_deref() == Some("autonomi")
+                    && r.target_canonical
+                        .as_ref()
+                        .map(|tc| tc.starts_with("autonomi://"))
+                        .unwrap_or(false)
             });
 
             if is_normalized {
@@ -261,7 +279,9 @@ pub fn test_scheme_alias(
                     transport: "gossip".to_string(),
                     status: TestStatus::Pass,
                     duration_ms,
-                    details: "ant:// and autonomi:// are both normalized to autonomi:// canonical form".to_string(),
+                    details:
+                        "ant:// and autonomi:// are both normalized to autonomi:// canonical form"
+                            .to_string(),
                     debug: serde_json::json!({ "query_id": query_id, "response": event.envelope }),
                 }
             } else {
@@ -272,7 +292,8 @@ pub fn test_scheme_alias(
                     transport: "gossip".to_string(),
                     status: TestStatus::Fail,
                     duration_ms,
-                    details: "Name target was not normalized to autonomi:// canonical form".to_string(),
+                    details: "Name target was not normalized to autonomi:// canonical form"
+                        .to_string(),
                     debug: serde_json::json!({ "query_id": query_id, "response": event.envelope }),
                 }
             }

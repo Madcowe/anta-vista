@@ -6,7 +6,6 @@
 #[cfg(test)]
 mod integration {
     use av_test_suite::prelude::*;
-    
 
     #[test]
     fn test_corrupted_db_graceful_failure() {
