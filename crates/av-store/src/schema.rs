@@ -141,3 +141,31 @@ UPDATE name_records
 SET target_canonical = 'autonomi://' || substr(target_canonical, 6)
 WHERE target_canonical LIKE 'ant://%';
 ";
+
+/// Local operator policy: subjects this node refuses to surface or serve.
+///
+/// One table rather than three because the three kinds are independent
+/// subjects (a resource can be blocked without naming who sent it, and an
+/// agent can be blocked without condemning anything they sent), they are
+/// always queried together when building a filter, and `av block --list` is
+/// then a single read.
+///
+/// The composite primary key makes re-blocking idempotent, so `blocked_at`
+/// records when the block was *first* imposed rather than being churned by a
+/// repeat `av block`. There is no expiry: blocks are permanent until
+/// explicitly unblocked, because a silently lapsing block would let a
+/// known-bad resource reappear without warning.
+///
+/// These rows are deliberately NOT cleared by `av purge --all`, which deletes
+/// cached data but not policy. Use `av unblock --all` to reset.
+pub const MIGRATION_005_BLOCKS: &str = "
+CREATE TABLE IF NOT EXISTS blocks (
+    subject_kind TEXT NOT NULL,
+    subject_id   TEXT NOT NULL,
+    reason       TEXT,
+    blocked_at   INTEGER NOT NULL,
+    source       TEXT NOT NULL DEFAULT 'manual',
+    PRIMARY KEY (subject_kind, subject_id)
+);
+CREATE INDEX IF NOT EXISTS idx_blocks_kind ON blocks(subject_kind);
+";

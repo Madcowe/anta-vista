@@ -9,6 +9,14 @@ pub struct ClusteredResult {
     pub agreement_count: usize,
     /// Average score across all agents that returned it
     pub avg_score: f32,
+    /// The agents that returned this resource, deduplicated.
+    ///
+    /// Clustering exists to answer "how many agents agree", but the identity of
+    /// those agents is what lets an operator block whoever introduced a
+    /// resource they did not want. The ids are the transport-authenticated
+    /// origins recorded on each response, so they are the identity worth
+    /// blocking.
+    pub agent_ids: Vec<String>,
 }
 
 /// Cluster responses from multiple agents by resource agreement.
@@ -39,6 +47,7 @@ pub fn cluster_responses(responses: &[(String, ResponsePayload)]) -> Vec<Cluster
                 result,
                 agreement_count: agents.len(),
                 avg_score,
+                agent_ids: agents,
             }
         })
         .collect();

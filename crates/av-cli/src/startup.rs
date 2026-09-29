@@ -81,6 +81,11 @@ pub fn run_startup_checks(cli: &crate::Cli) -> CliResult<StartupState> {
 ///
 /// A missing subcommand (`None`) is treated the same as `Web`, because bare `av`
 /// dispatches to exactly that.
+///
+/// `Block`/`Unblock` belong here because a block has to be enforceable when the
+/// network is down. Blocking an agent that is currently flooding you is exactly
+/// the moment you cannot count on the daemon being up, and `av block --list`
+/// is a plain local read.
 pub fn is_offline_command(command: &Option<crate::Commands>) -> bool {
     matches!(
         command,
@@ -88,6 +93,8 @@ pub fn is_offline_command(command: &Option<crate::Commands>) -> bool {
             | Some(crate::Commands::Purge { .. })
             | Some(crate::Commands::Listen { .. })
             | Some(crate::Commands::Stop { .. })
+            | Some(crate::Commands::Block { .. })
+            | Some(crate::Commands::Unblock { .. })
             | Some(crate::Commands::Web { .. })
     )
 }

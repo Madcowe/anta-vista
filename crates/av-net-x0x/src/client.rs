@@ -187,6 +187,59 @@ impl X0xNetClient {
         ranked.sort_by(|a, b| b.1.cmp(&a.1));
         ranked.into_iter().map(|(id, _)| id).take(cap).collect()
     }
+
+    /// Set a contact's trust level in the x0x daemon's own contact store.
+    ///
+    /// This is the transport-level escalation behind `av block --agent --x0x`:
+    /// x0x treats a `blocked` contact as silently dropped, which stops *all* of
+    /// that agent's traffic — every gossip topic, direct messages, presence —
+    /// not just the search answers anta-vista filters for itself.
+    ///
+    /// It is deliberately an inherent method rather than a `NetworkClient` trait
+    /// method: the trait is about carrying envelopes, and a mock transport has
+    /// no contact store to mutate. `discover_agent_ids` sets the same precedent.
+    ///
+    /// Whether a blocked contact can be walked back down a level is a daemon
+    /// policy this crate does not control, so `remove_contact` is the reliable
+    /// unblock.
+    pub fn set_contact_trust(&self, agent_id: &str, level: &str) -> NetResult<()> {
+        let url = format!("{}/contacts/{}", self.config.api_base, agent_id);
+        let resp = daemon_agent()
+            .patch(&url)
+            .set("Authorization", &format!("Bearer {}", self.config.token))
+            .send_json(json!({ "trust_level": level }))
+            .map_err(|e| NetError::Http(e.to_string()))?;
+        // The daemon answering at all is not the same as the daemon doing it. A
+        // 403 (unknown contact) or 404 (no such endpoint) is a refusal, and
+        // reporting success would tell the user their agent block reached the
+        // transport when nothing changed.
+        if !(200..300).contains(&resp.status()) {
+            return Err(NetError::Http(format!(
+                "daemon rejected trust level '{level}' for {agent_id}: HTTP {}",
+                resp.status()
+            )));
+        }
+        tracing::debug!(target: "av_net_x0x::client", agent_id = %agent_id, level, status = %resp.status(), "set_contact_trust ok");
+        Ok(())
+    }
+
+    /// Drop a contact from the daemon's store, lifting a `blocked` level.
+    pub fn remove_contact(&self, agent_id: &str) -> NetResult<()> {
+        let url = format!("{}/contacts/{}", self.config.api_base, agent_id);
+        let resp = daemon_agent()
+            .delete(&url)
+            .set("Authorization", &format!("Bearer {}", self.config.token))
+            .call()
+            .map_err(|e| NetError::Http(e.to_string()))?;
+        if !(200..300).contains(&resp.status()) {
+            return Err(NetError::Http(format!(
+                "daemon rejected removing contact {agent_id}: HTTP {}",
+                resp.status()
+            )));
+        }
+        tracing::debug!(target: "av_net_x0x::client", agent_id = %agent_id, status = %resp.status(), "remove_contact ok");
+        Ok(())
+    }
 }
 
 fn is_agent_id(s: &str) -> bool {

@@ -123,12 +123,15 @@ fn route(
         (Method::Get, "/api/deps") => Ok(handlers::deps(state)),
         (Method::Get, "/api/search") => Ok(handlers::search(state, query)),
         (Method::Get, "/api/download") => Ok(handlers::download(state, query)),
+        (Method::Get, "/api/blocks") => Ok(handlers::blocks_list(state)),
 
         (Method::Post, p) => {
             let body = read_body(request)?;
             Ok(match p {
                 "/api/rate" => handlers::rate(state, &body),
                 "/api/index" => handlers::index(state, &body),
+                "/api/block" => handlers::block(state, &body),
+                "/api/unblock" => handlers::unblock(state, &body),
                 "/api/listener/stop" => handlers::listener_stop(state),
                 "/api/listener/start" => handlers::listener_start(state),
                 "/api/deps/x0x/start" => handlers::start_x0x(state),

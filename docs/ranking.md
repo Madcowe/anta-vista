@@ -20,6 +20,16 @@ score = W_semantic  * cosine_similarity(query_vec, resource_vec)
 
 All weights sum to **1.0**.
 
+> **The agreement term is currently inert.** `agreement_score` reads from the
+> `claims` table, and nothing in the shipped code ever writes to it — there is
+> no `publish_claim` and no receive handler for `av.claim.v1`, so the table is
+> always empty in normal operation and the function returns its 0.5
+> cold-start default on every call. The weight is real and the arithmetic is
+> real, but the term is a constant and so cannot change the *order* of results.
+> Ranking today is effectively semantic + feedback + trust + relevance.
+> See `docs/known-limitations.md` → "Claims and peer agreement are not wired",
+> and `docs/follow-ups.md` for the proposed replacement.
+
 ### Signal definitions
 
 - **Cosine similarity** — dot product of L2-normalised embedding vectors,
@@ -27,6 +37,7 @@ All weights sum to **1.0**.
   `EmbeddingProfile`.
 - **Agreement score** — fraction of peers that have corroborating `Claim`
   records for this resource over the last rolling window (e.g. 24 h).
+  *Intended behaviour; see the note above — currently always 0.5.*
 - **Feedback score** — normalised positive/negative feedback ratio from
   `FeedbackEvent` records attributed to this resource. `Useful` and
   `HighConfidence` count positively; `NotUseful` and `Incorrect` negatively.

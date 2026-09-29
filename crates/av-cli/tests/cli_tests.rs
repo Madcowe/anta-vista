@@ -2,6 +2,7 @@ use av_core::types::{
     EmbeddingProfile, EmbeddingRecord, FeedbackEvent, FeedbackKind, ResourceDescriptor,
     ResourceKind,
 };
+use clap::Parser;
 use std::sync::Mutex;
 use tempfile::tempdir;
 
@@ -244,4 +245,41 @@ fn test_cli_purge_resource_removes_related_rows() {
 
     // SAFETY: tests are single-threaded (Mutex-guarded), so env var access is safe
     unsafe { std::env::remove_var("ANTA_VISTA_DB_PATH") };
+}
+
+// --show-peers gates the peer-id lines in search output. The ids are hidden by
+// default because the header already carries the count and the full list is
+// unreadable at real cluster sizes, but they must stay reachable, so this pins
+// both directions of the flag.
+#[test]
+fn show_peers_is_off_by_default_and_on_when_asked() {
+    let off = av_cli::Cli::try_parse_from(["av", "search", "rust"]).expect("parse");
+    match off.command {
+        Some(av_cli::Commands::Search {
+            show_peers, query, ..
+        }) => {
+            assert!(!show_peers, "peer ids must be hidden by default");
+            assert_eq!(query, "rust");
+        }
+        other => panic!("expected a search command, got {other:?}"),
+    }
+
+    let on = av_cli::Cli::try_parse_from(["av", "search", "rust", "--show-peers"])
+        .expect("parse with --show-peers");
+    match on.command {
+        Some(av_cli::Commands::Search { show_peers, .. }) => {
+            assert!(show_peers, "--show-peers must reach the search command")
+        }
+        other => panic!("expected a search command, got {other:?}"),
+    }
+}
+
+#[test]
+fn show_peers_is_a_search_flag_and_not_a_resolve_flag() {
+    // It was briefly added to `resolve` by accident, where it does nothing.
+    // Resolve must reject it rather than accept a flag that has no effect.
+    assert!(
+        av_cli::Cli::try_parse_from(["av", "resolve", "example", "--show-peers"]).is_err(),
+        "resolve must not accept --show-peers"
+    );
 }

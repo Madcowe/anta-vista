@@ -50,6 +50,9 @@ av status
 | `av index <uri>` | Ingest and index a URI |
 | `av propagate <id> <loc> <desc>` | Re-index a resource locally |
 | `av rate <id> <rating>` | Submit feedback rating |
+| `av block --resource\|--name\|--agent <id>` | Block a resource, name record or peer (local) |
+| `av block --list` | List current blocks |
+| `av unblock --resource\|--name\|--agent <id>` | Lift a block |
 | `av purge` | Clear local database entries |
 | `av listen` | Respond to network queries |
 | `av stop` | Stop all background av listen processes |
@@ -77,6 +80,60 @@ av resolve my-resource-name
 `--timeout <ms>` — network response timeout  
 `--stream` — show results progressively  
 `-v` / `-vv` — increase log verbosity
+
+### Blocking
+
+`av block` is a local denylist. It is the hard version of what trust weighting
+does softly — instead of ranking a bad result lower, it removes it.
+
+```bash
+av block --resource <sha256>      # never show or serve this resource again
+av block --name <record-id>        # this name claim stops resolving
+av block --agent <64-hex-id>       # ignore this peer's answers
+av block --list                    # what is currently blocked
+av unblock --resource <sha256>     # lift it again
+```
+
+Search and resolve always print the **full** id, never a truncated one, because a
+block matches an id exactly:
+
+```
+  2. [network] https://example.com/rust (score: 0.323, agreed by 1 peers)
+     resource_id: a6cf8d060e201b1dec4b4b378d5c8fb1ba05ad381f2069ab8333050e03452e7b
+```
+
+Note that a name result's identity is its `record_id`, **not** the URI it
+resolves to — the URI is the target, and blocking it blocks nothing. `av resolve`
+prints the record id for the same reason.
+
+To see which peers served a network result, add `--show-peers`; the ids are also
+always present in `--non-interactive` JSON. They are hidden by default because
+the peer count is already in the result header and the full list is unreadable
+at any real cluster size.
+
+- **A blocked resource is never served to peers**, not just hidden locally. The
+  `av listen` responder filters before publishing, so it cannot leak.
+- **A blocked agent is excluded from fan-out** and its responses are dropped on
+  arrival. Network results list the peers that supplied them, so you can block
+  one from the search UI without waiting for a pattern to emerge.
+- **Blocking a resource deletes your local copy** (and its embedding, feedback
+  and relevance rows) so junk does not sit in your index. Pass `--keep-local`
+  to block without deleting.
+- **Unblocking does not restore deleted data.** Re-index the URI to get it back.
+- **The three kinds are independent.** Blocking a resource never blocks the peer
+  that returned it — anta-vista does not record who sent a resource, and
+  guessing would let one bad result condemn a useful peer.
+- **Blocks are permanent and survive `av purge --all`.** Use `av unblock --all`
+  to reset.
+- Add `--x0x` to an agent block to also drop that peer's traffic at the
+  transport. It is opt-in, needs the daemon running, and blocks *everything*
+  from that agent on every topic.
+- Blocks are **not shared with peers** and are **not gossiped**. This is
+  suppression of your own node's behaviour, not a network takedown.
+
+Both commands work with the network down. See
+[docs/threat-model.md](docs/threat-model.md#t7--persistent-local-denylist) for
+the full list of limits.
 
 ---
 

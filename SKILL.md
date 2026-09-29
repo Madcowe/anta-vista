@@ -93,12 +93,17 @@ av search "pdf documents" --mime application/pdf
 av search "my query" --scheme autonomi          # only Autonomi resources
 av search "my query" --scheme https             # only HTTPS resources
 av search "my query" --limit 20
+av search "my query" --show-peers               # print the peer ids behind each network result
 av search "my query" --stream                   # show results as they arrive from network
 av search "my query" --timeout 10000            # wait 10s for network responses
 av search "my query" --non-interactive          # JSON output
 ```
 
 Ranking formula: `0.55 × semantic + 0.15 × agreement + 0.10 × feedback + 0.10 × trust + 0.10 × relevance`
+
+> The `agreement` term is currently **inert**: `agreement_score` reads the `claims` table and nothing writes to it, so it returns 0.5 on every call and cannot change the order of results. `agreed by N peers` in search output is a different, working signal (in-memory response clustering). See `docs/follow-ups.md`.
+
+Results always print the **full** id, never a truncated one — `av block` matches ids exactly. Peer ids are hidden by default because the header already carries the count; use `--show-peers` or `--non-interactive` to get them.
 
 In interactive mode, after results are displayed, the user is prompted: *"Which result was most relevant? (1-N, or Enter for none)"*. This stores per-query relevance feedback, boosting that resource for future searches with the same query. If the selected result came from the network, it is automatically propagated as a local resource.
 
@@ -170,6 +175,33 @@ av purge --all --no-confirm        # skip confirmation (for scripting)
 av purge --all --no-confirm --non-interactive
 ```
 
+### `av block` / `av unblock`
+
+Local policy for suppressing things on this machine. Enforced on every path: a blocked resource is hidden from search and never served to peers, a blocked name no longer resolves, and a blocked agent's answers are dropped and excluded from search fan-out.
+
+```bash
+av block --resource <sha256>            # never show or serve this resource again
+av block --resource <sha256> --keep-local   # block it but keep the local copy
+av block --name <record-id>             # a name record stops resolving
+av block --agent <64-hex>               # ignore this peer's answers
+av block --agent <64-hex> --x0x         # also drop it at the x0x transport
+av block --resource <sha256> --reason "spam"
+av block --list                         # show current blocks
+
+av unblock --resource <sha256>
+av unblock --name <record-id>
+av unblock --agent <64-hex> [--x0x]
+av unblock --all --no-confirm           # lift every local block
+```
+
+Three rules worth knowing before using it:
+
+- **Blocking a resource DELETES your local copy by default**, cascading away its embedding, feedback events and relevance judgments. Use `--keep-local` to block without deleting. `av unblock` does **not** restore anything — a deleted resource must be re-indexed.
+- **The three kinds are independent.** Blocking a resource never blocks the agent that returned it, and vice versa.
+- **A name's identity is its `record_id`, not the URI it resolves to.** `av resolve` prints the record id. Blocking the target URI blocks nothing.
+
+Other notes: blocks work with the network down. They are never gossiped — they are private local policy. `av unblock --all` does not lift x0x transport blocks, since it cannot enumerate x0x contacts. `--x0x` is best-effort: the local block lands regardless and any transport failure is reported, never hidden.
+
 ### `av listen`
 
 Background responder. Subscribes to all anta-vista gossip topics and responds to incoming queries from peers.
@@ -210,7 +242,13 @@ Is the resource already in your local index?
   │       ├─ Yes → av propagate (creates searchable local copy)
   │       └─ No  → av rate (signal opinion without content)
   └─ Yes → av rate (add your feedback signal)
+
+Do you want it gone entirely, rather than merely ranked lower?
+  └─ av block --resource <sha256>   (add --keep-local to keep the local copy)
+     Note this DELETES the local copy by default and unblock does not restore it.
 ```
+
+`av rate` lowers a result's score; `av block` removes it from every result set and stops it being served. They are not substitutes — use `rate` for "this was not very useful" and `block` for "I never want to see this again".
 
 ## Library API examples (Rust)
 

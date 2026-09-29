@@ -590,3 +590,286 @@ fn bare_av_in_machine_mode_refuses_and_exits_two() {
     assert_eq!(body["ok"], false);
     assert_eq!(body["error"], "no_subcommand");
 }
+
+// --- Blocking ---------------------------------------------------------------
+//
+// The web surface has to agree with the CLI about what a block does, so these
+// drive the HTTP endpoints and then read the state back through /api/blocks.
+// The server is shared across this file, so each test uses a distinct subject.
+
+#[test]
+fn the_block_list_is_readable_and_well_formed() {
+    // Deliberately does not assert `count == 0`. Every test in this file shares
+    // one server and one database and they run in parallel, so asserting the
+    // list is empty depends on which tests happen to have run first. This used
+    // to be `block_list_is_empty_on_a_fresh_database` and it was a coin flip.
+    let s = server().json("/api/blocks");
+    assert_eq!(s["ok"], true);
+    let blocks = s["blocks"].as_array().unwrap();
+    assert_eq!(s["count"].as_u64().unwrap() as usize, blocks.len());
+    for b in blocks {
+        assert!(b["subject_kind"].is_string(), "kind must be present");
+        assert!(b["subject_id"].is_string(), "id must be present");
+        // Ids are matched exactly when a block is applied or lifted, so a
+        // truncated id in the list cannot be copied into an unblock.
+        let id = b["subject_id"].as_str().unwrap();
+        assert!(
+            !id.is_empty() && !id.ends_with('\u{2026}'),
+            "listed id must be complete, got {id:?}"
+        );
+    }
+}
+
+#[test]
+fn blocking_a_resource_through_the_api_is_listed_back() {
+    let s = server();
+    let res = s.post(
+        "/api/block",
+        r#"{"subject_kind":"resource","subject_id":"web-blocked-1","reason":"spam"}"#,
+    );
+    assert_eq!(res.status, 200);
+    let body = res.json();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["blocked"], true);
+    // Nothing was held locally for this id, so nothing was deleted and the
+    // response must not claim otherwise.
+    assert_eq!(body["removed_local"], false);
+    assert_eq!(body["cascaded"], 0);
+
+    let listed = s.json("/api/blocks");
+    let found = listed["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["subject_id"] == "web-blocked-1" && b["subject_kind"] == "resource");
+    assert!(found, "the block should be listed: {}", listed);
+    // The source is recorded so `av block --list` shows where it came from.
+    let entry = listed["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["subject_id"] == "web-blocked-1")
+        .unwrap();
+    assert_eq!(entry["source"], "web");
+    assert_eq!(entry["reason"], "spam");
+}
+
+#[test]
+fn blocking_twice_reports_that_nothing_changed() {
+    let s = server();
+    let payload = r#"{"subject_kind":"resource","subject_id":"web-blocked-2"}"#;
+    assert_eq!(s.post("/api/block", payload).json()["blocked"], true);
+    // The second call must be honest rather than reporting a fresh block.
+    let again = s.post("/api/block", payload).json();
+    assert_eq!(again["blocked"], false);
+    assert!(
+        again["warning"]
+            .as_str()
+            .unwrap()
+            .contains("already blocked"),
+        "the response should say nothing changed: {again}"
+    );
+}
+
+#[test]
+fn unblocking_through_the_api_lifts_the_block() {
+    let s = server();
+    s.post(
+        "/api/block",
+        r#"{"subject_kind":"resource","subject_id":"web-blocked-3"}"#,
+    );
+    let res = s.post(
+        "/api/unblock",
+        r#"{"subject_kind":"resource","subject_id":"web-blocked-3"}"#,
+    );
+    assert_eq!(res.status, 200);
+    let body = res.json();
+    assert_eq!(body["unblocked"], true);
+    assert_eq!(body["removed"], 1);
+
+    let listed = s.json("/api/blocks");
+    assert!(
+        !listed["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["subject_id"] == "web-blocked-3"),
+        "the block should be gone"
+    );
+}
+
+#[test]
+fn unblocking_something_that_was_not_blocked_says_so() {
+    let body = server()
+        .post(
+            "/api/unblock",
+            r#"{"subject_kind":"resource","subject_id":"never-blocked"}"#,
+        )
+        .json();
+    assert_eq!(body["unblocked"], false);
+    assert_eq!(body["removed"], 0);
+    assert!(
+        body["warning"].as_str().unwrap().contains("not blocked"),
+        "the response should say it was not blocked: {body}"
+    );
+}
+
+#[test]
+fn the_block_api_rejects_a_malformed_agent_id_as_a_client_error() {
+    let res = server().post(
+        "/api/block",
+        r#"{"subject_kind":"agent","subject_id":"nothex"}"#,
+    );
+    // A 400, not a 500: the request was wrong. A block stored against a
+    // mistyped id would silently never match anything.
+    assert_eq!(res.status, 400);
+    let body = res.json();
+    assert_eq!(body["ok"], false);
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not a valid agent id")
+    );
+}
+
+#[test]
+fn the_block_api_rejects_an_unknown_kind_and_a_missing_id() {
+    let s = server();
+    let bad_kind = s.post(
+        "/api/block",
+        r#"{"subject_kind":"planet","subject_id":"x"}"#,
+    );
+    assert_eq!(bad_kind.status, 400);
+    assert!(
+        bad_kind.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("subject_kind")
+    );
+
+    let no_id = s.post("/api/block", r#"{"subject_kind":"resource"}"#);
+    assert_eq!(no_id.status, 400);
+    assert!(
+        no_id.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("subject_id")
+    );
+}
+
+#[test]
+fn blocking_a_name_record_works_through_the_api() {
+    let s = server();
+    let res = s.post(
+        "/api/block",
+        r#"{"subject_kind":"name","subject_id":"web-name-1"}"#,
+    );
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["blocked"], true);
+    // A name block hides rather than deletes, and must not claim to have
+    // removed anything.
+    assert_eq!(res.json()["removed_local"], false);
+}
+
+#[test]
+fn the_three_kinds_are_reported_separately_in_the_counts() {
+    let s = server();
+    for payload in [
+        r#"{"subject_kind":"resource","subject_id":"counts-res"}"#,
+        r#"{"subject_kind":"name","subject_id":"counts-name"}"#,
+    ] {
+        assert_eq!(s.post("/api/block", payload).status, 200);
+    }
+
+    let listed = s.json("/api/blocks");
+    let counts = listed["counts"].as_array().unwrap();
+    for kind in ["resource", "name"] {
+        let entry = counts.iter().find(|c| c["subject_kind"] == kind);
+        assert!(entry.is_some(), "no count for {kind}: {counts:?}");
+        assert!(entry.unwrap()["count"].as_i64().unwrap() >= 1);
+    }
+    // The three kinds are independent policies, so each is counted on its own.
+    let total: i64 = counts.iter().map(|c| c["count"].as_i64().unwrap()).sum();
+    assert_eq!(total, listed["count"].as_i64().unwrap());
+}
+
+#[test]
+fn the_page_offers_a_block_control() {
+    let body = &server().get("/").body;
+    // The control and its dialog have to exist in the shell, or the button can
+    // never be rendered.
+    for marker in ["data-role=\"block\"", "block-dialog", "block-title"] {
+        assert!(body.contains(marker), "page is missing {marker}");
+    }
+}
+
+#[test]
+fn the_client_script_knows_how_to_block() {
+    let js = server().get("/assets/app.js");
+    assert_eq!(js.status, 200);
+    for marker in ["/api/block", "/api/unblock", "blockTarget", "askBlock"] {
+        assert!(js.body.contains(marker), "app.js is missing {marker}");
+    }
+}
+
+#[test]
+fn the_web_api_refuses_to_escalate_a_block_to_x0x() {
+    let s = server();
+    // A loopback server is reachable by any page the user has open, so a
+    // caller-supplied `x0x` flag would let a request make a lasting global
+    // transport change the UI never offered. It must be rejected outright.
+    let res = s.post(
+        "/api/block",
+        r#"{"subject_kind":"agent","subject_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","x0x":true}"#,
+    );
+    assert_eq!(res.status, 400);
+    let body = res.json();
+    assert_eq!(body["ok"], false);
+    let detail = format!("{} {}", body["error"], body["detail"]);
+    assert!(
+        detail.contains("av block --agent"),
+        "the error must point at the CLI instead: {body}"
+    );
+    // Nothing was stored, so the transport is untouched.
+    let listed = s.json("/api/blocks");
+    assert!(
+        !listed["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["subject_id"]
+                == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        "a rejected request must not have created a block row"
+    );
+}
+
+#[test]
+fn an_agent_blocked_in_the_browser_says_the_transport_is_untouched() {
+    let s = server();
+    let id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    let res = s.post(
+        "/api/block",
+        &format!(r#"{{"subject_kind":"agent","subject_id":"{id}"}}"#),
+    );
+    assert_eq!(res.status, 200);
+    let body = res.json();
+    assert_eq!(body["blocked"], true);
+    assert_eq!(
+        body["x0x_requested"], false,
+        "the browser must never request a transport block"
+    );
+    // The block works locally, so it must not be described as a no-op, but it
+    // also must not imply the peer is unreachable.
+    let warning = body["warning"]
+        .as_str()
+        .expect("expected an honest warning");
+    assert!(
+        warning.contains("av block --agent"),
+        "warning should name the CLI escalation, got: {warning}"
+    );
+    assert!(
+        !warning.contains("deleted"),
+        "nothing was deleted: {warning}"
+    );
+}

@@ -30,9 +30,28 @@ pub fn run(
         limit,
     )?;
 
-    // Cache received network records locally
-    for (_peer, payload) in &resolve_res.network_results {
+    // Cache received network records locally.
+    //
+    // `execute_resolve` already drops whole responses from blocked agents, so
+    // anything reaching here came from a peer we are willing to hear from. The
+    // per-record check is for individual records the operator has blocked
+    // without blocking the peer.
+    for (peer, payload) in &resolve_res.network_results {
         for record in &payload.results {
+            if av_store::repo::blocks::is_blocked(
+                &conn,
+                av_store::repo::blocks::BlockKind::Name,
+                &record.record_id,
+            )
+            .unwrap_or(false)
+            {
+                tracing::debug!(
+                    record_id = %record.record_id,
+                    peer = %crate::output::abbrev(peer, 12),
+                    "skipping cached network name record: locally blocked"
+                );
+                continue;
+            }
             // Validate signature first (if possible)
             // For MVP/simplicity we assume valid if serialize/deserialize matches,
             // or we insert and let the store handle unique constraints.
@@ -135,6 +154,15 @@ pub fn run(
                     console::style(target).green().bold(),
                     w.score
                 );
+                // The resolved URI is the *target*, not the identity of the
+                // claim. A name block keys on the record id, so print it —
+                // otherwise the only identifier on screen cannot be used with
+                // `av block --name`, and blocking the target URI silently
+                // blocks nothing.
+                println!(
+                    "  record_id: {}",
+                    console::style(&w.record.record_id).cyan()
+                );
                 if !alternates.is_empty() {
                     println!("\nAlternates:");
                     for alt in &alternates {
@@ -143,6 +171,13 @@ pub fn run(
                             alt["target"].as_str().unwrap_or(""),
                             alt["score"].as_f64().unwrap_or(0.0)
                         );
+                    }
+                    // Alternates are separate claims by other agents. If one of
+                    // them is the bad record, its id has to be visible too.
+                    for alt in &alternates {
+                        if let Some(id) = alt["record_id"].as_str() {
+                            println!("    record_id: {}", console::style(id).cyan());
+                        }
                     }
                 }
             } else {

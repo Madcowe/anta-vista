@@ -122,6 +122,24 @@ const PAGE: &str = r##"<!doctype html>
   </form>
 </dialog>
 
+<!-- Blocking is mostly reversible, but "also delete the local copy" is not, so
+     the destructive option is a distinct button rather than a yes/no prompt
+     where the wrong click silently does the irreversible thing. -->
+<dialog id="block-dialog" class="dialog">
+  <form method="dialog">
+    <h2 id="block-title">Block this result</h2>
+    <p id="block-blurb" class="hint"></p>
+    <menu>
+      <button value="cancel" class="btn btn-quiet">Cancel</button>
+      <button value="keep" class="btn" data-role="block-keep">Block, keep local copy</button>
+      <!-- A name block only hides the record; there is nothing to delete, so
+           this button is hidden for names rather than offering an action the
+           backend silently ignores. See askBlock() in app.js. -->
+      <button value="delete" class="btn btn-primary" data-role="block-delete">Block and delete</button>
+    </menu>
+  </form>
+</dialog>
+
 <template id="result-template">
   <li class="result">
     <div class="result-head">
@@ -139,6 +157,8 @@ const PAGE: &str = r##"<!doctype html>
       <button type="button" class="btn btn-rate" data-rating="useful" title="Useful: raises this result's score for this query">Useful</button>
       <button type="button" class="btn btn-rate" data-rating="not-useful" title="Not useful: lowers it">Not useful</button>
       <button type="button" class="btn btn-rate" data-rating="incorrect" title="Factually wrong">Incorrect</button>
+      <button type="button" class="btn btn-quiet btn-block" data-role="block"
+        title="Never show or serve this again on this machine">Block</button>
       <span class="rate-status" data-role="rate-status" role="status"></span>
     </div>
   </li>

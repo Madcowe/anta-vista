@@ -24,10 +24,28 @@ pub fn lookup_name(
     now_secs: i64,
 ) -> IndexResult<Vec<NameResult>> {
     let normalized = normalize_name(name);
-    let records = av_store::repo::names::get_by_normalized_name(conn, &normalized)?;
+    let mut records = av_store::repo::names::get_by_normalized_name(conn, &normalized)?;
 
     if records.is_empty() {
         return Ok(vec![]);
+    }
+
+    // Local block policy, applied before ranking so blocked records never
+    // influence the agreement denominator or the recency range either. Loaded
+    // once: `get_by_normalized_name` can return many records for one name.
+    //
+    // This is what keeps a blocked name record from being served to peers: the
+    // responder answers name queries straight from `lookup_name` and does no
+    // filtering of its own afterwards.
+    //
+    // Fails closed, for the same reason as `search::search_top_k`.
+    let blocked =
+        av_store::repo::blocks::blocked_ids(conn, av_store::repo::blocks::BlockKind::Name)?;
+    if !blocked.is_empty() {
+        records.retain(|r| !blocked.contains(&r.record_id));
+        if records.is_empty() {
+            return Ok(vec![]);
+        }
     }
 
     // Filter by scheme

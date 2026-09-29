@@ -65,7 +65,8 @@ redirect name resolution or pollute search results.
 - Unsigned or mis-signed records are dropped immediately.
 - The `NAME_WEIGHT_TRUST` factor (0.50) heavily discounts records from
   low-trust sources.
-- Nodes may maintain a local blocklist of known-bad `by_agent_id` values.
+- Local blocking of a name record (`av block --name <record-id>`) removes it
+  from resolution and stops it being served, per T7.
 
 ### T5 — Privacy — query correlation
 
@@ -87,6 +88,65 @@ a deprecated code path.
   (`UnsupportedSchemaVersion` error).
 - Each topic name is versioned (`av.*.v1`) so future breaking changes use a new
   topic, allowing old and new nodes to coexist during migration.
+
+### T7 — Persistent local denylist
+
+**Threat:** Trust weighting is a soft, gradual defence. A peer that is mildly
+malicious is merely ranked lower, so an operator has no way to say "never show
+me anything from this source again", and no way to guarantee a specific
+resource stops being re-served. `av purge` removes local data but is not a
+policy: it says nothing to peers, and re-indexing or a re-announce brings the
+item straight back.
+
+**Mitigations:**
+
+Local blocks live in the `blocks` table (migration `005_blocks`) and are
+enforced on every path that touches a blocked subject:
+
+- **Resource** — filtered in `av_index::search::search_top_k`, so it cannot
+  appear in local results *or* be returned by the `av listen` responder. The
+  responder additionally re-filters immediately before publishing
+  (`to_publishable_resources`), because a resource blocked with `--keep-local`
+  still has its embedding and would otherwise be served.
+- **Name record** — filtered in `av_index::naming::lookup_name`, plus the same
+  pre-send check for name responses (`to_publishable_names`).
+- **Agent** — excluded from search/resolve fan-out candidate lists, and
+  responses from a blocked agent are dropped on arrival, before `peer_cache`
+  updates and before `--stream` output. Identity is taken from the
+  transport-authenticated origin (`DirectMessage::sender` /
+  `IncomingEvent::origin`), not the envelope's self-reported `from_agent_id`.
+
+**Deliberate limits of the design:**
+
+- Blocks are **local**. They are not gossiped and no peer learns about them, so
+  blocking a resource here does not stop another node serving it.
+- Blocking a resource **never infers a block on the agent that returned it**,
+  and vice versa. The kinds are independent, because `resources` has no
+  provenance column: anta-vista cannot know who sent a given resource, and
+  guessing would let one bad result condemn an otherwise useful peer. Block an
+  agent explicitly, and a network result's originating peers are shown so it can
+  be done from the search UI.
+- A name block is per **record id**, not per name. Names resolve by exact
+  normalized match, so blocking a name would also hide an innocent peer's
+  conflicting claim for the same name.
+- Blocks are **permanent** — no expiry. They survive `av purge --all`, because
+  purge clears data and a block is policy; use `av unblock --all` to reset.
+- `av block --resource` **deletes the local copy** by default (cascading to
+  `embeddings`, `feedback_events` and `relevance_judgments`). `--keep-local`
+  blocks without deleting. Unblocking lifts the policy but cannot restore
+  deleted data — the resource has to be re-indexed.
+- Blocking is **not retroactive for already-delivered data** and does not
+  retract anything already sent. It is a local filter, not a recall.
+- The x0x transport block (`--x0x`) is **opt-in and best-effort**: it needs the
+  daemon, and it drops *all* traffic from that agent on every topic, not just
+  anta-vista results. The local block always lands; a failed escalation is
+  reported as a warning rather than treated as success. `av unblock --all` does
+  not lift transport blocks, because it cannot enumerate x0x contacts — use
+  `av unblock --agent <id> --x0x`.
+
+**Residual risk:** a blocked resource is still reachable by its URI through the
+Autonomi network, and any node that never heard of the block can still serve it.
+Blocking suppresses this node's behaviour; it is not a takedown.
 
 ---
 

@@ -397,3 +397,198 @@ fn test_search_result_has_all_score_components() {
     assert!(r.trust_score >= 0.0 && r.trust_score <= 1.0);
     assert!(r.score >= 0.0 && r.score <= 1.0);
 }
+
+// --- Local block policy ----------------------------------------------------
+//
+// A block is the operator's "I do not want this in my results" switch, so the
+// filter has to hold on the main search path. These tests pin the behaviour at
+// the lowest layer that every caller (CLI search, `av listen` responder, web
+// search) depends on.
+
+fn block(conn: &rusqlite::Connection, kind: repo::blocks::BlockKind, id: &str) {
+    repo::blocks::add(conn, kind, id, Some("test"), 1_700_000_000, "test").expect("add block");
+}
+
+#[test]
+fn test_blocked_resource_is_excluded_from_search() {
+    let (conn, provider) = setup();
+
+    let blocked = ingest_bytes(
+        TEXT_BYTES,
+        Some("blocked.txt"),
+        "https://example.com/blocked.txt",
+    )
+    .expect("ingest");
+    repo::resources::insert(&conn, &blocked).expect("insert");
+
+    // Same store_resource pipeline, but pinned to the id we are about to block.
+    let profile = provider.profile().clone();
+    let pid = profile_id(&profile);
+    repo::embeddings::insert_profile(&conn, &pid, &profile).expect("insert profile");
+    let rec = provider
+        .embed_resource(&blocked.description_text, &blocked.id)
+        .expect("embed");
+    repo::embeddings::insert(&conn, &rec).expect("insert embedding");
+
+    let index = LocalIndex::new(&conn, &provider);
+    let before = index
+        .search("document", 5, &QueryFilter::default())
+        .expect("search");
+    assert!(
+        before.iter().any(|r| r.resource.id == blocked.id),
+        "control: the resource must be searchable before it is blocked"
+    );
+
+    block(&conn, repo::blocks::BlockKind::Resource, &blocked.id);
+
+    // The row is still there — a block hides, it does not have to delete.
+    assert!(
+        repo::resources::get(&conn, &blocked.id)
+            .expect("get")
+            .is_some()
+    );
+
+    let after = index
+        .search("document", 5, &QueryFilter::default())
+        .expect("search");
+    assert!(
+        !after.iter().any(|r| r.resource.id == blocked.id),
+        "a blocked resource must not appear in search results"
+    );
+}
+
+#[test]
+fn test_unblocking_a_resource_restores_it_to_search() {
+    let (conn, provider) = setup();
+    let resource =
+        ingest_bytes(TEXT_BYTES, Some("doc.txt"), "https://example.com/doc.txt").expect("ingest");
+    repo::resources::insert(&conn, &resource).expect("insert");
+    let profile = provider.profile().clone();
+    let pid = profile_id(&profile);
+    repo::embeddings::insert_profile(&conn, &pid, &profile).expect("insert profile");
+    let rec = provider
+        .embed_resource(&resource.description_text, &resource.id)
+        .expect("embed");
+    repo::embeddings::insert(&conn, &rec).expect("insert embedding");
+
+    let index = LocalIndex::new(&conn, &provider);
+    block(&conn, repo::blocks::BlockKind::Resource, &resource.id);
+    assert!(
+        index
+            .search("document", 5, &QueryFilter::default())
+            .expect("search")
+            .is_empty()
+    );
+
+    repo::blocks::remove(&conn, repo::blocks::BlockKind::Resource, &resource.id).expect("unblock");
+
+    let after = index
+        .search("document", 5, &QueryFilter::default())
+        .expect("search");
+    assert!(
+        after.iter().any(|r| r.resource.id == resource.id),
+        "unblocking a resource that was never deleted must bring it back"
+    );
+}
+
+#[test]
+fn test_blocked_name_record_does_not_resolve() {
+    let (conn, provider) = setup();
+
+    let nr = NameRecord {
+        schema_version: 1,
+        record_id: "nr-blocked".into(),
+        normalized_name: normalize_name("Blocked-Service"),
+        original_name: "Blocked-Service".into(),
+        record_type: NameRecordType::Uri,
+        target: "autonomi://deadbeef01234567890123456789012345678901234567890123456789012345"
+            .into(),
+        target_scheme: Some("autonomi".into()),
+        target_canonical: Some(
+            "autonomi://deadbeef01234567890123456789012345678901234567890123456789012345".into(),
+        ),
+        ttl_secs: 3600,
+        by_agent_id: "agent-abc".into(),
+        timestamp: 1_700_000_000,
+        signature: vec![],
+    };
+    repo::names::insert(&conn, &nr).expect("insert name record");
+
+    let index = LocalIndex::new(&conn, &provider);
+    let scheme_filter = SchemeFilter::default();
+
+    let before = index
+        .resolve_name("blocked-service", &scheme_filter)
+        .expect("lookup");
+    assert_eq!(
+        before.len(),
+        1,
+        "control: the name must resolve before it is blocked"
+    );
+
+    block(&conn, repo::blocks::BlockKind::Name, "nr-blocked");
+
+    let after = index
+        .resolve_name("blocked-service", &scheme_filter)
+        .expect("lookup");
+    assert!(
+        after.is_empty(),
+        "a blocked name record must not resolve, in any case variant"
+    );
+    // The row survives: a block hides the record rather than destroying it, so
+    // unblocking can bring it back without re-fetching from the network.
+    assert!(
+        repo::names::get_by_normalized_name(&conn, &normalize_name("Blocked-Service"))
+            .expect("get")
+            .iter()
+            .any(|r| r.record_id == "nr-blocked"),
+        "blocking a name must not delete the record"
+    );
+}
+
+#[test]
+fn test_blocking_one_name_record_does_not_hide_a_conflicting_record() {
+    let (conn, provider) = setup();
+
+    // Two records claim the same name, as happens when two agents both claim it.
+    // Names resolve by exact normalized match, so there is no ranking to
+    // disambiguate them: if a block hid "the name", it would hide the innocent
+    // claim too. The block is per record id, which is the only way to keep the
+    // two independent.
+    for (id, agent) in [("nr-good", "agent-good"), ("nr-bad", "agent-bad")] {
+        repo::names::insert(
+            &conn,
+            &NameRecord {
+                schema_version: 1,
+                record_id: id.into(),
+                normalized_name: normalize_name("Contested"),
+                original_name: "Contested".into(),
+                record_type: NameRecordType::Uri,
+                target: "autonomi://aa".into(),
+                target_scheme: Some("autonomi".into()),
+                target_canonical: Some("autonomi://aa".into()),
+                ttl_secs: 3600,
+                by_agent_id: agent.into(),
+                timestamp: 1_700_000_000,
+                signature: vec![],
+            },
+        )
+        .expect("insert name record");
+    }
+
+    block(&conn, repo::blocks::BlockKind::Name, "nr-bad");
+
+    let index = LocalIndex::new(&conn, &provider);
+    let results = index
+        .resolve_name("contested", &SchemeFilter::default())
+        .expect("lookup");
+    let ids: Vec<&str> = results
+        .iter()
+        .map(|r| r.record.record_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["nr-good"],
+        "only the blocked record is hidden; the other claim still resolves"
+    );
+}

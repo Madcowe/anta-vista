@@ -70,6 +70,24 @@ pub fn propagate_resource(
     description: &str,
     mime_type: &str,
 ) -> CliResult<()> {
+    // Guard at the shared low level rather than in each caller: `av propagate`,
+    // the interactive search prompt and the web rating handler all land here,
+    // and re-inserting a blocked resource would undo the block.
+    //
+    // Fails closed for the same reason as `cmd/index.rs`: an unreadable block
+    // list is not evidence that the resource is allowed.
+    if av_store::repo::blocks::is_blocked(
+        conn,
+        av_store::repo::blocks::BlockKind::Resource,
+        resource_id,
+    )
+    .map_err(|e| CliError::Database(format!("could not read the block list: {e}")))?
+    {
+        return Err(CliError::Validation(format!(
+            "resource {resource_id} is blocked; run 'av unblock --resource {resource_id}' first"
+        )));
+    }
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

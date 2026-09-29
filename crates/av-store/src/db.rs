@@ -41,6 +41,7 @@ fn migrate(conn: &Connection) -> SqlResult<()> {
             "004_canonical_scheme",
             crate::schema::MIGRATION_004_CANONICAL_SCHEME,
         ),
+        ("005_blocks", crate::schema::MIGRATION_005_BLOCKS),
     ];
 
     for (name, sql) in migrations {

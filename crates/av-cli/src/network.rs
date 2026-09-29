@@ -17,6 +17,27 @@ pub struct SearchResultWrapper {
     pub network_results: Vec<(String, ResponsePayload)>, // (agent_id, payload)
 }
 
+/// The x0x identities this node has blocked.
+///
+/// Loaded once per fan-out. A blocked agent is excluded from the candidate set
+/// entirely, so we neither ask it nor act on what it says: its responses are
+/// dropped on arrival, which is also the only place that can stop `--stream`
+/// from printing them, since streaming happens inside the receive loop.
+fn blocked_agents(conn: &Connection) -> HashSet<String> {
+    av_store::repo::blocks::blocked_ids(conn, av_store::repo::blocks::BlockKind::Agent)
+        .unwrap_or_default()
+}
+
+/// Decide whether a response from `agent_id` should be acted on.
+///
+/// The id compared here is the transport-authenticated origin the x0x daemon
+/// reports (`DirectMessage::sender` / `IncomingEvent::origin`), not the
+/// envelope's self-reported `from_agent_id`, because a blocked agent is
+/// identified by who actually delivered the message.
+fn accept_from(agent_id: &str, blocked: &HashSet<String>) -> bool {
+    !blocked.contains(agent_id)
+}
+
 #[allow(dead_code)]
 pub struct ResolveResultWrapper {
     pub local_results: Vec<av_index::naming::NameResult>,
@@ -111,16 +132,16 @@ pub fn execute_search(
         }
         candidates.extend(net_client.discover_agent_ids(10));
         let self_id = x0x_cfg.agent_id.clone();
-        let candidates: Vec<String> =
-            candidates
-                .into_iter()
-                .filter(|id| id != &self_id)
-                .fold(Vec::new(), |mut acc, id| {
-                    if !acc.contains(&id) {
-                        acc.push(id);
-                    }
-                    acc
-                });
+        let blocked = blocked_agents(conn);
+        let candidates: Vec<String> = candidates
+            .into_iter()
+            .filter(|id| id != &self_id && !blocked.contains(id))
+            .fold(Vec::new(), |mut acc, id| {
+                if !acc.contains(&id) {
+                    acc.push(id);
+                }
+                acc
+            });
 
         for peer_id in &candidates {
             let query_id = uuid::Uuid::new_v4().to_string();
@@ -172,6 +193,16 @@ pub fn execute_search(
                         serde_json::from_value::<ResponsePayload>(msg.envelope.payload.clone())
                     {
                         if query_ids.contains(&resp.query_id) {
+                            // Dropped before the push, so a blocked agent is
+                            // never reflected in `--stream` output and never
+                            // has its freshness refreshed in peer_cache.
+                            if !accept_from(&msg.sender, &blocked) {
+                                tracing::debug!(
+                                    agent_id = %crate::output::abbrev(&msg.sender, 12),
+                                    "dropping response from blocked agent"
+                                );
+                                continue;
+                            }
                             network_results.push((msg.sender.clone(), resp.clone()));
                             let _ =
                                 peers::upsert(conn, &msg.sender, serde_json::json!({}), now_secs());
@@ -190,6 +221,13 @@ pub fn execute_search(
                         serde_json::from_value::<ResponsePayload>(event.envelope.payload.clone())
                     {
                         if query_ids.contains(&resp.query_id) {
+                            if !accept_from(&event.origin, &blocked) {
+                                tracing::debug!(
+                                    agent_id = %crate::output::abbrev(&event.origin, 12),
+                                    "dropping gossip response from blocked agent"
+                                );
+                                continue;
+                            }
                             network_results.push((event.origin.clone(), resp.clone()));
                             let _ = peers::upsert(
                                 conn,
@@ -270,16 +308,16 @@ pub fn execute_resolve(
         }
         candidates.extend(net_client.discover_agent_ids(10));
         let self_id = x0x_cfg.agent_id.clone();
-        let candidates: Vec<String> =
-            candidates
-                .into_iter()
-                .filter(|id| id != &self_id)
-                .fold(Vec::new(), |mut acc, id| {
-                    if !acc.contains(&id) {
-                        acc.push(id);
-                    }
-                    acc
-                });
+        let blocked = blocked_agents(conn);
+        let candidates: Vec<String> = candidates
+            .into_iter()
+            .filter(|id| id != &self_id && !blocked.contains(id))
+            .fold(Vec::new(), |mut acc, id| {
+                if !acc.contains(&id) {
+                    acc.push(id);
+                }
+                acc
+            });
 
         for peer_id in &candidates {
             let query_id = uuid::Uuid::new_v4().to_string();
@@ -329,6 +367,13 @@ pub fn execute_resolve(
                         serde_json::from_value::<NameResponsePayload>(msg.envelope.payload.clone())
                     {
                         if query_ids.contains(&resp.query_id) {
+                            if !accept_from(&msg.sender, &blocked) {
+                                tracing::debug!(
+                                    agent_id = %crate::output::abbrev(&msg.sender, 12),
+                                    "dropping name response from blocked agent"
+                                );
+                                continue;
+                            }
                             network_results.push((msg.sender.clone(), resp.clone()));
                             let _ =
                                 peers::upsert(conn, &msg.sender, serde_json::json!({}), now_secs());
@@ -347,6 +392,13 @@ pub fn execute_resolve(
                         event.envelope.payload.clone(),
                     ) {
                         if query_ids.contains(&resp.query_id) {
+                            if !accept_from(&event.origin, &blocked) {
+                                tracing::debug!(
+                                    agent_id = %crate::output::abbrev(&event.origin, 12),
+                                    "dropping gossip name response from blocked agent"
+                                );
+                                continue;
+                            }
                             network_results.push((event.origin.clone(), resp.clone()));
                             let _ = peers::upsert(
                                 conn,

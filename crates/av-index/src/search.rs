@@ -30,6 +30,22 @@ pub fn search_top_k(
 ) -> IndexResult<Vec<SearchResult>> {
     let embeddings = load_all_embeddings(conn, profile_id)?;
 
+    // Local block policy, loaded once rather than queried per candidate: this
+    // loop runs once per embedded resource.
+    //
+    // This is the primary guard behind "a blocked resource is never served".
+    // Both inbound responder paths (`av listen`) answer peers from
+    // `index.search(...)` and do no filtering of their own afterwards, so
+    // filtering here covers serving as well as local display. The responder
+    // also re-checks immediately before sending, so the guarantee does not rest
+    // on this one call site surviving future changes.
+    //
+    // Fails closed. An unreadable block list is not evidence that nothing is
+    // blocked, and defaulting to an empty set here would turn a database
+    // hiccup into "serve everything the user asked never to be served".
+    let blocked =
+        av_store::repo::blocks::blocked_ids(conn, av_store::repo::blocks::BlockKind::Resource)?;
+
     // First pass: compute semantic similarity for all embeddings
     let mut candidates: Vec<(String, f32)> = embeddings
         .into_iter()
@@ -45,6 +61,9 @@ pub fn search_top_k(
     // Full scoring pass: apply filters + trust/feedback/agreement
     let mut results: Vec<SearchResult> = Vec::new();
     for (resource_id, semantic_sim) in candidates {
+        if blocked.contains(&resource_id) {
+            continue;
+        }
         let Some(resource) = av_store::repo::resources::get(conn, &resource_id)? else {
             continue;
         };

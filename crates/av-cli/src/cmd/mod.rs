@@ -1,6 +1,7 @@
 use crate::{Cli, Commands};
 use thiserror::Error;
 
+pub mod block;
 pub mod index;
 pub mod listen;
 pub mod name;
@@ -106,14 +107,18 @@ pub fn run(cli: Cli) -> CliResult<()> {
             kind,
             mime,
             limit,
+            show_peers,
         }) => search::run(
             cli.clone(),
             startup_state,
             query.clone(),
-            scheme.clone(),
-            kind.clone(),
-            mime.clone(),
-            *limit,
+            search::SearchOptions {
+                scheme: scheme.clone(),
+                kind: kind.clone(),
+                mime: mime.clone(),
+                limit: *limit,
+                show_peers: *show_peers,
+            },
         ),
         Some(Commands::Name {
             uri,
@@ -187,6 +192,42 @@ pub fn run(cli: Cli) -> CliResult<()> {
             location.clone(),
             description.clone(),
             mime.clone(),
+        ),
+        Some(Commands::Block {
+            resource,
+            agent,
+            name,
+            reason,
+            keep_local,
+            x0x,
+            list,
+        }) => block::run(
+            cli.clone(),
+            startup_state,
+            resource.clone(),
+            agent.clone(),
+            name.clone(),
+            reason.clone(),
+            *keep_local,
+            *x0x,
+            *list,
+        ),
+        Some(Commands::Unblock {
+            resource,
+            agent,
+            name,
+            all,
+            x0x,
+            no_confirm,
+        }) => block::run_unblock(
+            cli.clone(),
+            startup_state,
+            resource.clone(),
+            agent.clone(),
+            name.clone(),
+            *all,
+            *x0x,
+            *no_confirm,
         ),
         Some(Commands::Web {
             host,

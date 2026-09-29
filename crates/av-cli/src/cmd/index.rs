@@ -86,6 +86,29 @@ pub fn index_resource(
         av_ingest::apply_tags(&mut resource, tags);
     }
 
+    // --- Step 3b: Refuse a locally blocked content hash -----------------------
+    // Checked before any store write, which also means before the Step 7
+    // announce: `av index` is a third route by which a resource can leave this
+    // node, alongside serving query responses and reinforcing a search hit, and
+    // the search-layer filter does not cover it.
+    //
+    // Fails *closed*: if the block list cannot be read, indexing stops. Treating
+    // a read error as "not blocked" would let the one resource the user
+    // explicitly suppressed leave the node, which is the exact outcome a block
+    // exists to prevent.
+    if av_store::repo::blocks::is_blocked(
+        conn,
+        av_store::repo::blocks::BlockKind::Resource,
+        &resource.id,
+    )
+    .map_err(|e| CliError::Database(format!("could not read the block list: {e}")))?
+    {
+        return Err(CliError::Validation(format!(
+            "resource {} is blocked; run 'av unblock --resource {}' to index it again",
+            resource.id, resource.id
+        )));
+    }
+
     // --- Step 4: Check for duplicate ----------------------------------------
     // Primary: dedup by location (same URL)
     let existing_by_loc = av_store::repo::resources::get_by_location(conn, uri)

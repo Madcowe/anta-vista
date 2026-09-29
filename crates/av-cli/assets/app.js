@@ -54,6 +54,11 @@ const ui = {
   dialogBlurb: el('install-blurb'),
   dialogCommand: el('install-command'),
   dialogConfirm: el('install-confirm'),
+  blockDialog: el('block-dialog'),
+  blockKeep: el('block-dialog').querySelector('[data-role="block-keep"]'),
+  blockDelete: el('block-dialog').querySelector('[data-role="block-delete"]'),
+  blockTitle: el('block-title'),
+  blockBlurb: el('block-blurb'),
   dialogRun: el('install-run'),
 };
 
@@ -203,7 +208,147 @@ function renderResult(result) {
   pick('mime').textContent = result.mime_type || '';
 
   wireRating(node, result, pick('rate-status'));
+  wireBlock(node, result, pick('rate-status'), pick('block'));
   return node;
+}
+
+/* -------------------------------------------------------------- blocking -- */
+
+/* Work out what "block" should mean for this result.
+ *
+ * A name result blocks the name record, not whatever it points at: the
+ * complaint is about the claim, and the target may be perfectly good under a
+ * different name. Everything else blocks the resource id, which is a content
+ * hash, so the block survives the URL moving. */
+function blockTarget(result) {
+  if (result.source === 'name') {
+    const id = result.name_record && result.name_record.record_id;
+    return id ? { subject_kind: 'name', subject_id: id } : null;
+  }
+  return result.resource_id
+    ? { subject_kind: 'resource', subject_id: result.resource_id }
+    : null;
+}
+
+function wireBlock(node, result, statusEl, button) {
+  if (!button) return;
+  const target = blockTarget(result);
+
+  if (!target) {
+    button.disabled = true;
+    button.title = 'This result has no id to block.';
+    return;
+  }
+
+  /* A network result also knows which peers supplied it, so offer blocking
+   * those too. That is the only way to act on "this peer keeps sending me
+   * junk" without waiting to accumulate a pattern. */
+  const agents = Array.isArray(result.agent_ids) ? result.agent_ids.filter(Boolean) : [];
+
+  if (agents.length > 0) {
+    const menu = document.createElement('span');
+    menu.className = 'block-agents';
+    for (const agent of agents) {
+      const agentBtn = document.createElement('button');
+      agentBtn.type = 'button';
+      agentBtn.className = 'btn btn-quiet';
+      agentBtn.textContent = `Block peer ${agent.slice(0, 8)}`;
+      agentBtn.title = `Stop using answers from ${agent} on this machine`;
+      agentBtn.addEventListener('click', async () => {
+        agentBtn.disabled = true;
+        setStatus(statusEl, 'Blocking peer\u2026', '');
+        try {
+          await postJSON('/api/block', {
+            subject_kind: 'agent',
+            subject_id: agent,
+            reason: `peer of a search result for \u201c${lastQuery}\u201d`,
+          });
+          /* A peer block drops its answers, so the result list is now stale.
+           * Re-running the search is the honest way to show what is left. */
+          setStatus(statusEl, `Blocked peer ${agent.slice(0, 8)}. Re-running search\u2026`, 'ok');
+          ui.form.requestSubmit();
+        } catch (err) {
+          setStatus(statusEl, err.message, 'bad');
+          agentBtn.disabled = false;
+        }
+      });
+      menu.append(agentBtn);
+    }
+    node.querySelector('.result-actions').append(menu);
+  }
+
+  button.addEventListener('click', async () => {
+    /* "Block" and "block and delete" are different promises, and the second
+     * one cannot be undone by `av unblock`. Ask, with the destructive option
+     * named as such, rather than making a single click irreversibly delete
+     * rating history. */
+    const keepLocal = await askBlock(target);
+    if (keepLocal === null) return; // cancelled
+
+    button.disabled = true;
+    setStatus(statusEl, 'Blocking\u2026', '');
+
+    try {
+      const data = await postJSON('/api/block', {
+        ...target,
+        keep_local: keepLocal,
+      });
+
+      if (!data.blocked) {
+        setStatus(statusEl, 'Already blocked \u2014 nothing changed.', 'warn');
+      } else if (data.removed_local) {
+        setStatus(
+          statusEl,
+          `Blocked and removed the local copy (${data.cascaded} related row${
+            data.cascaded === 1 ? '' : 's'
+          } deleted). Re-running search\u2026`,
+          'ok'
+        );
+      } else {
+        setStatus(statusEl, 'Blocked. Re-running search\u2026', 'ok');
+      }
+
+      /* A block changes what this machine will show, so the rendered results
+       * are stale by definition. Re-run rather than patching the DOM, so the
+       * user sees exactly what a fresh search would return. */
+      ui.form.requestSubmit();
+    } catch (err) {
+      setStatus(statusEl, err.message, 'bad');
+      button.disabled = false;
+    }
+  });
+}
+
+/* Ask whether to keep the local copy. Resolves true to keep, false to delete,
+ * null if the user cancelled. */
+function askBlock(target) {
+  const isName = target.subject_kind === 'name';
+  ui.blockTitle.textContent = isName ? 'Block this name' : 'Block this resource';
+  ui.blockBlurb.textContent = isName
+    ? 'The name will stop resolving here and will not be served to peers. The record itself is ' +
+      'kept, so unblocking restores it.'
+    : 'The resource will disappear from results and will never be served to peers. ' +
+      'Blocking alone keeps the local copy; blocking and deleting also removes the local ' +
+      'row, its embedding and its ratings, which unblocking cannot undo.';
+
+  /* A name block never deletes anything, so offering "Block and delete" would
+   * be a button that appears to do something irreversible and does not. The
+   * backend silently ignores keep_local for names; hide the option instead of
+   * lying about it. */
+  ui.blockDelete.hidden = isName;
+  ui.blockKeep.textContent = isName ? 'Block this name' : 'Block, keep local copy';
+
+  return new Promise((resolve) => {
+    const onClose = () => {
+      ui.blockDialog.removeEventListener('close', onClose);
+      const value = ui.blockDialog.returnValue;
+      if (value === 'delete' && target.subject_kind !== 'name') resolve(false);
+      else if (value === 'keep') resolve(true);
+      else resolve(null); // cancel, or Escape
+    };
+    ui.blockDialog.addEventListener('close', onClose);
+    ui.blockDialog.showModal();
+  });
 }
 
 function wireRating(node, result, statusEl) {
@@ -358,10 +503,88 @@ async function refreshStatus() {
   ui.statusBody.textContent = 'Loading\u2026';
   try {
     const s = await api('/api/status');
-    ui.statusBody.replaceChildren(statusList(s));
+    // Blocks are fetched separately because a failed block list must not blank
+    // the whole status panel, and vice versa.
+    let blocks = null;
+    try {
+      blocks = await api('/api/blocks');
+    } catch (e) {
+      blocks = { ok: false, count: 0, blocks: [] };
+    }
+    ui.statusBody.replaceChildren(statusList(s), blocksSection(blocks));
   } catch (err) {
     ui.statusBody.textContent = `Could not read status: ${err.message}`;
   }
+}
+
+/* The blocks list lives in the status drawer so a block can always be undone
+ * from the browser. A block the user cannot see and cannot lift from the page
+ * they set it on is a trap, so this lists every subject with its own Unblock
+ * button rather than only reporting counts. */
+function blocksSection(data) {
+  const wrap = document.createElement('section');
+  wrap.className = 'status-blocks';
+
+  const heading = document.createElement('h3');
+  const n = (data && data.count) || 0;
+  heading.textContent = `Blocked (${n})`;
+  wrap.append(heading);
+
+  const entries = (data && data.blocks) || [];
+  if (entries.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'hint';
+    empty.textContent = 'Nothing is blocked.';
+    wrap.append(empty);
+    return wrap;
+  }
+
+  const list = document.createElement('ul');
+  list.className = 'block-list';
+  for (const entry of entries) {
+    const li = document.createElement('li');
+    li.className = 'block-item';
+
+    const kind = document.createElement('span');
+    kind.className = 'badge';
+    kind.dataset.source = entry.subject_kind;
+    kind.textContent = entry.subject_kind;
+
+    const id = document.createElement('code');
+    id.className = 'block-id';
+    id.textContent = entry.subject_id;
+    if (entry.reason) id.title = entry.reason;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-quiet';
+    btn.textContent = 'Unblock';
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        const res = await postJSON('/api/unblock', {
+          subject_kind: entry.subject_kind,
+          subject_id: entry.subject_id,
+        });
+        setStatus(
+          ui.banner,
+          res.unblocked
+            ? `Unblocked ${entry.subject_kind} ${entry.subject_id.slice(0, 12)}.`
+            : 'That subject was not blocked.',
+          'ok'
+        );
+      } catch (err) {
+        setStatus(ui.banner, `Could not unblock: ${err.message}`, 'bad');
+        btn.disabled = false;
+      }
+      refreshStatus();
+    });
+
+    li.append(kind, id, btn);
+    list.append(li);
+  }
+  wrap.append(list);
+  return wrap;
 }
 
 function statusList(s) {

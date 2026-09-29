@@ -9,7 +9,9 @@ Images, audio, and video are indexed by their text descriptions only
 This is intentional for the MVP — it keeps the model requirement to a single
 small CPU-friendly model (`all-MiniLM-L6-v2`).
 
-**Workaround:** Add tags or description claims via the claim system.
+**Workaround:** Add tags or description text at index time. (There is no claim
+system in practice — see "Claims and peer agreement are not wired" under
+Trust below.)
 
 ### Brute-force cosine search
 
@@ -40,6 +42,34 @@ Run periodic cleanup against the `name_records` table if storage matters.
 
 ## Trust
 
+### Claims and peer agreement are not wired
+
+The `claims` table, the `Claim`/`ClaimPayload` types, `MessageKind::Claim` and
+`TOPIC_CLAIM` all exist, and the responder subscribes to the topic — but
+nothing ever emits a claim and nothing handles one:
+
+- there is no `publish_claim` on `MessageDispatcher`
+- `cmd/listen.rs` matches only `Query` and `NameQuery`; `MessageKind::Claim`
+  falls through to `_ => {}` and is dropped
+- the only `claims::insert` calls in the workspace are in tests
+  (`av-trust/tests/trust.rs`, `av-index/tests/local_search.rs`,
+  `av-store/tests/integration.rs`)
+
+Consequences:
+
+- `agreement_score` always returns 0.5, so the 0.15 agreement weight in
+  `docs/ranking.md` contributes a constant and cannot reorder results.
+- There is no record of which agent served which resource outside the lifetime
+  of a single search, so resource-to-agent attribution is not available to
+  anything.
+
+`agreement_count` shown in search output ("agreed by N peers") is unrelated and
+does work — it comes from in-memory response clustering in `av-query`, not from
+`claims`. The two are both called agreement; they are not the same signal.
+
+The proposed replacement is user-mediated rather than a gossiped claim stream —
+see `docs/follow-ups.md`.
+
 ### Cold-start bias risk
 
 Early agents that respond quickly may receive disproportionate initial
@@ -52,6 +82,13 @@ An attacker can spin up many agent identities cheaply. Rate limiting and
 trust decay reduce their influence but cannot prevent it entirely. Full
 sybil resistance requires identity cost (stake, proof-of-work, etc.) — out of
 scope for MVP.
+
+This is why the dead `claims`/`agreement` path should not simply be switched
+on: `agreement_score` is `COUNT(DISTINCT by_agent_id)` for a resource over
+total distinct agents, so an attacker who registers many agent identities and
+has them all claim one resource drives that term toward 1.0 for that resource
+alone. The topic is gossiped, so the cost of doing so is low. Restoring the
+signal needs a Sybil answer first, not just a publisher.
 
 ## Network
 

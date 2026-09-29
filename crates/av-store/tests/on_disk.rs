@@ -66,7 +66,7 @@ fn test_concurrent_opens_of_a_fresh_database() {
         .query_row("SELECT COUNT(*) FROM applied_migrations", [], |r| r.get(0))
         .expect("count migrations");
     assert_eq!(
-        applied, 4,
+        applied, 5,
         "every migration should be recorded exactly once"
     );
 }

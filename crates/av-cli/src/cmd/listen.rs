@@ -161,6 +161,98 @@ fn open_db(db_path: &std::path::Path) -> CliResult<rusqlite::Connection> {
     av_store::open(db_path).map_err(|e| CliError::Database(e.to_string()))
 }
 
+/// Map index hits to wire results, dropping blocked resources.
+///
+/// `av_index::search::search_top_k` already filters these, so in practice the
+/// blocked branch finds nothing. It exists because this is the responder: the
+/// promise that a blocked resource never leaves this node should not depend on
+/// a filter inside a different crate staying intact, and because it is the only
+/// place that can *report* that something was withheld. Same reasoning as the
+/// loopback host-header guard in the web server — keep it in front of the send.
+///
+/// Returns the publishable results and the ids that were withheld.
+fn to_publishable_resources(
+    conn: &rusqlite::Connection,
+    hits: Vec<av_index::search::SearchResult>,
+) -> (Vec<ResourceResult>, Vec<String>) {
+    // Fails closed, like the two `av-index` filters. This is the last gate
+    // before the send, so defaulting to "nothing blocked" here would publish
+    // whatever the previous layer failed to filter.
+    let blocked = match av_store::repo::blocks::blocked_ids(
+        conn,
+        av_store::repo::blocks::BlockKind::Resource,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("av listen: refusing to serve results, could not read the block list: {e}");
+            // Withhold everything rather than guess.
+            return (
+                Vec::new(),
+                hits.into_iter().map(|h| h.resource.id).collect(),
+            );
+        }
+    };
+
+    let mut kept = Vec::with_capacity(hits.len());
+    let mut withheld = Vec::new();
+    for r in hits {
+        if blocked.contains(&r.resource.id) {
+            withheld.push(r.resource.id);
+            continue;
+        }
+        kept.push(ResourceResult {
+            resource_id: r.resource.id,
+            description_text: r.resource.description_text,
+            location: r.resource.location,
+            location_scheme: r.resource.location_scheme,
+            mime_type: r.resource.mime_type,
+            score: r.score,
+        });
+    }
+    (kept, withheld)
+}
+
+/// Drop blocked name records from a response about to be published, for the
+/// same reason as [`to_publishable_resources`].
+fn to_publishable_names(
+    conn: &rusqlite::Connection,
+    hits: Vec<av_index::naming::NameResult>,
+) -> (Vec<av_core::types::NameRecord>, Vec<String>) {
+    let blocked =
+        match av_store::repo::blocks::blocked_ids(conn, av_store::repo::blocks::BlockKind::Name) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("av listen: refusing to serve names, could not read the block list: {e}");
+                return (
+                    Vec::new(),
+                    hits.into_iter().map(|h| h.record.record_id).collect(),
+                );
+            }
+        };
+
+    let mut kept = Vec::with_capacity(hits.len());
+    let mut withheld = Vec::new();
+    for r in hits {
+        if blocked.contains(&r.record.record_id) {
+            withheld.push(r.record.record_id);
+            continue;
+        }
+        kept.push(r.record);
+    }
+    (kept, withheld)
+}
+
+/// Note that a response was trimmed by local block policy.
+fn note_withheld(query_id: &str, kind: &str, withheld: &[String]) {
+    if !withheld.is_empty() {
+        tracing::debug!(
+            query_id = %crate::output::abbrev(query_id, 8),
+            count = withheld.len(),
+            "withheld locally blocked {kind} from response"
+        );
+    }
+}
+
 fn respond_to_search_query(
     dispatcher: &MessageDispatcher,
     db_path: &std::path::Path,
@@ -184,21 +276,12 @@ fn respond_to_search_query(
         .search(&q.query_text, q.max_results as usize, &filter)
         .unwrap_or_default();
 
-    if results.is_empty() {
+    let (network_results, withheld) = to_publishable_resources(&conn, results);
+    note_withheld(&q.query_id, "resources", &withheld);
+
+    if network_results.is_empty() {
         return Ok(());
     }
-
-    let network_results: Vec<ResourceResult> = results
-        .into_iter()
-        .map(|r| ResourceResult {
-            resource_id: r.resource.id.clone(),
-            description_text: r.resource.description_text.clone(),
-            location: r.resource.location.clone(),
-            location_scheme: r.resource.location_scheme.clone(),
-            mime_type: r.resource.mime_type.clone(),
-            score: r.score,
-        })
-        .collect();
 
     dispatcher
         .publish_response(&q.query_id, network_results)
@@ -229,21 +312,12 @@ fn respond_to_search_query_direct(
         .search(&q.query_text, q.max_results as usize, &filter)
         .unwrap_or_default();
 
-    if results.is_empty() {
+    let (network_results, withheld) = to_publishable_resources(&conn, results);
+    note_withheld(&q.query_id, "resources", &withheld);
+
+    if network_results.is_empty() {
         return Ok(());
     }
-
-    let network_results: Vec<ResourceResult> = results
-        .into_iter()
-        .map(|r| ResourceResult {
-            resource_id: r.resource.id.clone(),
-            description_text: r.resource.description_text.clone(),
-            location: r.resource.location.clone(),
-            location_scheme: r.resource.location_scheme.clone(),
-            mime_type: r.resource.mime_type.clone(),
-            score: r.score,
-        })
-        .collect();
 
     dispatcher
         .send_direct_response(to_agent_id, &q.query_id, network_results)
@@ -263,15 +337,15 @@ fn respond_to_name_query(
     let results =
         av_index::naming::lookup_name(&conn, &q.name, &scheme_filter, now).unwrap_or_default();
 
-    if results.is_empty() {
+    // Truncate before filtering, so an unblocked query answers with exactly the
+    // same number of records it always did.
+    let capped = results.into_iter().take(q.max_results as usize).collect();
+    let (records, withheld) = to_publishable_names(&conn, capped);
+    note_withheld(&q.query_id, "name records", &withheld);
+
+    if records.is_empty() {
         return Ok(());
     }
-
-    let records: Vec<av_core::types::NameRecord> = results
-        .into_iter()
-        .take(q.max_results as usize)
-        .map(|r| r.record)
-        .collect();
 
     dispatcher
         .publish_name_response(&q.query_id, &q.normalized_name, records)
@@ -292,15 +366,13 @@ fn respond_to_name_query_direct(
     let results =
         av_index::naming::lookup_name(&conn, &q.name, &scheme_filter, now).unwrap_or_default();
 
-    if results.is_empty() {
+    let capped = results.into_iter().take(q.max_results as usize).collect();
+    let (records, withheld) = to_publishable_names(&conn, capped);
+    note_withheld(&q.query_id, "name records", &withheld);
+
+    if records.is_empty() {
         return Ok(());
     }
-
-    let records: Vec<av_core::types::NameRecord> = results
-        .into_iter()
-        .take(q.max_results as usize)
-        .map(|r| r.record)
-        .collect();
 
     dispatcher
         .send_direct_name_response(to_agent_id, &q.query_id, &q.normalized_name, records)
@@ -312,4 +384,166 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// --- Block policy on the responder path ------------------------------------
+//
+// `to_publishable_resources` / `to_publishable_names` are the last gate before
+// a result leaves this node, so they are tested directly. The search and naming
+// layers also filter blocked subjects, and these tests deliberately block a
+// result that *did* come back from that layer — a resource blocked with
+// `--keep-local` still has its embedding, so the only thing standing between
+// it and a peer is this function.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use av_index::naming::NameResult;
+    use av_index::search::SearchResult;
+    use av_store::repo::blocks::{self, BlockKind};
+
+    fn stub_resource(id: &str) -> SearchResult {
+        SearchResult {
+            resource: av_core::types::ResourceDescriptor {
+                id: id.to_string(),
+                kind: av_core::types::ResourceKind::Text,
+                location: format!("autonomi://{id}"),
+                location_scheme: Some("autonomi".into()),
+                location_canonical: Some(format!("autonomi://{id}")),
+                mime_type: "text/plain".into(),
+                filename: None,
+                metadata_json: serde_json::json!({}),
+                description_text: "a description".into(),
+                created_at: 1_700_000_000,
+            },
+            semantic_score: 1.0,
+            agreement_score: 0.0,
+            feedback_score: 0.0,
+            trust_score: 0.0,
+            relevance_score: 0.0,
+            score: 1.0,
+        }
+    }
+
+    fn block(conn: &rusqlite::Connection, kind: BlockKind, id: &str) {
+        blocks::add(conn, kind, id, Some("test"), 1_700_000_000, "test").expect("add block");
+    }
+
+    #[test]
+    fn blocked_resource_is_never_published_to_a_peer() {
+        let conn = av_store::open_in_memory().expect("open db");
+        let hits = vec![stub_resource("aa"), stub_resource("bb")];
+        block(&conn, BlockKind::Resource, "bb");
+
+        let (publishable, withheld) = to_publishable_resources(&conn, hits);
+        let ids: Vec<&str> = publishable.iter().map(|r| r.resource_id.as_str()).collect();
+
+        assert_eq!(
+            ids,
+            vec!["aa"],
+            "the blocked resource must not be published"
+        );
+        assert_eq!(
+            withheld,
+            vec!["bb".to_string()],
+            "and the responder says so"
+        );
+    }
+
+    #[test]
+    fn nothing_is_published_when_every_hit_is_blocked() {
+        let conn = av_store::open_in_memory().expect("open db");
+        let hits = vec![stub_resource("aa"), stub_resource("bb")];
+        block(&conn, BlockKind::Resource, "aa");
+        block(&conn, BlockKind::Resource, "bb");
+
+        let (publishable, withheld) = to_publishable_resources(&conn, hits);
+        assert!(publishable.is_empty());
+        assert_eq!(withheld.len(), 2);
+    }
+
+    #[test]
+    fn unblocked_resources_pass_through_untouched() {
+        let conn = av_store::open_in_memory().expect("open db");
+        let hits = vec![stub_resource("aa")];
+        let (publishable, withheld) = to_publishable_resources(&conn, hits);
+        assert_eq!(publishable.len(), 1);
+        assert!(withheld.is_empty());
+    }
+
+    #[test]
+    fn a_blocked_name_record_is_never_published_to_a_peer() {
+        let conn = av_store::open_in_memory().expect("open db");
+        let make = |id: &str| NameResult {
+            record: av_core::types::NameRecord {
+                schema_version: 1,
+                record_id: id.to_string(),
+                normalized_name: "contested".into(),
+                original_name: "Contested".into(),
+                record_type: av_core::types::NameRecordType::Uri,
+                target: "autonomi://aa".into(),
+                target_scheme: Some("autonomi".into()),
+                target_canonical: Some("autonomi://aa".into()),
+                ttl_secs: 3600,
+                by_agent_id: "agent-abc".into(),
+                timestamp: 1_700_000_000,
+                signature: vec![],
+            },
+            score: 1.0,
+            trust_score: 1.0,
+            agreement_score: 0.0,
+            recency_score: 0.0,
+            ttl_valid: true,
+        };
+        block(&conn, BlockKind::Name, "nr-bad");
+
+        let (publishable, withheld) =
+            to_publishable_names(&conn, vec![make("nr-good"), make("nr-bad")]);
+        let ids: Vec<&str> = publishable.iter().map(|r| r.record_id.as_str()).collect();
+
+        assert_eq!(
+            ids,
+            vec!["nr-good"],
+            "only the blocked name claim is withheld"
+        );
+        assert_eq!(withheld, vec!["nr-bad".to_string()]);
+    }
+
+    #[test]
+    fn a_resource_block_does_not_withhold_a_name_record() {
+        // The three kinds are independent policies. Sharing a string between a
+        // resource id and a name record id must not couple them, so a resource
+        // block is never allowed to suppress a name response.
+        let conn = av_store::open_in_memory().expect("open db");
+        let make = |id: &str| NameResult {
+            record: av_core::types::NameRecord {
+                schema_version: 1,
+                record_id: id.to_string(),
+                normalized_name: "shared".into(),
+                original_name: "Shared".into(),
+                record_type: av_core::types::NameRecordType::Uri,
+                target: "autonomi://aa".into(),
+                target_scheme: Some("autonomi".into()),
+                target_canonical: Some("autonomi://aa".into()),
+                ttl_secs: 3600,
+                by_agent_id: "agent-abc".into(),
+                timestamp: 1_700_000_000,
+                signature: vec![],
+            },
+            score: 1.0,
+            trust_score: 1.0,
+            agreement_score: 0.0,
+            recency_score: 0.0,
+            ttl_valid: true,
+        };
+        block(&conn, BlockKind::Resource, "shared");
+
+        let (publishable, withheld) = to_publishable_names(&conn, vec![make("shared")]);
+        assert_eq!(
+            publishable.len(),
+            1,
+            "a resource block must not touch name records"
+        );
+        assert!(withheld.is_empty());
+    }
 }

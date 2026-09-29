@@ -196,7 +196,18 @@ pub fn search(state: &Arc<AppState>, query: &str) -> WebResponse {
     // Search blocks until every peer has replied or the fan-out times out.
     // Streaming results (SSE) is a deliberate follow-up, not something to fake.
     let merged = match crate::cmd::search::collect_results(
-        &state.cli, &startup, &conn, &provider, &q, scheme, kind, mime, limit,
+        &state.cli,
+        &startup,
+        &conn,
+        &provider,
+        &q,
+        &crate::cmd::search::SearchOptions {
+            scheme,
+            kind,
+            mime,
+            limit,
+            show_peers: false,
+        },
     ) {
         Ok(m) => m,
         Err(e) => return error_response(e),
@@ -656,4 +667,236 @@ pub fn install_ant(state: &Arc<AppState>) -> WebResponse {
         })
         .to_string(),
     )
+}
+
+// --- Local block policy -----------------------------------------------------
+//
+// These three handlers are thin adapters over `cmd::block`, deliberately: the
+// browser and the CLI must apply identical policy, and a block is a promise
+// about what this node will and will not do. Reimplementing the rules here
+// would be how the two surfaces start to disagree about whether something is
+// blocked.
+
+/// `GET /api/blocks` — every current block, with per-kind counts.
+pub fn blocks_list(state: &Arc<AppState>) -> WebResponse {
+    let conn = match db_conn(state) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+
+    let entries = match crate::cmd::block::list_blocks(&conn) {
+        Ok(e) => e,
+        Err(e) => return json_error(500, "database_error", &e.to_string()),
+    };
+    let counts = match crate::cmd::block::counts(&conn) {
+        Ok(c) => c,
+        Err(e) => return json_error(500, "database_error", &e.to_string()),
+    };
+
+    json_response(
+        json!({
+            "ok": true,
+            "count": entries.len(),
+            "blocks": entries
+                .iter()
+                .map(|e| json!({
+                    "subject_kind": e.subject_kind.as_str(),
+                    "subject_id": e.subject_id,
+                    "reason": e.reason,
+                    "blocked_at": e.blocked_at,
+                    "source": e.source,
+                }))
+                .collect::<Vec<_>>(),
+            "counts": counts
+                .iter()
+                .map(|(k, n)| json!({ "subject_kind": k.as_str(), "count": n }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string(),
+    )
+}
+
+/// `POST /api/block` — block one subject.
+///
+/// `keep_local` defaults to false, matching the CLI: blocking a resource
+/// deletes the local copy. The response says whether that happened, so the page
+/// can tell the user what actually changed instead of implying everything
+/// succeeded.
+pub fn block(state: &Arc<AppState>, body: &str) -> WebResponse {
+    let payload: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, "validation_error", &format!("invalid JSON: {e}")),
+    };
+
+    let kind = match payload["subject_kind"]
+        .as_str()
+        .and_then(av_store::repo::blocks::BlockKind::parse)
+    {
+        Some(k) => k,
+        None => {
+            return json_error(
+                400,
+                "validation_error",
+                "'subject_kind' must be one of: resource, name, agent",
+            );
+        }
+    };
+    let subject_id = payload["subject_id"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if subject_id.is_empty() {
+        return json_error(400, "validation_error", "missing 'subject_id'");
+    }
+    let reason = payload["reason"].as_str().map(|s| s.to_string());
+    let keep_local = payload["keep_local"].as_bool().unwrap_or(false);
+    // The browser never escalates to the x0x transport on its own. That block
+    // is global, drops everything from that agent on every topic, and needs the
+    // daemon; offering it as a one-click toggle in a search result row would
+    // make a local preference do something much larger than it looks.
+    //
+    // This is deliberately not read from the payload. A loopback server is
+    // reachable by any page the user visits, and honouring a caller-supplied
+    // `x0x` flag would let a request from one make a lasting global change the
+    // UI never offered. `av block --agent <id> --x0x` is the explicit,
+    // user-typed way to do that.
+    const X0X: bool = false;
+    if payload.get("x0x").is_some() {
+        return json_error(
+            400,
+            "validation_error",
+            "x0x transport blocking is not available over the web interface. \
+             Use 'av block --agent <id> --x0x' instead.",
+        );
+    }
+
+    let conn = match db_conn(state) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let startup = match state.startup.read() {
+        Ok(s) => s,
+        Err(_) => return json_error(500, "state_error", "startup state is poisoned"),
+    };
+
+    match crate::cmd::block::block_subject(
+        &conn,
+        &startup,
+        kind,
+        &subject_id,
+        reason.as_deref(),
+        keep_local,
+        X0X,
+        "web",
+    ) {
+        Ok(o) => {
+            // Reuse the CLI's warning text so a block made in the browser says
+            // the same thing as the same block made from the terminal. The one
+            // addition is that the browser's escalation is structurally absent.
+            let mut warning = crate::cmd::block::warning_for(&o);
+            if warning.is_none() && o.kind == crate::cmd::block::BlockKind::Agent {
+                warning = Some(
+                    "Blocked in anta-vista only. This peer can still reach the node and the \
+                     responder will still count its claims. Use 'av block --agent <id> --x0x' \
+                     to drop it at the transport too."
+                        .to_string(),
+                );
+            }
+            json_response(
+                json!({
+                    "ok": true,
+                    "subject_kind": o.kind.as_str(),
+                    "subject_id": o.subject_id,
+                    "blocked": o.blocked,
+                    "removed_local": o.removed_local,
+                    "kept_local": o.kept_local,
+                    "cascaded": o.cascaded,
+                    "x0x_requested": o.x0x_requested,
+                    "warning": warning,
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => validation_response(&e),
+    }
+}
+
+/// `POST /api/unblock` — lift one block, or every block with `all: true`.
+pub fn unblock(state: &Arc<AppState>, body: &str) -> WebResponse {
+    let payload: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, "validation_error", &format!("invalid JSON: {e}")),
+    };
+
+    let all = payload["all"].as_bool().unwrap_or(false);
+    let kind = payload["subject_kind"]
+        .as_str()
+        .and_then(av_store::repo::blocks::BlockKind::parse);
+    let subject_id = payload["subject_id"].as_str().map(|s| s.trim().to_string());
+
+    if !all && kind.is_none() {
+        return json_error(
+            400,
+            "validation_error",
+            "provide 'subject_kind' and 'subject_id', or set all: true",
+        );
+    }
+    if !all && subject_id.as_deref().unwrap_or("").is_empty() {
+        return json_error(400, "validation_error", "missing 'subject_id'");
+    }
+
+    let conn = match db_conn(state) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let startup = match state.startup.read() {
+        Ok(s) => s,
+        Err(_) => return json_error(500, "state_error", "startup state is poisoned"),
+    };
+
+    match crate::cmd::block::unblock_subject(
+        &conn,
+        &startup,
+        kind.unwrap_or(av_store::repo::blocks::BlockKind::Resource),
+        subject_id.as_deref(),
+        all,
+        // The browser does not touch x0x transport state; `av unblock --agent
+        // <id> --x0x` is the explicit way to do that.
+        false,
+    ) {
+        Ok(o) => json_response(
+            json!({
+                "ok": true,
+                "subject_kind": o.kind.as_str(),
+                "subject_id": o.subject_id,
+                "unblocked": o.unblocked,
+                "removed": o.removed,
+                "warning": if o.removed > 0 {
+                    Some(
+                        "Lifted the block. Deleted resources are not restored — re-index them to get them back."
+                            .to_string(),
+                    )
+                } else {
+                    Some("That subject was not blocked.".to_string())
+                },
+            })
+            .to_string(),
+        ),
+        Err(e) => validation_response(&e),
+    }
+}
+
+/// Map a `CliError` onto the right HTTP status.
+///
+/// `block_subject` rejects a malformed agent id as a validation failure, and the
+/// browser needs to see that as a 400 rather than a 500 — the request was wrong,
+/// not the server.
+fn validation_response(e: &crate::cmd::CliError) -> WebResponse {
+    use crate::cmd::CliError;
+    match e {
+        CliError::Validation(msg) => json_error(400, "validation_error", msg),
+        CliError::Database(msg) => json_error(500, "database_error", msg),
+        other => json_error(500, "internal_error", &other.to_string()),
+    }
 }

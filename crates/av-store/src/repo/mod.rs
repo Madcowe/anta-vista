@@ -1,3 +1,4 @@
+pub mod blocks;
 pub mod claims;
 pub mod embeddings;
 pub mod feedback;

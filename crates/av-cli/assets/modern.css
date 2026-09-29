@@ -447,3 +447,58 @@ input[type="text"] {
   text-decoration: underline dotted;
   text-underline-offset: 3px;
 }
+
+/* Blocking controls. `flex-wrap` on .result-actions already handles the extra
+ * buttons, so these only need to sit together as one group and stay visually
+ * quieter than the rating buttons — blocking is not a rating. */
+.block-agents {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+[data-theme="modern"] .btn-block {
+  margin-left: auto;
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+
+[data-theme="modern"] .btn-block:hover {
+  opacity: 1;
+  color: var(--danger, #b3261e);
+}
+
+/* Block list in the status drawer. */
+.status-blocks h3 {
+  margin: 18px 0 8px;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.7;
+}
+
+.block-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.block-item {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.block-id {
+  font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  flex: 1 1 8rem;
+}

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::cmd::{CliError, CliResult};
 use crate::network::execute_search;
-use crate::output::{abbrev, print_output};
+use crate::output::print_output;
 use crate::startup::StartupState;
 use av_core::constants::WEIGHT_RELEVANCE;
 use av_embed::minilm::MiniLmProvider;
@@ -29,17 +29,36 @@ pub struct MergedResults {
 ///
 /// This is the single implementation of Anta-Vista search ranking; the CLI and
 /// the web UI are both thin presentation layers over it.
+/// Query filters and display options for one search.
+///
+/// Grouped because the flat argument list had grown past the point of being
+/// readable, and because `limit` and `show_peers` are display concerns that
+/// `collect_results` has no business knowing about individually.
+#[derive(Debug, Clone, Default)]
+pub struct SearchOptions {
+    pub scheme: Option<String>,
+    pub kind: Option<String>,
+    pub mime: Option<String>,
+    pub limit: usize,
+    /// Print the peer ids behind each network result. Hidden by default.
+    pub show_peers: bool,
+}
+
 pub fn collect_results(
     cli: &crate::Cli,
     state: &StartupState,
     conn: &Connection,
     provider: &MiniLmProvider,
     query: &str,
-    scheme: Option<String>,
-    kind: Option<String>,
-    mime: Option<String>,
-    limit: usize,
+    opts: &SearchOptions,
 ) -> CliResult<MergedResults> {
+    let SearchOptions {
+        scheme,
+        kind,
+        mime,
+        limit,
+        ..
+    } = opts.clone();
     let name_scheme_filter = scheme
         .clone()
         .map(|s| av_index::filter::SchemeFilter::new(vec![s]));
@@ -49,6 +68,17 @@ pub fn collect_results(
     // Cluster network results and merge with local
     let clustered = cluster_responses(&res.network_results);
     let clustering_active = !res.network_results.is_empty();
+
+    // Local and name hits are already filtered by `av-index` (which is also
+    // what keeps `av listen` from serving them). Network hits never pass
+    // through the index — they arrive as wire payloads and are clustered — so
+    // this is the only place they can be dropped.
+    let blocked_resources =
+        av_store::repo::blocks::blocked_ids(conn, av_store::repo::blocks::BlockKind::Resource)
+            .unwrap_or_default();
+    let blocked_names =
+        av_store::repo::blocks::blocked_ids(conn, av_store::repo::blocks::BlockKind::Name)
+            .unwrap_or_default();
 
     // Merge local and clustered network results, sorted by score descending
     let mut all_results: Vec<serde_json::Value> = Vec::new();
@@ -78,6 +108,9 @@ pub fn collect_results(
     }
 
     for c in &clustered {
+        if blocked_resources.contains(&c.result.resource_id) {
+            continue;
+        }
         if res
             .local_results
             .iter()
@@ -92,6 +125,10 @@ pub fn collect_results(
             "mime_type": c.result.mime_type,
             "score": c.avg_score,
             "agreement_count": c.agreement_count,
+            // The peers that actually returned this, so an operator who does
+            // not want the result can block whoever sent it rather than only
+            // the resource. These are transport-authenticated origins.
+            "agent_ids": c.agent_ids,
             "source": "network",
         }));
     }
@@ -114,6 +151,9 @@ pub fn collect_results(
     for candidate in &name_candidates {
         if let Ok(name_results) = av_index::naming::lookup_name(conn, candidate, &sf, now) {
             for nr in name_results {
+                if blocked_names.contains(&nr.record.record_id) {
+                    continue;
+                }
                 let name_location = nr
                     .record
                     .target_canonical
@@ -165,11 +205,9 @@ pub fn run(
     cli: crate::Cli,
     state: StartupState,
     query: String,
-    scheme: Option<String>,
-    kind: Option<String>,
-    mime: Option<String>,
-    limit: usize,
+    opts: SearchOptions,
 ) -> CliResult<()> {
+    let show_peers = opts.show_peers;
     let db_path = av_core::paths::db_path()
         .ok_or_else(|| CliError::Database("Failed to determine database path".to_string()))?;
     let conn = av_store::open(&db_path).map_err(|e| CliError::Database(e.to_string()))?;
@@ -177,9 +215,7 @@ pub fn run(
     // Load real embedding model
     let provider = MiniLmProvider::new().map_err(|e| CliError::Model(e.to_string()))?;
 
-    let merged = collect_results(
-        &cli, &state, &conn, &provider, &query, scheme, kind, mime, limit,
-    )?;
+    let merged = collect_results(&cli, &state, &conn, &provider, &query, &opts)?;
     let all_results = merged.results;
 
     let output_json = json!({
@@ -220,7 +256,11 @@ pub fn run(
                             score,
                         );
                         println!("     {} [{}]", description, mime_type);
-                        println!("     resource_id: {}", abbrev(&resource_id, 16));
+                        // The full id, not a truncated one: an abbreviated hash
+                        // cannot be pasted into `av block`, and a block stored
+                        // against a truncated id matches nothing while looking
+                        // like it worked.
+                        println!("     resource_id: {}", resource_id);
                     }
                     "network" => {
                         let agreement_count = result["agreement_count"].as_u64().unwrap_or(0);
@@ -233,9 +273,32 @@ pub fn run(
                             agreement_count,
                         );
                         println!("     {}", description);
-                        println!("     resource_id: {}", abbrev(&resource_id, 16));
+                        println!("     resource_id: {}", resource_id);
+                        // The peer count is already in the header line above,
+                        // and printing every id is unusable at any real cluster
+                        // size (a 50-agent cluster is ~3.2k characters on one
+                        // line). Ids are transport-authenticated origins, so
+                        // they stay available for anyone who needs to block a
+                        // specific peer, behind an explicit flag and in the
+                        // `--non-interactive` JSON, which always carries them.
+                        if show_peers
+                            && let Some(agents) = result["agent_ids"].as_array()
+                            && !agents.is_empty()
+                        {
+                            let ids: Vec<&str> = agents.iter().filter_map(|a| a.as_str()).collect();
+                            println!("     peers:       {}", ids.join(", "));
+                        }
                     }
                     "name" => {
+                        // A name result's `resource_id` is the synthetic
+                        // `name:<record-id>` used for ranking, not a resource
+                        // id, and `location` is the *target* URI — which is not
+                        // what a name block keys on either. Print the record id
+                        // under its own name so neither is mistaken for it.
+                        let record_id = result["name_record"]["record_id"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
                         println!(
                             "  {}. [{}] {} → {} (score: {:.3})",
                             rank + 1,
@@ -244,7 +307,7 @@ pub fn run(
                             console::style(location).green(),
                             score,
                         );
-                        println!("     resource_id: {}", abbrev(&resource_id, 16));
+                        println!("     record_id:   {}", record_id);
                     }
                     _ => {}
                 }
@@ -310,7 +373,19 @@ pub fn run(
                         }
                     } else {
                         // Resource result: propagate into local index
-                        if av_store::repo::resources::get(&conn, rid)
+                        if av_store::repo::blocks::is_blocked(
+                            &conn,
+                            av_store::repo::blocks::BlockKind::Resource,
+                            rid,
+                        )
+                        .unwrap_or(false)
+                        {
+                            println!(
+                                "  {} Result {} is blocked; not propagating it back",
+                                console::style("✗").red(),
+                                n,
+                            );
+                        } else if av_store::repo::resources::get(&conn, rid)
                             .ok()
                             .flatten()
                             .is_none()
@@ -388,6 +463,22 @@ pub fn reinforce(
             serde_json::from_value::<av_core::types::NameRecord>(result["name_record"].clone())
                 .map_err(|e| CliError::Validation(format!("malformed name_record: {e}")))?;
 
+        // A block imposed after this result was rendered must not be undone by
+        // the operator's own next action, which would re-broadcast the very
+        // record that was just blocked.
+        if av_store::repo::blocks::is_blocked(
+            conn,
+            av_store::repo::blocks::BlockKind::Name,
+            &record.record_id,
+        )
+        .unwrap_or(false)
+        {
+            return Err(CliError::Validation(format!(
+                "name record {} is blocked; unblock it before reinforcing",
+                record.record_id
+            )));
+        }
+
         // Relevance first: `publish_name_claim` consumes the record by value.
         av_store::repo::relevance::name_upsert(conn, &normalized, &record.record_id, 1.0)
             .map_err(|e| CliError::Database(e.to_string()))?;
@@ -413,6 +504,23 @@ pub fn reinforce(
     // Resource result: keep a metadata copy if we only heard about it from a peer.
     // This stores the description we were already given — it does not download
     // the underlying bytes.
+    //
+    // Refuse a blocked resource first: otherwise a block imposed after this
+    // result was rendered would be silently reversed by reinforcing it, which
+    // re-inserts the resource and re-publishes nothing but does re-advertise
+    // its description to peers via the listener.
+    if av_store::repo::blocks::is_blocked(
+        conn,
+        av_store::repo::blocks::BlockKind::Resource,
+        resource_id,
+    )
+    .unwrap_or(false)
+    {
+        return Err(CliError::Validation(format!(
+            "resource {resource_id} is blocked; unblock it before reinforcing"
+        )));
+    }
+
     if av_store::repo::resources::get(conn, resource_id)
         .ok()
         .flatten()

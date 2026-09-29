@@ -67,6 +67,12 @@ pub enum Commands {
 
         #[arg(long, default_value = "10", help = "Max results")]
         limit: usize,
+
+        #[arg(
+            long,
+            help = "Print the peer ids behind each network result (hidden by default; also present in --non-interactive JSON)"
+        )]
+        show_peers: bool,
     },
 
     #[command(about = "Register a name → URI mapping")]
@@ -163,6 +169,104 @@ pub enum Commands {
 
         #[arg(long, help = "MIME type (e.g. text/plain, text/html)")]
         mime: Option<String>,
+    },
+
+    #[command(
+        about = "Block a resource, name record or peer agent locally",
+        long_about = "Blocking is local policy, enforced on every path: a blocked resource is \
+                      hidden from search and never served to peers, a blocked name no longer \
+                      resolves, and a blocked agent's answers are dropped and excluded from search \
+                      fan-out.\n\n\
+                      BLOCKING A RESOURCE DELETES YOUR LOCAL COPY by default, which also removes \
+                      its embedding, feedback events and relevance judgments. Pass --keep-local \
+                      to block without deleting.\n\n\
+                      The three kinds are independent: blocking a resource never blocks the agent \
+                      that returned it."
+    )]
+    Block {
+        #[arg(
+            long,
+            value_name = "RESOURCE_ID",
+            help = "Block a resource SHA-256 hash"
+        )]
+        resource: Option<String>,
+
+        #[arg(
+            long,
+            value_name = "AGENT_ID",
+            help = "Block a 64-hex x0x peer agent id"
+        )]
+        agent: Option<String>,
+
+        #[arg(
+            long,
+            value_name = "RECORD_ID",
+            help = "Block a name record id (accepts 'name:<id>')"
+        )]
+        name: Option<String>,
+
+        #[arg(long, help = "Record why, shown by 'av block --list'")]
+        reason: Option<String>,
+
+        #[arg(
+            long,
+            help = "Block the resource but keep the local copy (skips the delete)"
+        )]
+        keep_local: bool,
+
+        #[arg(
+            long,
+            help = "Also block the agent at the x0x transport (requires the daemon; drops all \
+                    of that agent's traffic on every topic, not just anta-vista results)"
+        )]
+        x0x: bool,
+
+        #[arg(long, help = "List current blocks instead of adding one")]
+        list: bool,
+    },
+
+    #[command(
+        about = "Lift a block",
+        long_about = "Removing a block does not restore data. A resource deleted when it was \
+                      blocked has to be re-indexed with 'av index <uri>'."
+    )]
+    Unblock {
+        #[arg(
+            long,
+            value_name = "RESOURCE_ID",
+            help = "Unblock a resource SHA-256 hash"
+        )]
+        resource: Option<String>,
+
+        #[arg(
+            long,
+            value_name = "AGENT_ID",
+            help = "Unblock a 64-hex x0x peer agent id"
+        )]
+        agent: Option<String>,
+
+        #[arg(
+            long,
+            value_name = "RECORD_ID",
+            help = "Unblock a name record id (accepts 'name:<id>')"
+        )]
+        name: Option<String>,
+
+        #[arg(
+            long,
+            help = "Lift every block. Does not restore deleted resources, and does not lift x0x \
+                    transport blocks (those need a per-agent 'av unblock --agent <id> --x0x')"
+        )]
+        all: bool,
+
+        #[arg(
+            long,
+            help = "Also lift the x0x transport block for an --agent (requires the daemon)"
+        )]
+        x0x: bool,
+
+        #[arg(long, help = "Skip confirmation prompt (for scripting)")]
+        no_confirm: bool,
     },
 
     #[command(
