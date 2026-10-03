@@ -177,6 +177,7 @@ pub fn run(
         target_canonical,
         ttl_secs: ttl,
         by_agent_id: agent_id,
+        origin_agent_id: None,
         timestamp,
         signature: vec![], // Signature would require x0x signing — placeholder for MVP
     };

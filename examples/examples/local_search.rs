@@ -116,6 +116,7 @@ fn main() {
         ),
         ttl_secs: 3600,
         by_agent_id: "local-agent".to_string(),
+        origin_agent_id: None,
         timestamp: 1_700_000_000,
         signature: vec![],
     };

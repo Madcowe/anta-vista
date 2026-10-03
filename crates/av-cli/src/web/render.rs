@@ -86,6 +86,10 @@ const PAGE: &str = r##"<!doctype html>
     <h2 id="results-heading" class="results-heading"><span id="results-count"></span></h2>
     <ol id="results" class="result-list"></ol>
     <p id="results-empty" class="hint" hidden>No results for that query.</p>
+    <!-- Removing or blocking a result takes its whole row, including the status
+         line that would have said what happened. This lives outside the rows so
+         the outcome survives the removal. -->
+    <p id="results-note" class="results-note" role="status"></p>
   </section>
 </main>
 
@@ -140,6 +144,43 @@ const PAGE: &str = r##"<!doctype html>
   </form>
 </dialog>
 
+<dialog id="recommend-dialog" aria-labelledby="recommend-title">
+  <form method="dialog">
+    <h2 id="recommend-title">Share this link?</h2>
+    <p class="hint">Recommending it may share the link with other people using this network.</p>
+    <menu>
+      <button value="no" class="btn btn-quiet">No, keep it to myself</button>
+      <button value="yes" class="btn btn-primary">Yes, recommend</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="peer-block-dialog" aria-labelledby="peer-block-title">
+  <form method="dialog">
+    <h2 id="peer-block-title">Block this peer?</h2>
+    <!-- Filled in by askPeerBlock() in app.js. An agent block is not a
+         disconnect, so the peer being able to reach this node is part of the
+         promise rather than a footnote. The command to drop it at the
+         transport travels with the copy. -->
+    <p id="peer-block-blurb" class="hint"></p>
+    <menu>
+      <button value="cancel" class="btn btn-quiet">Cancel</button>
+      <button value="block" class="btn btn-danger">Block this peer</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="remove-dialog" aria-labelledby="remove-title">
+  <form method="dialog">
+    <h2 id="remove-title">Remove from local index?</h2>
+    <p id="remove-blurb" class="hint"></p>
+    <menu>
+      <button value="cancel" class="btn btn-quiet">Cancel</button>
+      <button value="remove" class="btn btn-danger" data-role="remove-confirm">Remove</button>
+    </menu>
+  </form>
+</dialog>
+
 <template id="result-template">
   <li class="result">
     <div class="result-head">
@@ -153,12 +194,21 @@ const PAGE: &str = r##"<!doctype html>
       <span class="mime" data-role="mime"></span>
     </div>
     <div class="result-actions">
-      <span class="rate-label">Rate:</span>
-      <button type="button" class="btn btn-rate" data-rating="useful" title="Useful: raises this result's score for this query">Useful</button>
-      <button type="button" class="btn btn-rate" data-rating="not-useful" title="Not useful: lowers it">Not useful</button>
-      <button type="button" class="btn btn-rate" data-rating="incorrect" title="Factually wrong">Incorrect</button>
-      <button type="button" class="btn btn-quiet btn-block" data-role="block"
-        title="Never show or serve this again on this machine">Block</button>
+      <!-- One rating, not three. The value stays "useful" — only the label
+           changed — and the two negative ratings are no longer offered here.
+           A name record cannot be rated, so app.js hides the whole control
+           for source="name" rather than showing a button that cannot work. -->
+      <button type="button" class="btn btn-rate" data-rating="useful"
+        title="Recommend this result for the query you searched">Recommend</button>
+      <!-- Only offered when the result is local, which app.js decides from
+           result.source. Removes the local copy without blocking it: a peer
+           holding the same link can return it later. -->
+      <span class="result-deny">
+        <button type="button" class="btn btn-quiet btn-remove" data-role="remove"
+          title="Delete this from your local index. A peer holding it can still return it; use Block to stop that.">Remove from local index</button>
+        <button type="button" class="btn btn-quiet btn-block" data-role="block"
+          title="Never show or serve this again on this machine">Block</button>
+      </span>
       <span class="rate-status" data-role="rate-status" role="status"></span>
     </div>
   </li>

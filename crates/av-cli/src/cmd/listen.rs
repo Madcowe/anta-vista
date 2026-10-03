@@ -218,27 +218,39 @@ fn to_publishable_names(
     conn: &rusqlite::Connection,
     hits: Vec<av_index::naming::NameResult>,
 ) -> (Vec<av_core::types::NameRecord>, Vec<String>) {
-    let blocked =
-        match av_store::repo::blocks::blocked_ids(conn, av_store::repo::blocks::BlockKind::Name) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("av listen: refusing to serve names, could not read the block list: {e}");
-                return (
-                    Vec::new(),
-                    hits.into_iter().map(|h| h.record.record_id).collect(),
-                );
-            }
-        };
+    // Recorded up front so the fail-closed path below can name everything it is
+    // withholding without having to keep the moved-out `hits` around.
+    let all_ids: Vec<String> = hits.iter().map(|h| h.record.record_id.clone()).collect();
+    let refuse = |reason: &str| -> (Vec<av_core::types::NameRecord>, Vec<String>) {
+        eprintln!("av listen: refusing to serve names, {reason}");
+        (Vec::new(), all_ids.clone())
+    };
 
-    let mut kept = Vec::with_capacity(hits.len());
-    let mut withheld = Vec::new();
-    for r in hits {
-        if blocked.contains(&r.record.record_id) {
-            withheld.push(r.record.record_id);
-            continue;
-        }
-        kept.push(r.record);
-    }
+    // The same policy `lookup_name` applied, via the same loader, so this gate
+    // and the lookup the responder already did cannot disagree about what is
+    // blocked. It covers all three kinds: a blocked claim by record id, a claim
+    // whose target resource is blocked, and a claim a blocked peer published.
+    //
+    // Fails closed for the same reason as `to_publishable_resources`: an
+    // unreadable block list is not evidence that nothing is blocked.
+    let policy = match av_index::naming::NameBlockPolicy::load(conn) {
+        Ok(p) => p,
+        Err(e) => return refuse(&format!("could not read the block list: {e}")),
+    };
+
+    let candidates: Vec<av_core::types::NameRecord> = hits.into_iter().map(|h| h.record).collect();
+    let kept = match av_index::naming::retain_unblocked(conn, candidates, &policy) {
+        Ok(k) => k,
+        Err(e) => return refuse(&format!("could not apply block policy: {e}")),
+    };
+
+    let kept_ids: std::collections::HashSet<String> =
+        kept.iter().map(|r| r.record_id.clone()).collect();
+    let withheld: Vec<String> = all_ids
+        .into_iter()
+        .filter(|id| !kept_ids.contains(id))
+        .collect();
+
     (kept, withheld)
 }
 
@@ -486,6 +498,7 @@ mod tests {
                 target_canonical: Some("autonomi://aa".into()),
                 ttl_secs: 3600,
                 by_agent_id: "agent-abc".into(),
+                origin_agent_id: None,
                 timestamp: 1_700_000_000,
                 signature: vec![],
             },
@@ -527,6 +540,7 @@ mod tests {
                 target_canonical: Some("autonomi://aa".into()),
                 ttl_secs: 3600,
                 by_agent_id: "agent-abc".into(),
+                origin_agent_id: None,
                 timestamp: 1_700_000_000,
                 signature: vec![],
             },
@@ -545,5 +559,80 @@ mod tests {
             "a resource block must not touch name records"
         );
         assert!(withheld.is_empty());
+    }
+
+    fn stub_name_from(id: &str, claimed_by: &str, origin: Option<&str>) -> NameResult {
+        NameResult {
+            record: av_core::types::NameRecord {
+                schema_version: 1,
+                record_id: id.to_string(),
+                normalized_name: "svc".into(),
+                original_name: "Svc".into(),
+                record_type: av_core::types::NameRecordType::Uri,
+                target: "autonomi://aa".into(),
+                target_scheme: Some("autonomi".into()),
+                target_canonical: Some("autonomi://aa".into()),
+                ttl_secs: 3600,
+                by_agent_id: claimed_by.to_string(),
+                origin_agent_id: origin.map(str::to_string),
+                timestamp: 1_700_000_000,
+                signature: vec![],
+            },
+            score: 1.0,
+            trust_score: 1.0,
+            agreement_score: 0.0,
+            recency_score: 0.0,
+            ttl_valid: true,
+        }
+    }
+
+    fn agent_id(seed: char) -> String {
+        seed.to_string().repeat(64)
+    }
+
+    #[test]
+    fn a_blocked_peers_names_are_never_published_to_a_peer() {
+        let conn = av_store::open_in_memory().expect("open db");
+        let hits = vec![
+            stub_name_from("nr-bad", &agent_id('b'), Some(&agent_id('b'))),
+            stub_name_from("nr-good", &agent_id('g'), Some(&agent_id('g'))),
+        ];
+        block(&conn, BlockKind::Agent, &agent_id('b'));
+
+        let (publishable, withheld) = to_publishable_names(&conn, hits);
+        let ids: Vec<&str> = publishable.iter().map(|r| r.record_id.as_str()).collect();
+
+        assert_eq!(
+            ids,
+            vec!["nr-good"],
+            "a blocked peer's claim must not be re-served to another peer"
+        );
+        assert_eq!(
+            withheld,
+            vec!["nr-bad".to_string()],
+            "the withheld claim is reported, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn publishing_names_fails_closed_when_the_block_list_is_unreadable() {
+        let conn = av_store::open_in_memory().expect("open db");
+        let hits = vec![stub_name_from("nr-1", "someone", None)];
+        // Sanity: the same input is served while the database is intact.
+        assert_eq!(to_publishable_names(&conn, hits.clone()).0.len(), 1);
+
+        conn.execute_batch("DROP TABLE blocks")
+            .expect("drop blocks");
+
+        let (publishable, withheld) = to_publishable_names(&conn, hits);
+        assert!(
+            publishable.is_empty(),
+            "a failed block read must not be read as 'nothing is blocked'"
+        );
+        assert_eq!(
+            withheld.len(),
+            1,
+            "everything is withheld, and the withheld list says so"
+        );
     }
 }

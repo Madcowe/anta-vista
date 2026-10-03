@@ -131,6 +131,7 @@ fn route(
                 "/api/rate" => handlers::rate(state, &body),
                 "/api/index" => handlers::index(state, &body),
                 "/api/block" => handlers::block(state, &body),
+                "/api/purge" => handlers::purge(state, &body),
                 "/api/unblock" => handlers::unblock(state, &body),
                 "/api/listener/stop" => handlers::listener_stop(state),
                 "/api/listener/start" => handlers::listener_start(state),

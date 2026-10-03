@@ -1,5 +1,6 @@
 use av_core::types::{NameRecord, normalize_name};
 use rusqlite::{Connection, params};
+use std::collections::HashSet;
 
 use crate::{error::IndexResult, filter::SchemeFilter};
 
@@ -12,6 +13,162 @@ pub struct NameResult {
     pub agreement_score: f32,
     pub recency_score: f32,
     pub ttl_valid: bool,
+}
+
+/// Resolve a name record's target to the local `resource_id` it points at.
+///
+/// A name stores a URI, while a block is keyed on the content hash in
+/// `resources.id`, so relating the two means going through the `resources`
+/// row. Returns `Ok(None)` only when the target is genuinely not held locally,
+/// in which case there is nothing to check against.
+///
+/// A *failed* lookup is not the same answer and is returned as `Err` rather than
+/// collapsed into it. Swallowing the error would turn a broken `resources` table
+/// into "we hold nothing", which reads as "nothing to suppress" and serves
+/// exactly the name a block was meant to hide.
+fn resolve_target_resource(conn: &Connection, record: &NameRecord) -> IndexResult<Option<String>> {
+    // `target` is the form `av index` stores, both run through
+    // `av_ingest::location::normalize_uri`. `target_canonical` is the
+    // scheme-rewritten form and is the better bet for a record that arrived
+    // from a peer, which may still carry the old `ant://` prefix.
+    let candidates = [
+        Some(record.target.as_str()),
+        record.target_canonical.as_deref(),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if let Some(resource) = av_store::repo::resources::get_by_location(conn, candidate)? {
+            return Ok(Some(resource.id));
+        }
+    }
+    Ok(None)
+}
+
+/// Drop name records that point at a blocked resource.
+///
+/// Blocking a name only covers the claim. Blocking the *resource* it resolves
+/// to has to suppress the name too, otherwise a peer that resolves the name
+/// through this node is still handed the link that was just blocked — which is
+/// the opposite of what "block" means everywhere else here.
+///
+/// Shared by `lookup_name` and the responder's pre-send gate so both agree.
+///
+/// Known limit: resolution goes through the `resources` row, so this only
+/// covers names whose target we still hold. Once a blocked resource's row is
+/// deleted there is nothing left to resolve against, and a claim for that name
+/// re-supplied by a peer can be served again.
+pub fn retain_unblocked_targets(
+    conn: &Connection,
+    records: Vec<NameRecord>,
+    blocked_resources: &HashSet<String>,
+) -> IndexResult<Vec<NameRecord>> {
+    if blocked_resources.is_empty() {
+        return Ok(records);
+    }
+
+    let mut kept = Vec::with_capacity(records.len());
+    for r in records {
+        // Propagate the error rather than keeping the record on a failed read.
+        if let Some(id) = resolve_target_resource(conn, &r)?
+            && blocked_resources.contains(&id)
+        {
+            continue;
+        }
+        kept.push(r);
+    }
+    Ok(kept)
+}
+
+/// Drop name records that a blocked peer published.
+///
+/// A peer block stops the node *consulting* that peer, but a name record it sent
+/// earlier is already sitting in `name_records` and would otherwise keep
+/// resolving and keep being served to other peers. Filtering on
+/// `origin_agent_id` — the id the x0x daemon authenticated when the record
+/// arrived — is what makes the block actually complete.
+///
+/// Deliberately *not* filtered on `by_agent_id`: that is the id the sending peer
+/// wrote in its own payload, so a peer could stamp an unblocked id onto
+/// everything it sends and the block would never fire.
+///
+/// Records with no origin are kept. That covers the two cases where there is no
+/// peer to attribute: records this machine authored via `av name`, and records
+/// cached before `origin_agent_id` existed.
+pub fn retain_unblocked_agents(
+    records: Vec<NameRecord>,
+    blocked_agents: &HashSet<String>,
+) -> Vec<NameRecord> {
+    if blocked_agents.is_empty() {
+        return records;
+    }
+    records
+        .into_iter()
+        .filter(|r| match &r.origin_agent_id {
+            Some(origin) => !blocked_agents.contains(origin),
+            None => true,
+        })
+        .collect()
+}
+
+/// Every block that can affect a name record, loaded once per lookup.
+///
+/// All three kinds interact with a name, and they are independent policies, so
+/// they are read together and applied by one function. Keeping the reads in a
+/// single place is what stops `lookup_name` and the responder's pre-send gate
+/// from drifting apart and one of them quietly serving a suppressed name.
+///
+/// Fails closed by construction: `load` propagates, and every caller does the
+/// same. An unreadable `blocks` table is not evidence that nothing is blocked,
+/// and treating it as such would re-expose every name the operator suppressed.
+#[derive(Debug, Clone, Default)]
+pub struct NameBlockPolicy {
+    /// Blocked name record ids.
+    pub records: HashSet<String>,
+    /// Blocked resource ids, matched against a record's resolved target.
+    pub resources: HashSet<String>,
+    /// Blocked peer ids, matched against a record's transport origin.
+    pub agents: HashSet<String>,
+}
+
+impl NameBlockPolicy {
+    pub fn load(conn: &Connection) -> IndexResult<Self> {
+        Ok(Self {
+            records: av_store::repo::blocks::blocked_ids(
+                conn,
+                av_store::repo::blocks::BlockKind::Name,
+            )?,
+            resources: av_store::repo::blocks::blocked_ids(
+                conn,
+                av_store::repo::blocks::BlockKind::Resource,
+            )?,
+            agents: av_store::repo::blocks::blocked_ids(
+                conn,
+                av_store::repo::blocks::BlockKind::Agent,
+            )?,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty() && self.resources.is_empty() && self.agents.is_empty()
+    }
+}
+
+/// Apply all three kinds of block to a set of name records.
+///
+/// The single choke point every name-serving path goes through.
+pub fn retain_unblocked(
+    conn: &Connection,
+    records: Vec<NameRecord>,
+    policy: &NameBlockPolicy,
+) -> IndexResult<Vec<NameRecord>> {
+    let records = records
+        .into_iter()
+        .filter(|r| !policy.records.contains(&r.record_id))
+        .collect();
+
+    let records = retain_unblocked_agents(records, &policy.agents);
+    let records = retain_unblocked_targets(conn, records, &policy.resources)?;
+    Ok(records)
 }
 
 /// Look up a name exactly (case-insensitive via normalized_name).
@@ -34,15 +191,14 @@ pub fn lookup_name(
     // influence the agreement denominator or the recency range either. Loaded
     // once: `get_by_normalized_name` can return many records for one name.
     //
-    // This is what keeps a blocked name record from being served to peers: the
-    // responder answers name queries straight from `lookup_name` and does no
-    // filtering of its own afterwards.
+    // This is what keeps blocked names from being served to peers: the responder
+    // answers name queries straight from `lookup_name` and does no filtering of
+    // its own afterwards.
     //
     // Fails closed, for the same reason as `search::search_top_k`.
-    let blocked =
-        av_store::repo::blocks::blocked_ids(conn, av_store::repo::blocks::BlockKind::Name)?;
-    if !blocked.is_empty() {
-        records.retain(|r| !blocked.contains(&r.record_id));
+    let policy = NameBlockPolicy::load(conn)?;
+    if !policy.is_empty() {
+        records = retain_unblocked(conn, records, &policy)?;
         if records.is_empty() {
             return Ok(vec![]);
         }

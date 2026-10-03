@@ -40,6 +40,38 @@ targets. The caller sees all candidates with scores.
 Expired name records are penalised in ranking but not automatically deleted.
 Run periodic cleanup against the `name_records` table if storage matters.
 
+### A deleted resource's name can come back from a peer
+
+Blocking a resource suppresses the name records that point at it, so a blocked
+link cannot be handed out again under a name. That check resolves the name's
+target through the `resources` row, which means it can only recognise a target
+this machine still holds.
+
+"Block and delete" removes that row, along with the local name records, so the
+local gap is closed. But a peer that still holds the claim can re-supply it, and
+the re-supplied claim has no local resource to match against, so it will be
+served. Blocking a resource *and* deleting it is therefore not durable against a
+peer re-asserting the name. "Block, keep local copy" is durable. If you need the
+stronger guarantee, block the name record itself as well as the resource.
+
+### Names cached before transport origins were recorded cannot be attributed
+
+Blocking a peer suppresses the name records that peer published, which works by
+matching against `name_records.origin_agent_id` — the id the x0x daemon
+authenticated when the record arrived. That column was added in migration
+`006_name_origin`.
+
+Records cached before that migration have `NULL` there, and there is nothing to
+recover the sender from: the only other id in the row is `by_agent_id`, which
+the peer wrote in its own payload, so trusting it would let any peer evade a
+block by lying about who it is. Legacy rows are therefore left unfiltered, and
+a peer you blocked keeps its previously published names resolving until those
+records are replaced or the name is blocked directly.
+
+In practice this window is small — a record is re-cached from a current
+response, and re-caching rewrites the column. If it matters, purge the name
+record as well as blocking the peer.
+
 ## Trust
 
 ### Claims and peer agreement are not wired

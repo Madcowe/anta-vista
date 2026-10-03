@@ -159,6 +159,16 @@
   color: #ee0000;
 }
 
+/* The description sits under the location, and it is the text anta-vista
+   embeds — up to 800 characters of a document's own content. Keep it indented
+   like `av search` prints it, and let it wrap rather than stretch the row. */
+[data-theme="retro"] .result-desc {
+  font-family: var(--mono);
+  font-size: 13px;
+  margin: 6px 0;
+  overflow-wrap: anywhere;
+}
+
 [data-theme="retro"] .rid,
 [data-theme="retro"] .mime,
 [data-theme="retro"] .score,
@@ -166,6 +176,16 @@
 [data-theme="retro"] .status-line {
   font-family: var(--mono);
   font-size: 13px;
+}
+
+/* The peer-block blurb separates the promise from the limits with blank lines;
+   without this they collapse into one paragraph and stop reading as caveats. */
+/* `pre-line` keeps the indented identifier on its own line, so a long Autonomi
+ * location or URL does not get folded into the middle of a sentence. */
+#peer-block-blurb,
+#remove-blurb {
+  white-space: pre-line;
+  max-width: 34rem;
 }
 
 [data-theme="retro"] .command {
@@ -255,9 +275,37 @@
   flex-wrap: wrap;
 }
 
-[data-theme="retro"] .btn-block {
-  margin-left: auto;
+[data-theme="retro"] .btn-block,
+[data-theme="retro"] .btn-remove {
   font-size: 0.8rem;
+}
+
+[data-theme="retro"] .results-note {
+  font-size: 0.8rem;
+  margin: 10px 0 0;
+  min-height: 1.2em;
+}
+
+[data-theme="retro"] .results-note[data-tone="ok"] {
+  color: var(--ok);
+}
+
+[data-theme="retro"] .results-note[data-tone="warn"] {
+  color: var(--warn);
+}
+
+[data-theme="retro"] .result-deny {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+/* Confirms the removal, which deletes data and cannot be undone here. */
+[data-theme="retro"] .btn-danger {
+  background: var(--warn);
+  border-color: var(--warn);
+  color: #fff;
 }
 
 [data-theme="retro"] .status-blocks h3 {

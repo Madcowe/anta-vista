@@ -38,13 +38,17 @@ pub fn run(
     // without blocking the peer.
     for (peer, payload) in &resolve_res.network_results {
         for record in &payload.results {
-            if av_store::repo::blocks::is_blocked(
+            // Fail closed. Returning `false` here on a database error would be
+            // indistinguishable from "not blocked", and the effect is to cache
+            // every record in the response — so a transient read failure would
+            // quietly reintroduce names the operator suppressed.
+            let record_blocked = av_store::repo::blocks::is_blocked(
                 &conn,
                 av_store::repo::blocks::BlockKind::Name,
                 &record.record_id,
             )
-            .unwrap_or(false)
-            {
+            .map_err(|e| CliError::Database(e.to_string()))?;
+            if record_blocked {
                 tracing::debug!(
                     record_id = %record.record_id,
                     peer = %crate::output::abbrev(peer, 12),
@@ -52,10 +56,25 @@ pub fn run(
                 );
                 continue;
             }
+
+            // `peer` is the id the x0x daemon authenticated — `network.rs` only
+            // ever populates `network_results` from `msg.sender` /
+            // `event.origin` after an `accept_from` gate. It is deliberately not
+            // `record.by_agent_id`, which the sending peer chose and could set
+            // to any value, including an origin that is not blocked.
+            //
             // Validate signature first (if possible)
             // For MVP/simplicity we assume valid if serialize/deserialize matches,
             // or we insert and let the store handle unique constraints.
-            let _ = av_store::repo::names::insert(&conn, record);
+            if let Err(e) =
+                av_store::repo::names::insert_with_origin(&conn, record, Some(peer.as_str()))
+            {
+                tracing::debug!(
+                    record_id = %record.record_id,
+                    peer = %crate::output::abbrev(peer, 12),
+                    "could not cache network name record: {e}"
+                );
+            }
         }
     }
 

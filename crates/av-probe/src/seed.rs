@@ -185,6 +185,7 @@ fn init_seed_db(conn: &Connection, provider: &dyn EmbeddingProvider, agent_id: &
         target_canonical: Some(format!("ant://{}", agent_id)),
         ttl_secs: 3600,
         by_agent_id: agent_id.to_string(),
+        origin_agent_id: None,
         timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -205,6 +206,7 @@ fn init_seed_db(conn: &Connection, provider: &dyn EmbeddingProvider, agent_id: &
         target_canonical: Some(format!("ant://{}", agent_id)),
         ttl_secs: 3600,
         by_agent_id: agent_id.to_string(),
+        origin_agent_id: None,
         timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

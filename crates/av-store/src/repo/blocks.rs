@@ -171,3 +171,70 @@ pub fn delete_resource_cascade(conn: &Connection, resource_id: &str) -> SqlResul
     let n = conn.execute("DELETE FROM resources WHERE id = ?1", params![resource_id])?;
     Ok(n > 0)
 }
+
+/// What `delete_resource_cascade_with_names` removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceCascade {
+    /// Whether a `resources` row actually went away.
+    pub resource_removed: bool,
+    /// Name records that pointed at the resource, dropped with it.
+    pub names_removed: usize,
+}
+
+/// Delete a resource, the rows that cascade from it, and any local name claim
+/// pointing at it.
+///
+/// The name rows are not foreign keys — a claim stores a URI, not a `resources`
+/// id — so they would otherwise be left behind, still answering to a name whose
+/// only local resolution is gone. Once this returns, a peer that re-supplies
+/// that name is no longer the local gap it was.
+///
+/// The location is read before the delete, and the whole thing runs in one
+/// transaction so a failure cannot leave a resource gone but its claims intact.
+pub fn delete_resource_cascade_with_names(
+    conn: &Connection,
+    resource_id: &str,
+) -> SqlResult<ResourceCascade> {
+    // `BEGIN IMMEDIATE`, not a deferred transaction: this always writes, and a
+    // deferred transaction that starts by reading and later upgrades to a write
+    // fails with SQLITE_BUSY_SNAPSHOT if any other connection committed in
+    // between. The web server holds a connection per request, so that window is
+    // routinely open. `busy_timeout` is set on every connection in
+    // `av_store::db`; without it, taking the write lock up front would fail
+    // immediately instead of waiting.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    let outcome = (|| -> SqlResult<ResourceCascade> {
+        let location: Option<String> = conn
+            .query_row(
+                "SELECT location FROM resources WHERE id = ?1",
+                params![resource_id],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let names_removed = match location.as_deref() {
+            Some(loc) => crate::repo::names::delete_by_target(conn, loc)?,
+            None => 0,
+        };
+
+        let n = conn.execute("DELETE FROM resources WHERE id = ?1", params![resource_id])?;
+        Ok(ResourceCascade {
+            resource_removed: n > 0,
+            names_removed,
+        })
+    })();
+
+    match outcome {
+        Ok(cascade) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(cascade)
+        }
+        Err(e) => {
+            // Never leave a transaction open on a connection that is handed back
+            // to a per-request pool.
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}

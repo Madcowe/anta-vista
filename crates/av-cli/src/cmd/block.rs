@@ -223,10 +223,14 @@ pub fn block_subject(
         // Count the dependent rows the delete will take with it, so the report
         // states what was actually lost instead of implying only the embedding
         // went. `resources` has three `ON DELETE CASCADE` dependants:
-        // `embeddings`, `feedback_events` and `relevance_judgments`.
+        // `embeddings`, `feedback_events` and `relevance_judgments`. Name
+        // records are not foreign keys but are dropped with the resource they
+        // point at, so they are counted here too.
         cascaded = dependent_row_count(conn, &subject_id);
-        removed_local = blocks::delete_resource_cascade(conn, &subject_id)
+        let cascade = blocks::delete_resource_cascade_with_names(conn, &subject_id)
             .map_err(|e| CliError::Database(e.to_string()))?;
+        removed_local = cascade.resource_removed;
+        cascaded += cascade.names_removed;
     }
 
     let x0x_applied = if x0x && kind == BlockKind::Agent {

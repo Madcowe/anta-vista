@@ -164,6 +164,7 @@ fn test_name_lookup_basic() {
         ),
         ttl_secs: 3600,
         by_agent_id: "agent-abc".into(),
+        origin_agent_id: None,
         timestamp: 1_700_000_000,
         signature: vec![],
     };
@@ -204,6 +205,7 @@ fn test_name_lookup_scheme_filter() {
         ),
         ttl_secs: 3600,
         by_agent_id: "agent-a".into(),
+        origin_agent_id: None,
         timestamp: 1_700_000_000,
         signature: vec![],
     };
@@ -218,6 +220,7 @@ fn test_name_lookup_scheme_filter() {
         target_canonical: Some("https://example.com/my-app".into()),
         ttl_secs: 3600,
         by_agent_id: "agent-b".into(),
+        origin_agent_id: None,
         timestamp: 1_700_000_001,
         signature: vec![],
     };
@@ -509,6 +512,7 @@ fn test_blocked_name_record_does_not_resolve() {
         ),
         ttl_secs: 3600,
         by_agent_id: "agent-abc".into(),
+        origin_agent_id: None,
         timestamp: 1_700_000_000,
         signature: vec![],
     };
@@ -546,6 +550,30 @@ fn test_blocked_name_record_does_not_resolve() {
     );
 }
 
+/// Put a `resources` row at a real location, so a name record has something to
+/// resolve against.
+///
+/// The name-to-resource bridge is the whole point of these tests, so the row has
+/// to be built the way production builds it: `resources.location` is the
+/// normalized URI, and that is the string a name's `target` is matched against.
+fn index_resource_at(conn: &rusqlite::Connection, id: &str, location: &str) {
+    use av_core::types::{ResourceDescriptor, ResourceKind};
+
+    let descriptor = ResourceDescriptor {
+        id: id.to_string(),
+        kind: ResourceKind::Text,
+        location: location.to_string(),
+        location_scheme: Some(location.split(':').next().unwrap_or("").to_string()),
+        location_canonical: Some(location.to_string()),
+        mime_type: "text/plain".into(),
+        filename: None,
+        metadata_json: serde_json::json!({}),
+        description_text: "a description".into(),
+        created_at: 1_700_000_000,
+    };
+    repo::resources::insert(conn, &descriptor).expect("insert resource");
+}
+
 #[test]
 fn test_blocking_one_name_record_does_not_hide_a_conflicting_record() {
     let (conn, provider) = setup();
@@ -569,6 +597,7 @@ fn test_blocking_one_name_record_does_not_hide_a_conflicting_record() {
                 target_canonical: Some("autonomi://aa".into()),
                 ttl_secs: 3600,
                 by_agent_id: agent.into(),
+                origin_agent_id: None,
                 timestamp: 1_700_000_000,
                 signature: vec![],
             },
@@ -590,5 +619,442 @@ fn test_blocking_one_name_record_does_not_hide_a_conflicting_record() {
         ids,
         vec!["nr-good"],
         "only the blocked record is hidden; the other claim still resolves"
+    );
+}
+
+/// A 64-hex agent id, which is the only shape `av block --agent` accepts.
+fn agent_id(seed: char) -> String {
+    seed.to_string().repeat(64)
+}
+
+/// Store a name record as if it had been cached from `origin`, with
+/// `by_agent_id` set independently so tests can make the two disagree.
+fn cache_name_from(
+    conn: &rusqlite::Connection,
+    record_id: &str,
+    name: &str,
+    target: &str,
+    by_agent_id: &str,
+    origin: Option<&str>,
+) {
+    repo::names::insert_with_origin(
+        conn,
+        &NameRecord {
+            schema_version: 1,
+            record_id: record_id.into(),
+            normalized_name: normalize_name(name),
+            original_name: name.into(),
+            record_type: NameRecordType::Uri,
+            target: target.into(),
+            target_scheme: Some("autonomi".into()),
+            target_canonical: Some(target.into()),
+            ttl_secs: 3600,
+            by_agent_id: by_agent_id.into(),
+            origin_agent_id: origin.map(str::to_string),
+            timestamp: 1_700_000_000,
+            signature: vec![],
+        },
+        origin,
+    )
+    .expect("insert name record");
+}
+
+#[test]
+fn a_name_cached_from_a_blocked_peer_stops_resolving() {
+    let (conn, provider) = setup();
+
+    cache_name_from(
+        &conn,
+        "nr-from-bad",
+        "shared",
+        "autonomi://bb",
+        &agent_id('b'),
+        Some(&agent_id('b')),
+    );
+    let index = LocalIndex::new(&conn, &provider);
+    assert_eq!(
+        index
+            .resolve_name("shared", &SchemeFilter::default())
+            .expect("lookup")
+            .len(),
+        1,
+        "control: the name must resolve before the peer is blocked"
+    );
+
+    block(&conn, repo::blocks::BlockKind::Agent, &agent_id('b'));
+
+    assert!(
+        index
+            .resolve_name("shared", &SchemeFilter::default())
+            .expect("lookup")
+            .is_empty(),
+        "a name the blocked peer published must stop resolving"
+    );
+    // The row survives, like every other kind of block. Unblocking restores it
+    // without another round trip.
+    assert!(
+        repo::names::get_by_normalized_name(&conn, "shared")
+            .expect("get")
+            .iter()
+            .any(|r| r.record_id == "nr-from-bad"),
+        "blocking a peer must not delete the names it published"
+    );
+}
+
+#[test]
+fn a_peer_cannot_hide_behind_an_id_it_wrote_itself() {
+    let (conn, provider) = setup();
+
+    // The peer claims to be `honest`, but x0x authenticated it as `liar`. Only
+    // the second is usable: `by_agent_id` is inside the payload the sender chose,
+    // so a block keyed on it is opt-out.
+    cache_name_from(
+        &conn,
+        "nr-liar",
+        "sneaky",
+        "autonomi://cc",
+        &agent_id('h'),
+        Some(&agent_id('l')),
+    );
+
+    let index = LocalIndex::new(&conn, &provider);
+    block(&conn, repo::blocks::BlockKind::Agent, &agent_id('l'));
+
+    assert!(
+        index
+            .resolve_name("sneaky", &SchemeFilter::default())
+            .expect("lookup")
+            .is_empty(),
+        "the block must follow the authenticated origin, not the self-reported id"
+    );
+}
+
+#[test]
+fn blocking_a_claimed_id_does_not_silence_a_different_real_origin() {
+    let (conn, provider) = setup();
+
+    // The mirror of the previous test: the record claims to be `liar` but
+    // actually came from `honest`. Blocking the claimed id must leave it alone,
+    // or blocking one peer would silence unrelated names.
+    cache_name_from(
+        &conn,
+        "nr-honest",
+        "sneaky",
+        "autonomi://dd",
+        &agent_id('l'),
+        Some(&agent_id('h')),
+    );
+
+    let index = LocalIndex::new(&conn, &provider);
+    block(&conn, repo::blocks::BlockKind::Agent, &agent_id('l'));
+
+    assert_eq!(
+        index
+            .resolve_name("sneaky", &SchemeFilter::default())
+            .expect("lookup")
+            .len(),
+        1,
+        "a self-reported id must not be enough to censor a record"
+    );
+}
+
+#[test]
+fn blocking_every_peer_leaves_locally_authored_names_alone() {
+    let (conn, provider) = setup();
+
+    // `av name` writes records with no peer behind them. Blocking peers must not
+    // take the local namespace with them, or a user could silence their own
+    // names by blocking an unrelated agent.
+    cache_name_from(
+        &conn,
+        "nr-mine",
+        "mine",
+        "autonomi://ee",
+        &agent_id('m'),
+        None,
+    );
+
+    let index = LocalIndex::new(&conn, &provider);
+    for seed in ['a', 'b', 'c'] {
+        block(&conn, repo::blocks::BlockKind::Agent, &agent_id(seed));
+    }
+
+    assert_eq!(
+        index
+            .resolve_name("mine", &SchemeFilter::default())
+            .expect("lookup")
+            .len(),
+        1,
+        "a record with no origin has no peer to block and must keep resolving"
+    );
+}
+
+#[test]
+fn blocking_a_peer_only_hides_its_own_claims() {
+    let (conn, provider) = setup();
+
+    // Two peers claim the same name, as happens whenever a name is contested.
+    // Names resolve by exact normalized match with no ranking, so an agent block
+    // has to be per record — otherwise blocking one peer censors the other's
+    // perfectly good claim too.
+    cache_name_from(
+        &conn,
+        "nr-from-bad",
+        "contested",
+        "autonomi://ff",
+        &agent_id('b'),
+        Some(&agent_id('b')),
+    );
+    cache_name_from(
+        &conn,
+        "nr-from-good",
+        "contested",
+        "autonomi://11",
+        &agent_id('g'),
+        Some(&agent_id('g')),
+    );
+
+    let index = LocalIndex::new(&conn, &provider);
+    block(&conn, repo::blocks::BlockKind::Agent, &agent_id('b'));
+
+    let ids: Vec<String> = index
+        .resolve_name("contested", &SchemeFilter::default())
+        .expect("lookup")
+        .iter()
+        .map(|r| r.record.record_id.clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["nr-from-good"],
+        "only the blocked peer's claim is hidden"
+    );
+}
+
+#[test]
+fn an_unreadable_block_list_serves_no_names() {
+    let (conn, provider) = setup();
+
+    cache_name_from(
+        &conn,
+        "nr-1",
+        "svc",
+        "autonomi://22",
+        &agent_id('a'),
+        Some(&agent_id('a')),
+    );
+    // Prove the name resolves while the database is intact.
+    let index = LocalIndex::new(&conn, &provider);
+    assert_eq!(
+        index
+            .resolve_name("svc", &SchemeFilter::default())
+            .expect("lookup")
+            .len(),
+        1
+    );
+
+    // Drop the table the way a corrupted or half-migrated database would. A read
+    // that errors is not evidence that nothing is blocked, so the lookup has to
+    // fail rather than return the name.
+    conn.execute_batch("DROP TABLE blocks")
+        .expect("drop blocks");
+
+    assert!(
+        index.resolve_name("svc", &SchemeFilter::default()).is_err(),
+        "a failed block read must not read as 'nothing is blocked'"
+    );
+}
+
+#[test]
+fn blocking_a_resource_suppresses_the_name_that_points_at_it() {
+    let (conn, provider) = setup();
+
+    index_resource_at(&conn, "res-blocked", "autonomi://example/blocked");
+    index_resource_at(&conn, "res-kept", "autonomi://example/kept");
+
+    {
+        use av_core::types::NameRecordType;
+        for (id, name, target) in [
+            ("nr-blocked", "blocked-svc", "autonomi://example/blocked"),
+            ("nr-kept", "kept-svc", "autonomi://example/kept"),
+        ] {
+            repo::names::insert(
+                &conn,
+                &NameRecord {
+                    schema_version: 1,
+                    record_id: id.into(),
+                    normalized_name: normalize_name(name),
+                    original_name: name.into(),
+                    record_type: NameRecordType::Uri,
+                    target: target.into(),
+                    target_scheme: Some("autonomi".into()),
+                    target_canonical: Some(target.into()),
+                    ttl_secs: 3600,
+                    by_agent_id: "agent-abc".into(),
+                    origin_agent_id: None,
+                    timestamp: 1_700_000_000,
+                    signature: vec![],
+                },
+            )
+            .expect("insert name record");
+        }
+    }
+
+    let index = LocalIndex::new(&conn, &provider);
+    assert_eq!(
+        index
+            .resolve_name("blocked-svc", &SchemeFilter::default())
+            .expect("lookup")
+            .len(),
+        1,
+        "control: the name resolves while its resource is unblocked"
+    );
+
+    block(&conn, repo::blocks::BlockKind::Resource, "res-blocked");
+
+    assert!(
+        index
+            .resolve_name("blocked-svc", &SchemeFilter::default())
+            .expect("lookup")
+            .is_empty(),
+        "a name must not hand out a resource the operator blocked"
+    );
+    assert_eq!(
+        index
+            .resolve_name("kept-svc", &SchemeFilter::default())
+            .expect("lookup")
+            .len(),
+        1,
+        "blocking one resource must not censor an unrelated name"
+    );
+}
+
+#[test]
+fn a_name_reaches_its_resource_through_the_legacy_scheme_alias() {
+    let (conn, provider) = setup();
+
+    // The row is stored under the canonical scheme, as `av index` does, but the
+    // record arrived from a peer still carrying `ant://`. The bridge has to try
+    // `target_canonical` too, or a legacy record would slip past the block and
+    // hand out the very link that was blocked.
+    index_resource_at(&conn, "res-a", "autonomi://example/doc");
+
+    use av_core::types::NameRecordType;
+    repo::names::insert(
+        &conn,
+        &NameRecord {
+            schema_version: 1,
+            record_id: "nr-legacy".into(),
+            normalized_name: normalize_name("legacy-svc"),
+            original_name: "legacy-svc".into(),
+            record_type: NameRecordType::Uri,
+            target: "ant://example/doc".into(),
+            target_scheme: Some("ant".into()),
+            target_canonical: Some("autonomi://example/doc".into()),
+            ttl_secs: 3600,
+            by_agent_id: "agent-abc".into(),
+            origin_agent_id: None,
+            timestamp: 1_700_000_000,
+            signature: vec![],
+        },
+    )
+    .expect("insert name record");
+
+    let index = LocalIndex::new(&conn, &provider);
+    block(&conn, repo::blocks::BlockKind::Resource, "res-a");
+
+    assert!(
+        index
+            .resolve_name("legacy-svc", &SchemeFilter::default())
+            .expect("lookup")
+            .is_empty(),
+        "the target must be matched through the canonical scheme"
+    );
+}
+
+#[test]
+fn blocking_a_resource_the_name_does_not_hold_leaves_the_namespace_intact() {
+    let (conn, provider) = setup();
+
+    // A name whose target this machine never held. There is nothing to match the
+    // block against, so the record stays resolvable. Dropping it instead would
+    // let one block censor every name in the local namespace that points
+    // somewhere else.
+    use av_core::types::NameRecordType;
+    repo::names::insert(
+        &conn,
+        &NameRecord {
+            schema_version: 1,
+            record_id: "nr-elsewhere".into(),
+            normalized_name: normalize_name("elsewhere"),
+            original_name: "elsewhere".into(),
+            record_type: NameRecordType::Uri,
+            target: "autonomi://not-held-locally".into(),
+            target_scheme: Some("autonomi".into()),
+            target_canonical: Some("autonomi://not-held-locally".into()),
+            ttl_secs: 3600,
+            by_agent_id: "agent-abc".into(),
+            origin_agent_id: None,
+            timestamp: 1_700_000_000,
+            signature: vec![],
+        },
+    )
+    .expect("insert name record");
+
+    let index = LocalIndex::new(&conn, &provider);
+    block(
+        &conn,
+        repo::blocks::BlockKind::Resource,
+        "res-something-else",
+    );
+
+    assert_eq!(
+        index
+            .resolve_name("elsewhere", &SchemeFilter::default())
+            .expect("lookup")
+            .len(),
+        1,
+        "an unresolvable target is not the same as a blocked one"
+    );
+}
+
+#[test]
+fn a_broken_resources_table_fails_closed_rather_than_serving_the_name() {
+    let (conn, provider) = setup();
+
+    index_resource_at(&conn, "res-a", "autonomi://example/doc");
+
+    use av_core::types::NameRecordType;
+    repo::names::insert(
+        &conn,
+        &NameRecord {
+            schema_version: 1,
+            record_id: "nr-1".into(),
+            normalized_name: normalize_name("svc"),
+            original_name: "svc".into(),
+            record_type: NameRecordType::Uri,
+            target: "autonomi://example/doc".into(),
+            target_scheme: Some("autonomi".into()),
+            target_canonical: Some("autonomi://example/doc".into()),
+            ttl_secs: 3600,
+            by_agent_id: "agent-abc".into(),
+            origin_agent_id: None,
+            timestamp: 1_700_000_000,
+            signature: vec![],
+        },
+    )
+    .expect("insert name record");
+
+    let index = LocalIndex::new(&conn, &provider);
+    block(&conn, repo::blocks::BlockKind::Resource, "res-a");
+
+    // With a resource block in force the bridge has to consult `resources`.
+    // If that read fails, treating the error as "target not held locally" would
+    // keep the record and serve the exact link the block exists to hide.
+    conn.execute_batch("DROP TABLE resources")
+        .expect("drop resources");
+
+    assert!(
+        index.resolve_name("svc", &SchemeFilter::default()).is_err(),
+        "a failed target lookup must not be read as 'nothing to suppress'"
     );
 }

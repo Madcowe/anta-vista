@@ -138,6 +138,26 @@ pub struct NameRecord {
     pub target_canonical: Option<String>,
     pub ttl_secs: u32,
     pub by_agent_id: String,
+    /// The transport-authenticated peer this record was cached from, or `None`
+    /// when this machine authored it.
+    ///
+    /// `by_agent_id` is whatever the publishing peer wrote in its own payload,
+    /// so it is self-reported and worthless for blocking — a peer would simply
+    /// claim a different id. This holds the id the x0x daemon authenticated
+    /// (`DirectMessage::sender` / `IncomingEvent::origin`), which a peer cannot
+    /// forge, and is what agent blocks are matched against.
+    ///
+    /// `#[serde(skip)]` is load-bearing rather than tidiness: `NameRecord` is
+    /// carried inside `NameResponsePayload` and `NameClaimPayload`, so without
+    /// it a peer could stamp any origin onto its own record — blaming another
+    /// agent, or naming an origin that is not blocked. Only the local cache
+    /// path sets this, and only from an authenticated sender.
+    ///
+    /// `None` for locally authored records, and for records cached before this
+    /// column existed. Those have no peer to attribute, so agent blocks must
+    /// leave them alone.
+    #[serde(skip)]
+    pub origin_agent_id: Option<String>,
     pub timestamp: i64,
     pub signature: Vec<u8>,
 }
@@ -287,6 +307,10 @@ mod tests {
             target_canonical: None,
             ttl_secs: 3600,
             by_agent_id: "agent-xyz".into(),
+            // `None`, not a value: the authenticated origin is deliberately
+            // absent from the wire, so a roundtrip cannot preserve it. See
+            // `origin_tests` for the guarantee this protects.
+            origin_agent_id: None,
             timestamp: 1_700_000_004,
             signature: vec![0xca, 0xfe],
         };
@@ -325,5 +349,78 @@ mod tests {
         assert_eq!(normalize_scheme("ANT"), "autonomi");
         assert_eq!(normalize_scheme("autonomi"), "autonomi");
         assert_eq!(normalize_scheme("https"), "https");
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn record() -> NameRecord {
+        NameRecord {
+            schema_version: 1,
+            record_id: "nr-1".into(),
+            normalized_name: "svc".into(),
+            original_name: "svc".into(),
+            record_type: NameRecordType::Uri,
+            target: "autonomi://abc".into(),
+            target_scheme: Some("autonomi".into()),
+            target_canonical: Some("autonomi://abc".into()),
+            ttl_secs: 3600,
+            by_agent_id: "b".repeat(64),
+            origin_agent_id: Some("a".repeat(64)),
+            timestamp: 1_700_000_000,
+            signature: vec![],
+        }
+    }
+
+    #[test]
+    fn origin_never_travels_on_the_wire() {
+        // If this ever serializes, a peer can stamp any origin onto its own
+        // record: frame another agent for something it never sent, or name an
+        // origin that is not blocked. The whole column exists to stop that, so
+        // the guarantee is pinned here rather than left to a comment.
+        let json = serde_json::to_value(record()).expect("serialize");
+        assert!(
+            json.get("origin_agent_id").is_none(),
+            "origin_agent_id must never be serialized: {json}"
+        );
+    }
+
+    #[test]
+    fn a_peer_cannot_set_its_own_origin_by_sending_the_field() {
+        // A hostile payload that includes the field anyway must deserialize to
+        // `None`, not to the value the sender chose.
+        let hostile = serde_json::json!({
+            "schema_version": 1,
+            "record_id": "nr-hostile",
+            "normalized_name": "svc",
+            "original_name": "svc",
+            "record_type": "Uri",
+            "target": "autonomi://abc",
+            "target_scheme": "autonomi",
+            "target_canonical": "autonomi://abc",
+            "ttl_secs": 3600,
+            "by_agent_id": "c".repeat(64),
+            "origin_agent_id": "victim".repeat(8),
+            "timestamp": 1_700_000_000,
+            "signature": [],
+        });
+
+        let parsed: NameRecord = serde_json::from_value(hostile).expect("deserialize");
+        assert_eq!(
+            parsed.origin_agent_id, None,
+            "a sender-chosen origin must be discarded"
+        );
+        assert_eq!(parsed.by_agent_id, "c".repeat(64));
+    }
+
+    #[test]
+    fn by_agent_id_is_carried_but_origin_is_not() {
+        // The contrast that matters: the self-reported id survives (it is useful
+        // for display and trust) and the authenticated one does not.
+        let value: Value = serde_json::to_value(record()).expect("serialize");
+        assert_eq!(value["by_agent_id"], Value::String("b".repeat(64)));
     }
 }

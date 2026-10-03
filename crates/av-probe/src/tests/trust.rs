@@ -50,6 +50,7 @@ pub fn test_unknown_trust(
         target_canonical: Some("ant://trust-test-loc".to_string()),
         ttl_secs: 3600,
         by_agent_id: peer_id.clone(),
+        origin_agent_id: None,
         timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

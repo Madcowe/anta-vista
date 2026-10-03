@@ -46,6 +46,7 @@ const ui = {
   resultsSection: el('results-section'),
   resultsCount: el('results-count'),
   resultsEmpty: el('results-empty'),
+  resultsNote: el('results-note'),
   addForm: el('add-form'),
   addStatus: el('add-status'),
   template: el('result-template'),
@@ -59,6 +60,12 @@ const ui = {
   blockDelete: el('block-dialog').querySelector('[data-role="block-delete"]'),
   blockTitle: el('block-title'),
   blockBlurb: el('block-blurb'),
+  recommendDialog: el('recommend-dialog'),
+  peerBlockDialog: el('peer-block-dialog'),
+  peerBlockBlurb: el('peer-block-blurb'),
+  removeDialog: el('remove-dialog'),
+  removeTitle: el('remove-title'),
+  removeBlurb: el('remove-blurb'),
   dialogRun: el('install-run'),
 };
 
@@ -144,9 +151,63 @@ function setCount(text) {
   ui.resultsCount.textContent = text;
 }
 
+/* Say what just happened, outside the result rows.
+ *
+ * Removing or blocking a result takes its whole row, and the status line that
+ * would have reported the outcome lives inside that row. Reporting it here is
+ * the only way the user finds out whether the click did anything. */
+function setResultsNote(message, tone) {
+  ui.resultsNote.textContent = message || '';
+  ui.resultsNote.dataset.tone = tone || '';
+}
+
+/* Recount what is left on the page after rows have been taken off it. */
+function recountResults() {
+  const left = ui.results.children.length;
+  ui.resultsEmpty.hidden = left > 0;
+  setCount(
+    left === 0
+      ? `Nothing left for \u201c${lastQuery}\u201d`
+      : `${left} result${left === 1 ? '' : 's'} for \u201c${lastQuery}\u201d`
+  );
+}
+
+/* Take a result off the page and keep the count honest, without re-running the
+ * search.
+ *
+ * Re-querying was the honest way to show what a *fresh* search returns, but it
+ * is the wrong tool here: the user just asked for this link to be gone, and
+ * asking the network again is both slower and a second chance for a peer to
+ * hand back the thing that was just removed. The row is the truth we already
+ * have. */
+function dropResult(node, message, tone) {
+  node.remove();
+  recountResults();
+  setResultsNote(message, tone);
+}
+
+/* Drop every result this page is showing that came from `agent`.
+ *
+ * Blocking a peer is a statement about the peer, not about one link, so every
+ * row it supplied goes at once. Rows that are also local results survive,
+ * because a block does not delete the local copy and the user still has it. */
+function dropResultsFromAgent(agent) {
+  let removed = 0;
+  for (const node of Array.from(ui.results.children)) {
+    const agents = node.dataset.agentIds ? node.dataset.agentIds.split(',') : [];
+    if (!agents.includes(agent)) continue;
+    if (node.dataset.source === 'local') continue;
+    node.remove();
+    removed += 1;
+  }
+  if (removed === 0) return;
+  recountResults();
+}
+
 function renderResults(results) {
   ui.results.replaceChildren();
   ui.resultsEmpty.hidden = results.length > 0;
+  setResultsNote('', '');
 
   if (results.length === 0) {
     setCount(`No results for \u201c${lastQuery}\u201d`);
@@ -168,18 +229,43 @@ function renderResult(result) {
   badge.textContent = source;
   badge.dataset.source = source;
 
+  /* On the row as well as the badge, so a later action can decide what this
+   * result is without re-reading the badge, and so `dropResultsFromAgent` can
+   * tell a network row from a local one. */
+  node.dataset.source = source;
+  node.dataset.agentIds = (Array.isArray(result.agent_ids) ? result.agent_ids : [])
+    .filter(Boolean)
+    .join(',');
+
+  /* Match the CLI's information order: identifier as the heading, description
+   * indented underneath.
+   *
+   * This used to branch on the location's scheme rather than on the result's
+   * meaning, so the two layouts disagreed: an `http(s)` result used the
+   * *description* as its link text and never displayed the URL at all, while an
+   * Autonomi result showed the location with the description below. `av search`
+   * has always printed the location first for both, so the browser does too —
+   * one rule, one layout.
+   *
+   * A name result is the one case that inverts, and for the same reason the CLI
+   * inverts it: the name is the human-facing identifier and the location is the
+   * target it resolves to ("name → target"). Swapping them here would hide the
+   * thing the user actually searched for. */
+  const location = result.location || '';
+  const heading = source === 'name' ? result.description || location : location;
+  const detail = source === 'name' ? location : result.description || '';
+
   /* Autonomi locations are not openable from the browser yet. Rather than
    * link to a scheme nothing handles, show the location as text and let the
    * open/download path be filled in once the server can fetch it. */
-  const location = result.location || '';
   const title = pick('title');
   if (/^https?:\/\//i.test(location)) {
-    title.textContent = result.description || location;
+    title.textContent = heading;
     title.href = location;
   } else {
     const span = document.createElement('span');
     span.className = 'result-loc';
-    span.textContent = location;
+    span.textContent = heading;
     /* Say why it is not a link, rather than leaving the user to guess. */
     span.title =
       'Autonomi locations cannot be opened or downloaded yet: the server has no ' +
@@ -188,10 +274,7 @@ function renderResult(result) {
     node.classList.add('is-locatable');
   }
 
-  pick('desc').textContent =
-    result.description && result.description !== title.textContent
-      ? result.description
-      : '';
+  pick('desc').textContent = detail && detail !== heading ? detail : '';
 
   const breakdown = result.score_breakdown;
   const score = Number(result.score || 0);
@@ -207,8 +290,9 @@ function renderResult(result) {
   pick('rid').textContent = `id ${(result.resource_id || '').slice(0, 16)}`;
   pick('mime').textContent = result.mime_type || '';
 
-  wireRating(node, result, pick('rate-status'));
+  wireRecommend(node, result, pick('rate-status'));
   wireBlock(node, result, pick('rate-status'), pick('block'));
+  wireRemove(node, result, pick('rate-status'), pick('remove'));
   return node;
 }
 
@@ -255,6 +339,13 @@ function wireBlock(node, result, statusEl, button) {
       agentBtn.textContent = `Block peer ${agent.slice(0, 8)}`;
       agentBtn.title = `Stop using answers from ${agent} on this machine`;
       agentBtn.addEventListener('click', async () => {
+        /* Blocking a peer is a judgement about one node's behaviour, so the
+         * button that makes it should say what it does and, more importantly,
+         * what it does not: a two-word label cannot convey that this stops
+         * consulting the peer without disconnecting it, and without deleting
+         * anything already on this machine. */
+        if (!(await askPeerBlock(agent))) return; // cancelled
+
         agentBtn.disabled = true;
         setStatus(statusEl, 'Blocking peer\u2026', '');
         try {
@@ -263,10 +354,17 @@ function wireBlock(node, result, statusEl, button) {
             subject_id: agent,
             reason: `peer of a search result for \u201c${lastQuery}\u201d`,
           });
-          /* A peer block drops its answers, so the result list is now stale.
-           * Re-running the search is the honest way to show what is left. */
-          setStatus(statusEl, `Blocked peer ${agent.slice(0, 8)}. Re-running search\u2026`, 'ok');
-          ui.form.requestSubmit();
+          /* A peer block drops its answers, so the results it supplied are no
+           * longer what this machine would return. Take them off the page
+           * rather than re-asking the network, which is the step that could
+           * hand the same answers back. */
+          dropResultsFromAgent(agent);
+          setResultsNote(
+            `Blocked peer ${agent.slice(0, 8)}. Its answers were removed from these results. ` +
+              'It can still reach this node \u2014 use "av block --agent ' +
+              `${agent} --x0x" to drop it at the transport too.`,
+            'ok'
+          );
         } catch (err) {
           setStatus(statusEl, err.message, 'bad');
           agentBtn.disabled = false;
@@ -296,22 +394,22 @@ function wireBlock(node, result, statusEl, button) {
 
       if (!data.blocked) {
         setStatus(statusEl, 'Already blocked \u2014 nothing changed.', 'warn');
-      } else if (data.removed_local) {
-        setStatus(
-          statusEl,
-          `Blocked and removed the local copy (${data.cascaded} related row${
-            data.cascaded === 1 ? '' : 's'
-          } deleted). Re-running search\u2026`,
-          'ok'
-        );
-      } else {
-        setStatus(statusEl, 'Blocked. Re-running search\u2026', 'ok');
+        return;
       }
 
-      /* A block changes what this machine will show, so the rendered results
-       * are stale by definition. Re-run rather than patching the DOM, so the
-       * user sees exactly what a fresh search would return. */
-      ui.form.requestSubmit();
+      /* A blocked resource is never served again, and never reappears from a
+       * peer, so the row is not merely stale \u2014 it is wrong. Drop it. The
+       * local copy may still exist ("Block, keep local copy"), but this page
+       * is showing what a search returns, and this will not be in it. */
+      dropResult(
+        node,
+        data.removed_local
+          ? `Blocked and deleted the local copy (${data.cascaded} related row${
+              data.cascaded === 1 ? '' : 's'
+            } went with it). This cannot be undone by unblocking.`
+          : 'Blocked. This result will not be shown or served again on this machine.',
+        'ok'
+      );
     } catch (err) {
       setStatus(statusEl, err.message, 'bad');
       button.disabled = false;
@@ -351,21 +449,34 @@ function askBlock(target) {
   });
 }
 
-function wireRating(node, result, statusEl) {
+function wireRecommend(node, result, statusEl) {
   const source = result.source || 'local';
+  const buttons = node.querySelectorAll('.btn-rate');
 
-  for (const button of node.querySelectorAll('.btn-rate')) {
+  /* Feedback rows hang off indexed resources, so a rating about a name record
+   * has nothing to attach to. Hide the control rather than leave a button that
+   * can only ever report that it does not work. */
+  if (source === 'name') {
+    for (const button of buttons) button.hidden = true;
+    return;
+  }
+
+  for (const button of buttons) {
     button.addEventListener('click', async () => {
       const rating = button.dataset.rating;
 
-      /* Feedback rows hang off indexed resources, so a rating about a name
-       * record has nothing to attach to. Say so instead of failing silently. */
-      if (source === 'name') {
-        setStatus(statusEl, 'Name records cannot be rated yet.', 'warn');
-        return;
+      /* A network result is somebody else's link. Recommending it is the one
+       * action here that gives the link to other people, so it asks first. A
+       * local result only changes this machine's ranking, so it does not. */
+      if (source === 'network') {
+        const agreed = await askRecommend();
+        /* No, and Escape, are the same answer: do nothing at all. No request,
+         * no disabled buttons, no status line — the user declined, so the page
+         * should look untouched. */
+        if (!agreed) return;
       }
 
-      for (const sibling of node.querySelectorAll('.btn-rate')) sibling.disabled = true;
+      for (const sibling of buttons) sibling.disabled = true;
       setStatus(statusEl, 'Recording\u2026', '');
 
       try {
@@ -379,8 +490,8 @@ function wireRating(node, result, statusEl) {
         });
 
         let message = data.relevance_boosted
-          ? `Rated ${rating}. Ranked higher for \u201c${lastQuery}\u201d.`
-          : `Rated ${rating}.`;
+          ? `Recommended. Ranked higher for \u201c${lastQuery}\u201d.`
+          : 'Recommended.';
 
         /* Surfaced because it is the honest limit: publishing does not yet
          * change how peers rank things. Repeatable, so it can be dismissed. */
@@ -396,10 +507,121 @@ function wireRating(node, result, statusEl) {
         }
       } catch (err) {
         setStatus(statusEl, err.message, 'bad');
-        for (const sibling of node.querySelectorAll('.btn-rate')) sibling.disabled = false;
+        for (const sibling of buttons) sibling.disabled = false;
       }
     });
   }
+}
+
+/* Ask before recommending a link that came from the network. Resolves true only
+ * for an explicit yes. */
+function askRecommend() {
+  return new Promise((resolve) => {
+    const onClose = () => {
+      ui.recommendDialog.removeEventListener('close', onClose);
+      resolve(ui.recommendDialog.returnValue === 'yes');
+    };
+    ui.recommendDialog.addEventListener('close', onClose);
+    ui.recommendDialog.showModal();
+  });
+}
+
+/* ------------------------------------------------------------- remove -- */
+
+/* "Remove from local index" frees local storage. It writes no block, so the
+ * difference from Block is not severity but durability: remove can be undone by
+ * the network, block cannot be undone without lifting the block. */
+function wireRemove(node, result, statusEl, button) {
+  if (!button) return;
+
+  /* Only a local resource is in this machine's index to be removed from. A
+   * network result has no local row, and a name result is a claim, not a
+   * stored resource. */
+  if ((result.source || 'local') !== 'local' || !result.resource_id) {
+    button.hidden = true;
+    return;
+  }
+
+  button.addEventListener('click', async () => {
+    if (!(await askRemove(result))) return; // cancelled
+
+    button.disabled = true;
+    setStatus(statusEl, 'Removing\u2026', '');
+
+    try {
+      const data = await postJSON('/api/purge', { resource_id: result.resource_id });
+      const n = data.deleted.resources;
+      dropResult(
+        node,
+        n > 0
+          ? 'Removed from your local index. A peer holding this link can still return it \u2014 use Block to stop that.'
+          : 'Already gone from your local index.',
+        n > 0 ? 'warn' : ''
+      );
+    } catch (err) {
+      setStatus(statusEl, err.message, 'bad');
+      button.disabled = false;
+    }
+  });
+}
+
+/* Ask before blocking a peer, spelling out both the effect and its limits.
+ * Resolves true only for an explicit confirm. */
+function askPeerBlock(agent) {
+  /* Kept short on purpose. The earlier version spelled out every limit of an
+   * agent block in a separate paragraph, which read like a warning about
+   * something going wrong. A block does drop this peer's answers and the names
+   * it published; the only caveat worth surfacing is that it is not a
+   * disconnect, plus the command that is. */
+  ui.peerBlockBlurb.textContent =
+    `anta-vista will stop asking peer ${agent.slice(0, 8)} for answers, and will ` +
+    'ignore anything it sends back.\n\n' +
+    'This does not disconnect it — the peer can still reach this node. To drop ' +
+    'it at the transport as well, run:\n\n' +
+    `    av block --agent ${agent} --x0x\n\n` +
+    'Links you have already indexed stay searchable. You can lift the block ' +
+    'with av unblock.';
+
+  return new Promise((resolve) => {
+    const onClose = () => {
+      ui.peerBlockDialog.removeEventListener('close', onClose);
+      resolve(ui.peerBlockDialog.returnValue === 'block');
+    };
+    ui.peerBlockDialog.addEventListener('close', onClose);
+    ui.peerBlockDialog.showModal();
+  });
+}
+
+/* Name what is being removed before removing it, and say plainly that this is
+ * not a block. Resolves true only for an explicit confirm. */
+function askRemove(result) {
+  /* Name the resource by its location, never by its description.
+   *
+   * `description` is the text anta-vista embeds, not something written for a
+   * person: for a text or PDF document it is up to 800 characters of the file's
+   * own content, glued into a sentence like "a text document from notes.txt:
+   * <the first 800 characters of the file>". Interpolating that into the
+   * confirm produced a wall of prose about a deletion, in the one dialog whose
+   * whole job is to be readable at a glance.
+   *
+   * The location is the real identity of the thing being deleted, and it stays
+   * short for Autonomi (a hash) and recognisable for a URL. */
+  const what = result.location || 'this result';
+  ui.removeTitle.textContent = 'Remove from local index?';
+  ui.removeBlurb.textContent =
+    `This deletes the following from this machine, along with its embedding ` +
+    `and ratings:\n\n    ${what}\n\n` +
+    'It cannot be undone here, and a peer holding the same link can return it ' +
+    'in a later search. Use Block if you want it gone for good.';
+
+  return new Promise((resolve) => {
+    const onClose = () => {
+      ui.removeDialog.removeEventListener('close', onClose);
+      resolve(ui.removeDialog.returnValue === 'remove');
+    };
+    ui.removeDialog.addEventListener('close', onClose);
+    ui.removeDialog.showModal();
+  });
 }
 
 function setStatus(node, message, tone) {
@@ -478,20 +700,23 @@ ui.addForm.addEventListener('submit', async (event) => {
 
 /* --------------------------------------------------------------- status -- */
 
-function openStatus() {
-  ui.statusDrawer.hidden = false;
-  ui.overlay.hidden = false;
-  ui.statusBtn.setAttribute('aria-expanded', 'true');
-  refreshStatus();
+/* The drawer's visibility is a two-way control, so the trigger is a toggle
+ * rather than an "open" button: pressing it again puts the panel away. The
+ * label follows the state so it reads correctly without the panel open, and
+ * `aria-expanded` carries it for assistive tech. */
+function setStatusOpen(open) {
+  ui.statusDrawer.hidden = !open;
+  ui.overlay.hidden = !open;
+  ui.statusBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  ui.statusBtn.textContent = open ? 'Hide status' : 'Status';
+  if (open) refreshStatus();
 }
 
 function closeStatus() {
-  ui.statusDrawer.hidden = true;
-  ui.overlay.hidden = true;
-  ui.statusBtn.setAttribute('aria-expanded', 'false');
+  setStatusOpen(false);
 }
 
-ui.statusBtn.addEventListener('click', openStatus);
+ui.statusBtn.addEventListener('click', () => setStatusOpen(ui.statusDrawer.hidden));
 ui.closeStatus.addEventListener('click', closeStatus);
 ui.overlay.addEventListener('click', closeStatus);
 

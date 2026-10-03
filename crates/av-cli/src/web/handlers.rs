@@ -822,6 +822,55 @@ pub fn block(state: &Arc<AppState>, body: &str) -> WebResponse {
     }
 }
 
+/// `POST /api/purge` — remove one locally indexed resource.
+///
+/// Backs the "Remove from local index" button. This frees local storage and
+/// nothing else: it writes no block, so a peer holding the same link can hand
+/// it back on a later search. The response names the counts so the page reports
+/// what actually went rather than implying a clean sweep.
+///
+/// An id we do not hold is a success with zero counts, not a 404 — "already
+/// gone" is the state the user asked for, and the row is only visible in the UI
+/// because it was there a moment ago.
+pub fn purge(state: &Arc<AppState>, body: &str) -> WebResponse {
+    let payload: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, "validation_error", &format!("invalid JSON: {e}")),
+    };
+
+    let resource_id = payload["resource_id"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if resource_id.is_empty() {
+        return json_error(400, "validation_error", "missing 'resource_id'");
+    }
+
+    let mut conn = match db_conn(state) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+
+    match crate::cmd::purge::purge_resource(&mut conn, &resource_id) {
+        Ok(o) => json_response(
+            json!({
+                "ok": true,
+                "resource_id": resource_id,
+                "deleted": {
+                    "resources": o.resources,
+                    "embeddings": o.embeddings,
+                    "feedback_events": o.feedback_events,
+                },
+                "warning": "Freed local storage only. A peer holding this link can still \
+                            return it; use block to stop that.",
+            })
+            .to_string(),
+        ),
+        Err(e) => validation_response(&e),
+    }
+}
+
 /// `POST /api/unblock` — lift one block, or every block with `all: true`.
 pub fn unblock(state: &Arc<AppState>, body: &str) -> WebResponse {
     let payload: serde_json::Value = match serde_json::from_str(body) {

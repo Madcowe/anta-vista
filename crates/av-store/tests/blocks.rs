@@ -4,6 +4,7 @@ use av_store::{open, open_in_memory, repo};
 const AGENT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const AGENT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const RES_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const RES_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
 fn now() -> i64 {
     1_700_000_000
@@ -254,4 +255,198 @@ fn blocks_survive_purge_all_which_clears_data_not_policy() {
     );
     let entries = blocks::list_all(&conn).unwrap();
     assert_eq!(entries[0].reason.as_deref(), Some("keep me"));
+}
+
+/// Insert a resource with a known location, so the name tests below have
+/// something for a name record to point at.
+fn insert_resource(conn: &rusqlite::Connection, id: &str, location: &str) {
+    use av_core::types::{ResourceDescriptor, ResourceKind};
+
+    repo::resources::insert(
+        conn,
+        &ResourceDescriptor {
+            id: id.to_string(),
+            kind: ResourceKind::Text,
+            location: location.to_string(),
+            location_scheme: Some("autonomi".to_string()),
+            location_canonical: Some(location.to_string()),
+            mime_type: "text/plain".to_string(),
+            filename: None,
+            metadata_json: serde_json::json!({}),
+            description_text: "a resource".to_string(),
+            created_at: now(),
+        },
+    )
+    .unwrap();
+}
+
+fn name_record(
+    record_id: &str,
+    name: &str,
+    target: &str,
+    canonical: Option<&str>,
+) -> av_core::types::NameRecord {
+    use av_core::types::NameRecordType;
+
+    av_core::types::NameRecord {
+        schema_version: 1,
+        record_id: record_id.to_string(),
+        normalized_name: name.to_lowercase(),
+        original_name: name.to_string(),
+        record_type: NameRecordType::Uri,
+        target: target.to_string(),
+        target_scheme: Some("autonomi".to_string()),
+        target_canonical: canonical.map(|c| c.to_string()),
+        ttl_secs: 86_400,
+        by_agent_id: AGENT_A.to_string(),
+        origin_agent_id: None,
+        timestamp: now(),
+        signature: vec![],
+    }
+}
+
+#[test]
+fn name_claims_are_counted_and_dropped_with_the_resource_they_target() {
+    let conn = open_in_memory().expect("in-memory db");
+    let location = "autonomi://example/target";
+    let other = "autonomi://example/unrelated";
+
+    insert_resource(&conn, RES_A, location);
+    insert_resource(&conn, RES_B, other);
+
+    repo::names::insert(&conn, &name_record("n1", "docs", location, None)).unwrap();
+    repo::names::insert(&conn, &name_record("n2", "Docs", location, Some(location))).unwrap();
+    repo::names::insert(&conn, &name_record("n3", "elsewhere", other, None)).unwrap();
+
+    assert_eq!(
+        repo::names::count_by_target(&conn, location).unwrap(),
+        2,
+        "both claims for this resource must be counted, whichever column holds the target"
+    );
+
+    let cascade = blocks::delete_resource_cascade_with_names(&conn, RES_A).unwrap();
+    assert!(cascade.resource_removed);
+    assert_eq!(
+        cascade.names_removed, 2,
+        "claims must be reported, not silently dropped"
+    );
+
+    assert!(
+        repo::names::get_by_normalized_name(&conn, "docs")
+            .unwrap()
+            .is_empty(),
+        "a claim cannot outlive the only thing it resolves to"
+    );
+    assert_eq!(
+        repo::names::get_by_normalized_name(&conn, "elsewhere")
+            .unwrap()
+            .len(),
+        1,
+        "an unrelated claim must survive"
+    );
+}
+
+#[test]
+fn name_claims_are_matched_through_the_legacy_scheme_alias() {
+    let conn = open_in_memory().expect("in-memory db");
+    let location = "autonomi://example/target";
+
+    insert_resource(&conn, RES_A, location);
+    // A claim received from a peer may still carry the old scheme, while the
+    // resource it points at was indexed under the canonical one.
+    repo::names::insert(
+        &conn,
+        &name_record("n1", "docs", "ant://example/target", None),
+    )
+    .unwrap();
+
+    assert_eq!(
+        repo::names::count_by_target(&conn, location).unwrap(),
+        1,
+        "the ant:// / autonomi:// alias must not hide a claim from its own resource"
+    );
+
+    let cascade = blocks::delete_resource_cascade_with_names(&conn, RES_A).unwrap();
+    assert_eq!(cascade.names_removed, 1);
+    assert!(
+        repo::names::get_by_normalized_name(&conn, "docs")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn cascading_an_absent_resource_removes_nothing_and_says_so() {
+    let conn = open_in_memory().expect("in-memory db");
+
+    let cascade = blocks::delete_resource_cascade_with_names(&conn, RES_A).unwrap();
+    assert!(
+        !cascade.resource_removed,
+        "an id we never held must not be reported as removed"
+    );
+    assert_eq!(cascade.names_removed, 0);
+}
+
+#[test]
+fn a_cached_name_record_round_trips_its_transport_origin() {
+    let conn = open_in_memory().expect("in-memory db");
+
+    let record = name_record(
+        "nr-1",
+        "svc",
+        "autonomi://example/t",
+        Some("autonomi://example/t"),
+    );
+    repo::names::insert_with_origin(&conn, &record, Some(AGENT_B)).expect("insert with origin");
+
+    let stored = repo::names::get_by_normalized_name(&conn, "svc").expect("get");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].origin_agent_id.as_deref(),
+        Some(AGENT_B),
+        "the authenticated origin must survive the round trip"
+    );
+    // The self-reported id is a separate column and is left as the peer wrote it.
+    assert_eq!(stored[0].by_agent_id, AGENT_A);
+}
+
+#[test]
+fn a_locally_authored_name_record_has_no_origin() {
+    let conn = open_in_memory().expect("in-memory db");
+
+    // `av name` goes through the plain insert, which must leave the origin NULL
+    // so agent blocks cannot match it.
+    let record = name_record("nr-mine", "mine", "autonomi://example/m", None);
+    repo::names::insert(&conn, &record).expect("insert");
+
+    let stored = repo::names::get_by_normalized_name(&conn, "mine").expect("get");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].origin_agent_id, None,
+        "a local record must not be attributed to a peer"
+    );
+}
+
+#[test]
+fn reinserting_a_record_replaces_its_origin() {
+    let conn = open_in_memory().expect("in-memory db");
+
+    // `INSERT OR REPLACE` is used for the cache, so a record that first arrives
+    // from one peer and later from another must end up attributed to the later
+    // one, not keep the first origin and quietly survive that peer's block.
+    let record = name_record("nr-r", "moved", "autonomi://example/m", None);
+    repo::names::insert_with_origin(&conn, &record, Some(AGENT_A)).expect("first insert");
+    repo::names::insert_with_origin(&conn, &record, Some(AGENT_B)).expect("second insert");
+
+    let stored = repo::names::get_by_normalized_name(&conn, "moved").expect("get");
+    assert_eq!(
+        stored.len(),
+        1,
+        "the record id is unique, so this is one row"
+    );
+    assert_eq!(
+        stored[0].origin_agent_id.as_deref(),
+        Some(AGENT_B),
+        "the most recent authenticated origin wins"
+    );
 }

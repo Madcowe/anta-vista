@@ -4,6 +4,17 @@
 
 /* --- shared structure ---------------------------------------------------- */
 
+/* The UA sheet's `[hidden] { display: none }` is only a *user-agent*
+ * declaration, so ANY author `display` rule silently beats it. `.drawer` and
+ * `.banner` are both `display: flex`, which meant the status drawer and the
+ * setup banner stayed painted while their `hidden` attribute was set: the
+ * drawer's close button set `hidden = true` and changed nothing on screen, and
+ * both panels were visible from first paint. `hidden` is how this app shows and
+ * hides things, so it has to win over layout. */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -127,6 +138,17 @@ input[type="text"] {
   font-size: 0.85rem;
 }
 
+/* The peer-block blurb separates the promise from the limits with blank lines.
+ * Without this they collapse into one paragraph and the caveats stop reading as
+ * caveats. */
+/* `pre-line` keeps the indented identifier on its own line, so a long Autonomi
+ * location or URL does not get folded into the middle of a sentence. */
+#peer-block-blurb,
+#remove-blurb {
+  white-space: pre-line;
+  max-width: 34rem;
+}
+
 .banner {
   padding: 12px 20px;
   display: flex;
@@ -158,8 +180,12 @@ input[type="text"] {
   align-items: baseline;
 }
 
+/* The description is the text anta-vista embeds, which for a text or PDF
+   document is up to 800 characters of the file's own content. Break it rather
+   than letting one long token widen the row. */
 .result-desc {
   margin: 6px 0;
+  overflow-wrap: anywhere;
 }
 
 .result-meta {
@@ -178,10 +204,35 @@ input[type="text"] {
   margin-top: 10px;
 }
 
-.rate-label,
 .rate-status {
   font-size: 0.8rem;
   opacity: 0.75;
+}
+
+/* The note that outlives a removed row, so the user can still find out what
+ * their click did. */
+.results-note {
+  font-size: 0.8rem;
+  margin: 10px 0 0;
+  min-height: 1.2em;
+  opacity: 0.8;
+}
+
+.results-note[data-tone="ok"] {
+  color: var(--ok, #1b5e20);
+}
+
+.results-note[data-tone="warn"] {
+  color: var(--warn, #8a5b00);
+}
+
+/* Groups the two "make this go away" actions so they stay together at the end
+ * of the row, whichever of them is present. */
+.result-deny {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
 }
 
 .drawer {
@@ -189,10 +240,23 @@ input[type="text"] {
   top: 0;
   right: 0;
   bottom: 0;
-  width: min(26rem, 100%);
+  /* Leave a strip of page showing. At 26rem the panel is wider than a phone
+   * viewport, so `100%` made it full-bleed: there was nothing left to click to
+   * dismiss it and the panel read as the page rather than as a panel over it. */
+  width: min(26rem, calc(100vw - 3rem));
   display: flex;
   flex-direction: column;
   z-index: 40;
+}
+
+/* Both ends hold controls, so they must not be shrunk. `.drawer-body` is
+ * `flex: 1`, whose basis is 0, and flex shrink is weighted by basis — so on a
+ * short viewport with a long status list the body contributed nothing to the
+ * shrink and the header absorbed all of it, which is how the close button ends
+ * up clipped. The body is the only part allowed to give way, and it scrolls. */
+.drawer-head,
+.drawer-foot {
+  flex: 0 0 auto;
 }
 
 .drawer-head {
@@ -458,15 +522,29 @@ input[type="text"] {
   flex-wrap: wrap;
 }
 
-[data-theme="modern"] .btn-block {
-  margin-left: auto;
+[data-theme="modern"] .btn-block,
+[data-theme="modern"] .btn-remove {
   font-size: 0.8rem;
   opacity: 0.75;
 }
 
-[data-theme="modern"] .btn-block:hover {
+[data-theme="modern"] .btn-block:hover,
+[data-theme="modern"] .btn-remove:hover {
   opacity: 1;
   color: var(--danger, #b3261e);
+}
+
+/* Confirms the removal. This deletes data and cannot be undone here, so it is
+ * the one result action that gets the solid destructive treatment rather than a
+ * quiet link. */
+[data-theme="modern"] .btn-danger {
+  background: var(--danger, #b3261e);
+  border-color: var(--danger, #b3261e);
+  color: #fff;
+}
+
+[data-theme="modern"] .btn-danger:hover {
+  filter: brightness(1.08);
 }
 
 /* Block list in the status drawer. */

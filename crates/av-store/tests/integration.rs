@@ -101,6 +101,7 @@ fn test_full_integration() {
         target_canonical: Some("ant://deadbeef".into()),
         ttl_secs: 3600,
         by_agent_id: "agent-abc".into(),
+        origin_agent_id: None,
         timestamp: 1_700_000_005,
         signature: vec![],
     };

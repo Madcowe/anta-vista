@@ -66,8 +66,23 @@ fn test_concurrent_opens_of_a_fresh_database() {
         .query_row("SELECT COUNT(*) FROM applied_migrations", [], |r| r.get(0))
         .expect("count migrations");
     assert_eq!(
-        applied, 5,
+        applied as usize,
+        av_store::schema::MIGRATIONS.len(),
         "every migration should be recorded exactly once"
+    );
+
+    // WAL survives the stampede. The opener that loses the race for the
+    // journal-mode lock no longer treats that as an error, so this is the
+    // assertion that the loser accepted the winner's WAL rather than quietly
+    // carrying on in rollback-journal mode — which would reintroduce the
+    // reader-blocks-writer stalls that WAL exists to prevent.
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .expect("read journal mode");
+    assert_eq!(
+        mode.to_lowercase(),
+        "wal",
+        "a database opened concurrently must still end up in WAL mode"
     );
 }
 

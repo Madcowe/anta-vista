@@ -873,3 +873,534 @@ fn an_agent_blocked_in_the_browser_says_the_transport_is_untouched() {
         "nothing was deleted: {warning}"
     );
 }
+
+// --- Remove from local index ----------------------------------------------
+//
+// `POST /api/purge` backs the browser's "Remove from local index" button, so
+// these pin what it actually does: frees the rows, reports the counts, writes
+// no block, and treats an id we never held as a no-op rather than an error.
+
+/// Seed a resource directly, so the test does not have to run the embedder to
+/// get something into the index.
+fn seed_resource(db: &std::path::Path, id: &str, location: &str) {
+    use av_core::types::{ResourceDescriptor, ResourceKind};
+
+    let conn = av_store::open(db).expect("open test db");
+    av_store::repo::resources::insert(
+        &conn,
+        &ResourceDescriptor {
+            id: id.to_string(),
+            kind: ResourceKind::Text,
+            location: location.to_string(),
+            location_scheme: Some("autonomi".to_string()),
+            location_canonical: Some(location.to_string()),
+            mime_type: "text/plain".to_string(),
+            filename: None,
+            metadata_json: serde_json::json!({}),
+            description_text: "seeded for the purge test".to_string(),
+            created_at: 1_700_000_000,
+        },
+    )
+    .expect("insert resource");
+
+    // OR IGNORE: this profile is shared by every seeded resource in the file,
+    // and the tests share one database.
+    conn.execute(
+        "INSERT OR IGNORE INTO embedding_profiles
+           (profile_id, model_id, model_version, dim, normalized, preproc_version)
+         VALUES ('p-purge', 'all-MiniLM-L6-v2', 'v1', 384, 1, 'v1')",
+        [],
+    )
+    .expect("insert profile");
+    conn.execute(
+        "INSERT INTO embeddings (resource_id, profile_id, vector_json, l2_norm, created_at)
+         VALUES (?1, 'p-purge', '[1.0]', 1.0, 1700000000)",
+        rusqlite::params![id],
+    )
+    .expect("insert embedding");
+}
+
+/// Count rows for one subject. `resources` keys on `id` while everything that
+/// references it uses `resource_id`, so the column is passed in.
+fn count_rows(db: &std::path::Path, table: &str, column: &str, id: &str) -> i64 {
+    let conn = av_store::open(db).expect("open test db");
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+        rusqlite::params![id],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|e| panic!("count {table}: {e}"))
+}
+
+#[test]
+fn purge_removes_the_resource_and_reports_the_counts() {
+    let server = server();
+    let id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    seed_resource(&server.db, id, "autonomi://purge-me");
+
+    let res = server.post("/api/purge", &format!(r#"{{"resource_id":"{id}"}}"#));
+    assert_eq!(res.status, 200, "{}", res.body);
+    let body = res.json();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["deleted"]["resources"], 1);
+    assert_eq!(body["deleted"]["embeddings"], 1);
+    assert_eq!(
+        count_rows(&server.db, "resources", "id", id),
+        0,
+        "the resource must be gone from the index"
+    );
+    assert_eq!(
+        count_rows(&server.db, "embeddings", "resource_id", id),
+        0,
+        "a successful purge must free the embedding too, or the row is a leak"
+    );
+}
+
+#[test]
+fn purge_writes_no_block_so_the_network_can_still_return_it() {
+    // The whole difference between Remove and Block. If this ever starts
+    // writing a block row, the button is quietly doing something much larger
+    // than "free local storage", and the peer will never send the link back.
+    let server = server();
+    let id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    seed_resource(&server.db, id, "autonomi://purge-no-block");
+
+    let res = server.post("/api/purge", &format!(r#"{{"resource_id":"{id}"}}"#));
+    assert_eq!(res.status, 200);
+
+    let conn = av_store::open(&server.db).expect("open test db");
+    let blocked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM blocks WHERE subject_id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .expect("count blocks");
+    assert_eq!(blocked, 0, "purge must not create a block");
+}
+
+#[test]
+fn purging_an_id_we_do_not_hold_is_a_successful_no_op() {
+    let res = server().post("/api/purge", r#"{"resource_id":"never-indexed-at-all"}"#);
+    assert_eq!(
+        res.status, 200,
+        "already gone is the state the user asked for, not an error"
+    );
+    let body = res.json();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["deleted"]["resources"], 0);
+}
+
+#[test]
+fn purge_validates_its_input() {
+    let res = server().post("/api/purge", r#"{}"#);
+    assert_eq!(res.status, 400);
+    assert!(
+        res.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("resource_id")
+    );
+
+    let res = server().post("/api/purge", r#"{"resource_id":"  "}"#);
+    assert_eq!(res.status, 400, "a blank id is not an id");
+}
+
+#[test]
+fn results_offer_one_rating_and_separate_remove_from_block() {
+    // The shape of the actions is the contract: one Recommend, a Remove that is
+    // only meaningful for local results, and a Block. The old three-button
+    // rating row and its "Rate:" label must not come back.
+    let body = &server().get("/").body;
+
+    assert_eq!(
+        body.matches("data-rating=").count(),
+        1,
+        "exactly one rating action may exist"
+    );
+    assert!(
+        body.contains(r#"data-rating="useful""#),
+        "the value stays useful"
+    );
+    assert!(body.contains(">Recommend</button>"));
+    assert!(!body.contains("data-rating=\"not-useful\""));
+    assert!(!body.contains("data-rating=\"incorrect\""));
+    assert!(!body.contains(">Not useful<"));
+    assert!(!body.contains(">Incorrect<"));
+    assert!(!body.contains("rate-label"), "the orphaned label is gone");
+
+    assert!(body.contains("Remove from local index"));
+    assert!(body.contains(r#"data-role="remove""#));
+    assert!(body.contains(r#"data-role="block""#));
+}
+
+#[test]
+fn recommend_asks_before_sharing_a_network_link() {
+    let body = &server().get("/").body;
+
+    assert!(body.contains(r#"id="recommend-dialog""#));
+    assert!(body.contains("Share this link?"));
+    assert!(body.contains("may share the link with other people"));
+    assert!(body.contains(">No, keep it to myself<"));
+    assert!(body.contains(">Yes, recommend<"));
+}
+
+#[test]
+fn removing_says_it_is_not_a_block() {
+    // "Remove" and "Block" are both deletions to the user but not the same one:
+    // only a block stops a peer returning the link. The confirm has to say so,
+    // because the button label alone cannot.
+    let js = &server().get("/assets/app.js").body;
+    assert!(js.contains("/api/purge"));
+    assert!(js.contains("Remove from local index?"));
+    assert!(js.contains("Use Block if you want it gone for good."));
+    assert!(
+        !js.contains("requestSubmit"),
+        "removing or blocking must not re-run the search; re-querying could hand \
+         the same link straight back"
+    );
+}
+
+#[test]
+fn result_rows_lead_with_the_location_like_the_cli() {
+    // `av search` prints the location first and the description indented beneath
+    // it, for every source. The browser branched on the URL *scheme* instead, so
+    // an `http(s)` result used the embedded description as its link text and
+    // never showed the URL at all, while an Autonomi result showed the location
+    // with the description below. Two layouts for the same field, and neither
+    // matched the terminal.
+    let js = &server().get("/assets/app.js").body;
+
+    assert!(
+        !js.contains("title.textContent = result.description || location"),
+        "a web result must not use the embedded description as its heading"
+    );
+    assert!(
+        js.contains(
+            "const heading = source === 'name' ? result.description || location : location"
+        ),
+        "the heading is the location, with name results as the one exception"
+    );
+    assert!(
+        js.contains("const detail = source === 'name' ? location : result.description || ''"),
+        "the description belongs underneath the heading"
+    );
+    // Both branches have to render `heading`. If either fell back to the
+    // description the two schemes would disagree again, which is the bug.
+    assert!(
+        js.contains("title.textContent = heading;") && js.contains("span.textContent = heading;"),
+        "the linked and unlinked branches must render the same heading"
+    );
+}
+
+#[test]
+fn the_remove_confirm_names_the_location_not_the_embedded_text() {
+    // `description` is the text anta-vista embeds, so for a text or PDF document
+    // it is up to 800 characters of the file's own content. The confirm used to
+    // interpolate it, which turned "are you sure?" into a wall of prose. The
+    // location is the identity of the thing being deleted and reads as one.
+    let js = &server().get("/assets/app.js").body;
+
+    let fn_start = js.find("function askRemove(").expect("askRemove exists");
+    let body = &js[fn_start
+        ..js[fn_start..]
+            .find("\nfunction ")
+            .unwrap_or(js.len() - fn_start)
+            + fn_start];
+
+    assert!(
+        !body.contains("result.description"),
+        "the remove confirm must not interpolate the embedded description"
+    );
+    assert!(
+        body.contains("result.location"),
+        "the remove confirm should name the resource by its location"
+    );
+}
+
+#[test]
+fn blocking_and_deleting_a_resource_reports_the_name_records_that_went_with_it() {
+    // The count in the response is the only way the user learns that a name
+    // pointing at this resource disappeared too. If it is not counted, the
+    // deletion happens silently and looks like it only removed a search result.
+    let server = server();
+    let id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let location = "autonomi://block-with-a-name";
+    seed_resource(&server.db, id, location);
+
+    {
+        let conn = av_store::open(&server.db).expect("open test db");
+        av_store::repo::names::insert(
+            &conn,
+            &av_core::types::NameRecord {
+                schema_version: 1,
+                record_id: "nr-purge-cascade".into(),
+                normalized_name: "cascade-name".into(),
+                original_name: "cascade-name".into(),
+                record_type: av_core::types::NameRecordType::Uri,
+                target: location.into(),
+                target_scheme: Some("autonomi".into()),
+                target_canonical: Some(location.into()),
+                ttl_secs: 86_400,
+                by_agent_id: "agent-abc".into(),
+                origin_agent_id: None,
+                timestamp: 1_700_000_000,
+                signature: vec![],
+            },
+        )
+        .expect("insert name record");
+    }
+
+    let res = server.post(
+        "/api/block",
+        &format!(r#"{{"subject_kind":"resource","subject_id":"{id}","keep_local":false}}"#),
+    );
+    assert_eq!(res.status, 200, "{}", res.body);
+    let body = res.json();
+    assert_eq!(body["removed_local"], true);
+
+    let cascaded = body["cascaded"].as_u64().expect("cascaded must be a count");
+    assert!(
+        cascaded >= 2,
+        "expected the embedding and the name record, got {cascaded}"
+    );
+
+    assert_eq!(
+        count_rows(&server.db, "name_records", "record_id", "nr-purge-cascade"),
+        0,
+        "a claim must not outlive the only thing it resolves to"
+    );
+}
+
+#[test]
+fn blocking_a_peer_asks_first_and_explains_what_it_does_not_do() {
+    // An agent block filters search responses and nothing else. The dialog has to
+    // carry both halves, because "Block peer" on its own reads like a
+    // disconnect and a cleanup, and it is neither.
+    let body = &server().get("/").body;
+
+    assert!(body.contains(r#"id="peer-block-dialog""#));
+    assert!(body.contains("Block this peer?"));
+    assert!(body.contains(">Block this peer</button>"));
+    assert!(body.contains(">Cancel</button>"));
+
+    let js = &server().get("/assets/app.js").body;
+    assert!(
+        js.contains("askPeerBlock"),
+        "the peer button must confirm before blocking"
+    );
+    for promise in [
+        "stop asking peer",
+        "ignore anything it sends back",
+        "does not disconnect it",
+        "can still reach this node",
+        "stay searchable",
+        "av unblock",
+    ] {
+        assert!(
+            js.contains(promise),
+            "the peer-block dialog omits a limit: {promise}"
+        );
+    }
+
+    /* The dialog used to promise that names the peer had already published
+     * still resolved "because those are stored locally". That was true when an
+     * agent block only filtered search responses, and stopped being true once
+     * name records carried a transport origin that agent blocks filter on. The
+     * stale line is worse than a missing one: it told the user a suppressed
+     * peer was still reachable through names. Assert it cannot come back
+     * without pinning the exact string, which a reword would dodge. */
+    for gone in ["still resolve", "stored locally", "Nothing is deleted"] {
+        assert!(
+            !js.contains(gone),
+            "the peer-block dialog still claims a blocked peer stays usable: {gone}"
+        );
+    }
+
+    assert!(
+        !js.contains("'av block --agent ${agent} --x0x'"),
+        "the dialog should offer the transport route as a command to run, not claim to do it"
+    );
+}
+
+#[test]
+fn the_peer_block_dialog_keeps_its_paragraph_breaks() {
+    // The promise and its limits are separate claims. Run together in one
+    // paragraph the caveats stop reading as caveats.
+    let css = &server().get("/assets/modern.css").body;
+    assert!(
+        css.contains("white-space: pre-line"),
+        "the peer-block blurb needs pre-line or its blank lines collapse"
+    );
+}
+
+#[test]
+fn hidden_wins_over_the_layout_rules_of_the_panels_it_hides() {
+    // This app shows and hides things by flipping `hidden` in app.js. The
+    // browser's own `[hidden] { display: none }` lives in the *user-agent*
+    // stylesheet, so any author rule that sets `display` silently outranks it —
+    // and both panels that app.js hides set `display: flex`. Without the guard
+    // below the status drawer and the setup banner are painted from first
+    // paint, and the drawer's close button sets `hidden = true` and changes
+    // nothing at all on screen, which is indistinguishable from a dead button.
+    let css = &server().get("/assets/modern.css").body;
+    let guard = css_rule(&css, "[hidden]").expect("modern.css needs a [hidden] rule");
+    assert!(
+        guard.contains("display: none") && guard.contains("!important"),
+        "[hidden] must be display:none !important, or an author `display` rule \
+         outranks it and the panels app.js hides stay on screen; got: {guard}"
+    );
+
+    // Both offenders are still `display: flex`, which is what makes the guard
+    // load-bearing rather than decorative. If this ever fails because one of
+    // them dropped the declaration, the other still needs the guard.
+    for selector in [".drawer", ".banner"] {
+        let rule = css_rule(&css, selector)
+            .unwrap_or_else(|| panic!("modern.css should still have a {selector} rule"));
+        assert!(
+            rule.contains("display: flex"),
+            "{selector} is expected to stay display:flex; the [hidden] guard exists \
+             because author display rules outrank the UA sheet; got: {rule}"
+        );
+    }
+}
+
+#[test]
+fn the_status_drawer_leaves_room_to_dismiss_itself() {
+    // A drawer that spans the full width of a phone leaves nothing to click to
+    // put it away: it covers the header, so the trigger is under it too, and
+    // the overlay click-out is unreachable. Capping the width keeps a strip of
+    // page visible at every size.
+    let css = &server().get("/assets/modern.css").body;
+    let rule = css_rule(&css, ".drawer").expect("modern.css should have a .drawer rule");
+    assert!(
+        !rule.contains("100%"),
+        "the drawer must not be sized at 100% of the viewport or it goes \
+         full-bleed on a phone; got: {rule}"
+    );
+    assert!(
+        rule.contains("100vw"),
+        "the drawer width should be capped against the viewport so page stays \
+         visible beside it; got: {rule}"
+    );
+}
+
+#[test]
+fn the_drawers_fixed_ends_cannot_be_squeezed_out_by_a_long_status_list() {
+    // `.drawer-body` is `flex: 1`, so its basis is 0 and it contributes nothing
+    // to flex shrink — which means the header absorbs essentially all of the
+    // shrink on a short viewport with a long status list. The close button lives
+    // in that header, so it is what gets clipped. Pinning both ends as
+    // non-shrinking keeps the controls reachable; the body is the part that
+    // should give way, and it scrolls.
+    let css = &server().get("/assets/modern.css").body;
+    for selector in [".drawer-head", ".drawer-foot"] {
+        let rule = css_rule(&css, selector)
+            .unwrap_or_else(|| panic!("modern.css should have a {selector} rule"));
+        assert!(
+            rule.contains("flex: 0 0 auto"),
+            "{selector} must not shrink, or a long status list clips the close \
+             button; got: {rule}"
+        );
+    }
+}
+
+/// The first rule in `css` whose selector list contains `selector` exactly,
+/// comments stripped and the opening brace kept.
+///
+/// Asserting on CSS with `contains` alone is how these tests went wrong: the
+/// explanatory comments name the very selectors being looked for, and a fixed
+/// character window around a match silently depends on how much prose follows
+/// it. Stripping comments first and matching whole selectors keeps an assertion
+/// pointing at the rule it claims to.
+fn css_rule(css: &str, selector: &str) -> Option<String> {
+    let mut stripped = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        stripped.push_str(&rest[..start]);
+        rest = match rest[start + 2..].find("*/") {
+            Some(end) => &rest[start + 2 + end + 2..],
+            None => return None, // unterminated comment: not a stylesheet
+        };
+    }
+    stripped.push_str(rest);
+
+    stripped.split('}').find_map(|chunk| {
+        let (prelude, _) = chunk.split_once('{')?;
+        prelude
+            .split(',')
+            .any(|s| s.trim() == selector)
+            // Splitting on `}` drops the brace; put it back so the value handed
+            // to an assertion is the rule as written.
+            .then(|| format!("{} }}", chunk.trim()))
+    })
+}
+
+#[test]
+fn both_panels_start_hidden_in_the_served_markup() {
+    // The guard above only matters because the markup opts out of first paint.
+    let body = server().get("/").body;
+    assert!(
+        body.contains(r#"<aside id="status-drawer" class="drawer" hidden"#),
+        "the status drawer must not be painted before the user asks for it"
+    );
+    assert!(
+        body.contains(r#"<div id="setup-banner" class="banner" hidden"#),
+        "the setup banner must not be painted before /api/deps reports a problem"
+    );
+}
+
+#[test]
+fn the_status_trigger_is_a_toggle_rather_than_an_open_button() {
+    // Pressing the trigger again has to put the panel away: it is the only
+    // control that is always reachable, so "open" only would leave the drawer
+    // with no way back that does not depend on the drawer itself.
+    let js = server().get("/assets/app.js").body;
+    assert!(
+        js.contains(
+            "ui.statusBtn.addEventListener('click', () => setStatusOpen(ui.statusDrawer.hidden))"
+        ),
+        "the status trigger must derive the next state from the current one so it toggles"
+    );
+    // And the trigger has to say so: the label and the ARIA state both follow.
+    assert!(
+        js.contains("ui.statusBtn.setAttribute('aria-expanded', open ? 'true' : 'false')"),
+        "aria-expanded must track the drawer, not sit permanently at false"
+    );
+    assert!(
+        js.contains("ui.statusBtn.textContent = open ? 'Hide status' : 'Status'"),
+        "the trigger label must track the drawer so it reads correctly when closed"
+    );
+    // The markup starts collapsed, which is the state the toggle expects.
+    assert!(
+        server()
+            .get("/")
+            .body
+            .contains(r#"id="open-status" class="btn btn-quiet" aria-expanded="false""#),
+        "the status trigger must advertise its collapsed state up front"
+    );
+}
+
+#[test]
+fn css_rule_lookup_finds_a_rule_and_ignores_prose() {
+    // Not a test of the app: a guard on the helper the CSS assertions use. If
+    // `css_rule` stopped stripping comments it would start matching selectors
+    // named in the explanatory comments and quietly pass for the wrong reason.
+    let css = "/* mentions [hidden] and .drawer { width: 1px } in prose */\n\
+               [hidden] { display: none !important; }\n\
+               .drawer, .banner { display: flex; }";
+    assert_eq!(
+        css_rule(css, "[hidden]").as_deref(),
+        Some("[hidden] { display: none !important; }")
+    );
+    // A grouped rule is found by either of its selectors.
+    assert_eq!(
+        css_rule(css, ".drawer").as_deref(),
+        Some(".drawer, .banner { display: flex; }")
+    );
+    assert_eq!(
+        css_rule(css, ".banner").as_deref(),
+        css_rule(css, ".drawer").as_deref()
+    );
+    assert_eq!(css_rule(css, ".nope"), None);
+}

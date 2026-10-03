@@ -153,6 +153,7 @@ fn test_publish_name_claim() {
         ),
         ttl_secs: 3600,
         by_agent_id: "agent-a".into(),
+        origin_agent_id: None,
         timestamp: 1_700_000_000,
         signature: vec![],
     };

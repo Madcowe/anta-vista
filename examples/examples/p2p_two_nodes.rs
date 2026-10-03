@@ -97,6 +97,7 @@ fn main() {
         target,
         ttl_secs: 3600,
         by_agent_id: config.agent_id.clone(),
+        origin_agent_id: None,
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

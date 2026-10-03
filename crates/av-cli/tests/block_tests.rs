@@ -327,6 +327,7 @@ fn a_name_block_hides_the_record_without_deleting_it() {
         target_canonical: Some("autonomi://aa".to_string()),
         ttl_secs: 3600,
         by_agent_id: "agent-abc".to_string(),
+        origin_agent_id: None,
         timestamp: 1_700_000_000,
         signature: vec![],
     };
@@ -793,6 +794,7 @@ fn an_abbreviated_id_of_a_local_name_record_is_refused() {
             target_canonical: Some("autonomi://aa".to_string()),
             ttl_secs: 3600,
             by_agent_id: "agent-abc".to_string(),
+            origin_agent_id: None,
             timestamp: 1_700_000_000,
             signature: vec![],
         },
@@ -937,6 +939,7 @@ fn a_dropped_blocks_table_fails_closed_rather_than_serving_everything() {
             target_canonical: Some("autonomi://aa".to_string()),
             ttl_secs: 3600,
             by_agent_id: "agent-abc".to_string(),
+            origin_agent_id: None,
             timestamp: 1_700_000_000,
             signature: vec![],
         },

@@ -4,6 +4,60 @@ use crate::startup::StartupState;
 use dialoguer::Confirm;
 use serde_json::json;
 
+/// What a single-resource purge actually removed.
+///
+/// Reported rather than assumed, so `av purge` and the browser can state what
+/// was lost instead of implying a single row went away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PurgeOutcome {
+    pub resources: usize,
+    pub embeddings: usize,
+    pub feedback_events: usize,
+}
+
+/// Delete one indexed resource and the rows that hang off it.
+///
+/// Shared by `av purge --resource` and the web interface's remove button so
+/// both free the same rows in the same transaction. A resource that is not held
+/// locally is a successful no-op — the caller reports zeros rather than an
+/// error, because "already gone" is the state the user asked for.
+///
+/// This frees local storage. It writes no block, so a peer holding the same
+/// link can hand it back on a later search; use `av block` to stop that.
+pub fn purge_resource(
+    conn: &mut rusqlite::Connection,
+    resource_id: &str,
+) -> CliResult<PurgeOutcome> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| CliError::Database(e.to_string()))?;
+    let feedback_events = tx
+        .execute(
+            "DELETE FROM feedback_events WHERE resource_id = ?1",
+            rusqlite::params![resource_id],
+        )
+        .map_err(|e| CliError::Database(e.to_string()))?;
+    let embeddings = tx
+        .execute(
+            "DELETE FROM embeddings WHERE resource_id = ?1",
+            rusqlite::params![resource_id],
+        )
+        .map_err(|e| CliError::Database(e.to_string()))?;
+    let resources = tx
+        .execute(
+            "DELETE FROM resources WHERE id = ?1",
+            rusqlite::params![resource_id],
+        )
+        .map_err(|e| CliError::Database(e.to_string()))?;
+    tx.commit().map_err(|e| CliError::Database(e.to_string()))?;
+
+    Ok(PurgeOutcome {
+        resources,
+        embeddings,
+        feedback_events,
+    })
+}
+
 pub fn run(
     cli: crate::Cli,
     _state: StartupState,
@@ -142,28 +196,10 @@ pub fn run(
         }
     } else {
         if let Some(ref r_id) = resource {
-            let tx = conn
-                .transaction()
-                .map_err(|e| CliError::Database(e.to_string()))?;
-            deleted_feedback_events = tx
-                .execute(
-                    "DELETE FROM feedback_events WHERE resource_id = ?1",
-                    rusqlite::params![r_id],
-                )
-                .map_err(|e| CliError::Database(e.to_string()))?;
-            deleted_embeddings = tx
-                .execute(
-                    "DELETE FROM embeddings WHERE resource_id = ?1",
-                    rusqlite::params![r_id],
-                )
-                .map_err(|e| CliError::Database(e.to_string()))?;
-            deleted_resources = tx
-                .execute(
-                    "DELETE FROM resources WHERE id = ?1",
-                    rusqlite::params![r_id],
-                )
-                .map_err(|e| CliError::Database(e.to_string()))?;
-            tx.commit().map_err(|e| CliError::Database(e.to_string()))?;
+            let outcome = purge_resource(&mut conn, r_id)?;
+            deleted_resources = outcome.resources;
+            deleted_embeddings = outcome.embeddings;
+            deleted_feedback_events = outcome.feedback_events;
         }
 
         if let Some(ref n) = name {

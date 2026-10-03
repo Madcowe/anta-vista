@@ -169,3 +169,38 @@ CREATE TABLE IF NOT EXISTS blocks (
 );
 CREATE INDEX IF NOT EXISTS idx_blocks_kind ON blocks(subject_kind);
 ";
+
+/// The transport origin a cached name record arrived from.
+///
+/// `name_records.by_agent_id` is whatever the publishing peer put in its own
+/// payload, so it is self-reported and trivially forged — the envelope says who
+/// the peer claims to be, not who the daemon actually delivered the message
+/// from. That is good enough to *display* a publisher, and useless for blocking,
+/// where a peer would simply lie about its own id to walk around the block.
+///
+/// This column records the id the transport authenticated (`DirectMessage::sender`
+/// / `IncomingEvent::origin`) and is written only by the cache path, which is
+/// the one place that has the real origin in hand. It is never read from the
+/// wire, so no peer can populate it for itself.
+///
+/// NULL means the record was created on this machine (`av name`) or was cached
+/// before this column existed. Either way there is no peer to block, so agent
+/// blocks must leave those records alone.
+pub const MIGRATION_006_NAME_ORIGIN: &str = "
+ALTER TABLE name_records ADD COLUMN origin_agent_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_name_records_origin ON name_records(origin_agent_id);
+";
+
+/// Every migration, in the order they must be applied.
+///
+/// Single source of truth: `db::migrate` walks this, and the on-disk test counts
+/// against it. Keeping the list here is what stops the migration count in that
+/// test from silently going stale when a migration is added.
+pub const MIGRATIONS: &[(&str, &str)] = &[
+    ("001_initial", MIGRATION_001_INITIAL),
+    ("002_relevance", MIGRATION_002_RELEVANCE),
+    ("003_name_relevance", MIGRATION_003_NAME_RELEVANCE),
+    ("004_canonical_scheme", MIGRATION_004_CANONICAL_SCHEME),
+    ("005_blocks", MIGRATION_005_BLOCKS),
+    ("006_name_origin", MIGRATION_006_NAME_ORIGIN),
+];
