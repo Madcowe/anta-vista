@@ -79,7 +79,7 @@ pub struct ViewHandle {
 /// resource, and `mime` should come from
 /// [`av_ingest::mime::detect_mime_with_hint`] so the type served here agrees
 /// with the type stored for the same bytes.
-pub fn publish(bytes: &[u8], mime: &str) -> Result<ViewHandle, String> {
+pub fn publish(bytes: &[u8], mime: &str, filename: &str) -> Result<ViewHandle, String> {
     // Bind before writing anything, so a port conflict costs nothing.
     let server =
         Server::http("127.0.0.1:0").map_err(|e| format!("could not bind a viewer port: {e}"))?;
@@ -100,9 +100,10 @@ pub fn publish(bytes: &[u8], mime: &str) -> Result<ViewHandle, String> {
     let path = format!("/v/{token}");
     let url = format!("http://127.0.0.1:{port}{path}");
     let mime = mime.to_string();
+    let filename = filename.to_string();
 
     std::thread::spawn(move || {
-        serve_one(server, file, path, mime);
+        serve_one(server, file, path, mime, filename);
     });
 
     Ok(ViewHandle {
@@ -112,7 +113,13 @@ pub fn publish(bytes: &[u8], mime: &str) -> Result<ViewHandle, String> {
 }
 
 /// Serve one file at one token path until the grace period ends.
-fn serve_one(server: Server, mut file: tempfile::NamedTempFile, path: String, mime: String) {
+fn serve_one(
+    server: Server,
+    mut file: tempfile::NamedTempFile,
+    path: String,
+    mime: String,
+    filename: String,
+) {
     let deadline = std::time::Instant::now() + VIEW_TTL;
 
     while std::time::Instant::now() < deadline {
@@ -128,7 +135,7 @@ fn serve_one(server: Server, mut file: tempfile::NamedTempFile, path: String, mi
         };
 
         let mut request = request;
-        let response = respond(&mut request, &path, &mime, &mut file);
+        let response = respond(&mut request, &path, &mime, &filename, &mut file);
         // A dropped connection here is the browser navigating away mid-response.
         // Nothing to do about it and nothing to report: the file stays until the
         // deadline either way.
@@ -140,6 +147,7 @@ fn respond(
     request: &mut Request,
     path: &str,
     mime: &str,
+    filename: &str,
     file: &mut tempfile::NamedTempFile,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     // Read-only, so refuse anything that is not a plain fetch of the document.
@@ -179,16 +187,54 @@ fn respond(
         Ok(h) => response.with_header(h),
         Err(_) => response.with_header(header("Content-Type", "application/octet-stream")),
     };
+    // Inline, so the browser renders it: a downloaded webpage has to open as a
+    // webpage, which is the entire point of the stopgap. But only for a type a
+    // browser can actually display — `inline` on an unrenderable type is a blank
+    // window with no error, which is the failure this whole branch exists to
+    // remove. The decision is made here as well as in the page, deliberately: if
+    // the two ever disagree, this response still does the safe thing.
+    let disposition = if av_ingest::mime::is_browser_renderable(mime) {
+        header("Content-Disposition", "inline")
+    } else {
+        let value = attachment_of(filename);
+        match tiny_http::Header::from_bytes("Content-Disposition", value.as_str()) {
+            Ok(h) => h,
+            // A filename that cannot be expressed as a header value still has to
+            // be downloadable, so fall back to a bare attachment rather than
+            // serving it inline.
+            Err(_) => header("Content-Disposition", "attachment"),
+        }
+    };
     response
-        // Inline, so the browser renders it: a downloaded webpage has to open as
-        // a webpage, which is the entire point of the stopgap.
-        .with_header(header("Content-Disposition", "inline"))
+        .with_header(disposition)
         // The type is what we sniffed, not what the address suggests, and the
         // browser must not second-guess it by sniffing the bytes again.
         .with_header(header("X-Content-Type-Options", "nosniff"))
         // Peer content should not outlive the tab, or leak into a shared cache.
         .with_header(header("Cache-Control", "no-store"))
         .with_header(header("Referrer-Policy", "no-referrer"))
+}
+
+/// A `Content-Disposition` value naming `filename`, with the quoting RFC 6266
+/// asks for.
+///
+/// `suggest_filename` already reduces this to one path segment, but a viewer URL
+/// is served on its own port and its response headers are the one place a
+/// caller-supplied name reaches a parser that is not us, so a quote or a
+/// newline is neutralised here rather than trusted. Escaped quotes inside a
+/// quoted-string are legal, so this cannot terminate the value early.
+fn attachment_of(filename: &str) -> String {
+    let mut out = String::from("attachment; filename=\"");
+    for c in filename.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\r' | '\n' => {}
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn host_is_loopback(request: &Request) -> bool {

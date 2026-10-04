@@ -303,7 +303,8 @@ pub fn view_blob(uri: &str, body: &[u8]) -> WebResponse {
         }
     };
 
-    match crate::web::viewer::publish(body, &mime) {
+    let name = av_ingest::filename::suggest_filename(&uri, &mime);
+    match crate::web::viewer::publish(body, &mime, &name) {
         Ok(handle) => json_response(
             json!({
                 "ok": true,
@@ -312,13 +313,67 @@ pub fn view_blob(uri: &str, body: &[u8]) -> WebResponse {
                 "bytes": body.len(),
                 // The name comes from the server so the browser's Save action
                 // and the CLI cannot invent two different names for one file.
-                "filename": av_ingest::filename::suggest_filename(&uri, &mime),
+                "filename": name,
                 "expires_in": handle.expires_in,
             })
             .to_string(),
         ),
         Err(e) => json_error(500, "viewer_failed", &e),
     }
+}
+
+/// The bodyless half of `/api/view/blob`: a name and a renderability verdict,
+/// with no need to send the file.
+///
+/// Save needs a filename and nothing else. It used to POST the whole record to
+/// get one, which worked until a record was larger than `MAX_BODY` — at which
+/// point saving a file the browser had already downloaded failed with an error
+/// about the upload, having nothing to do with the save.
+pub fn view_plan(uri: &str, mime_hint: &str, prefix: &[u8]) -> WebResponse {
+    let uri = av_ingest::location::normalize_uri(uri);
+    let info = av_ingest::location::analyze_location(&uri);
+    if info.canonical.is_none() {
+        return json_error(
+            400,
+            "validation_error",
+            "that is not a location we can name a file for",
+        );
+    }
+
+    // A hint we cannot place is treated as absent, which makes the verdict
+    // "download it" — the outcome that always works. Guessing "renderable" from
+    // an unknown type is how this path produced a blank window.
+    let normalised = av_ingest::mime::canonicalize_mime(mime_hint);
+    let hinted = match normalised.as_str() {
+        "application/octet-stream" | "" => "application/octet-stream",
+        other => other,
+    };
+
+    // Bytes beat a reported type whenever they say something specific. The
+    // Autonomi SDK hands us `application/octet-stream` for most real records —
+    // a DataMap chunk carries no content type — so trusting `hinted` alone sent
+    // every real image and PDF to a download instead of showing it.
+    //
+    // The author's own trailing name, when there is one, resolves the generic
+    // end, exactly as it does for a local file. An error is not a failure here:
+    // `detect_mime_prefix` cannot fail on non-empty input, and falling back to
+    // the hint means a surprise still yields an answer the page can act on.
+    let guess = if prefix.is_empty() {
+        hinted.to_string()
+    } else {
+        av_ingest::mime::detect_mime_prefix(prefix, info.inferred_filename.as_deref())
+            .unwrap_or_else(|_| hinted.to_string())
+    };
+
+    json_response(
+        json!({
+            "ok": true,
+            "filename": av_ingest::filename::suggest_filename(&uri, &guess),
+            "renderable": av_ingest::mime::is_browser_renderable(&guess),
+            "mime_type": guess,
+        })
+        .to_string(),
+    )
 }
 
 /// `POST /api/index/bytes` — raw body is the file; metadata arrives in headers.
@@ -816,36 +871,12 @@ pub fn blocks_list(state: &Arc<AppState>) -> WebResponse {
         Err(r) => return r,
     };
 
-    let entries = match crate::cmd::block::list_blocks(&conn) {
-        Ok(e) => e,
-        Err(e) => return json_error(500, "database_error", &e.to_string()),
-    };
-    let counts = match crate::cmd::block::counts(&conn) {
-        Ok(c) => c,
+    let report = match crate::cmd::block::block_report(&conn) {
+        Ok(r) => r,
         Err(e) => return json_error(500, "database_error", &e.to_string()),
     };
 
-    json_response(
-        json!({
-            "ok": true,
-            "count": entries.len(),
-            "blocks": entries
-                .iter()
-                .map(|e| json!({
-                    "subject_kind": e.subject_kind.as_str(),
-                    "subject_id": e.subject_id,
-                    "reason": e.reason,
-                    "blocked_at": e.blocked_at,
-                    "source": e.source,
-                }))
-                .collect::<Vec<_>>(),
-            "counts": counts
-                .iter()
-                .map(|(k, n)| json!({ "subject_kind": k.as_str(), "count": n }))
-                .collect::<Vec<_>>(),
-        })
-        .to_string(),
-    )
+    json_response(report.to_json().to_string())
 }
 
 /// `POST /api/block` — block one subject.

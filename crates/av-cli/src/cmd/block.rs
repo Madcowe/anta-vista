@@ -315,8 +315,86 @@ pub fn list_blocks(conn: &Connection) -> CliResult<Vec<BlockEntry>> {
     blocks::list_all(conn).map_err(|e| CliError::Database(e.to_string()))
 }
 
-pub fn counts(conn: &Connection) -> CliResult<Vec<(BlockKind, i64)>> {
-    blocks::counts_by_kind(conn).map_err(|e| CliError::Database(e.to_string()))
+/// Every block, plus the per-kind breakdown, read as one consistent snapshot.
+///
+/// Both surfaces that show blocks (`av block --list` and the web `/api/blocks`)
+/// call this rather than each issuing its own queries, because two independent
+/// reads of a table another process can write between them produce reports that
+/// disagree with themselves: the count comes from the list while the breakdown
+/// comes from a `GROUP BY` taken a moment later. Adding a block in that window
+/// yields a summary whose parts do not add up to its total, which reads as a
+/// bug in the block list rather than a race nobody should have to know about.
+///
+/// Deriving the breakdown from the rows already fetched means the invariant
+/// holds by construction rather than by luck.
+#[derive(Debug, Clone)]
+pub struct BlockReport {
+    /// Every blocked subject.
+    pub blocks: Vec<BlockEntry>,
+    /// How many subjects of each kind are blocked, as `(kind, count)`.
+    ///
+    /// Keyed on the kind's own label, so an unrecognised `subject_kind` is
+    /// reported under itself instead of being folded into `resource`. Grouping
+    /// happens on the raw stored string *before* parsing, for the opposite
+    /// reason: parsing first would let two different stored kinds collapse onto
+    /// one label and silently lose whichever row lost the merge.
+    pub counts: Vec<(String, i64)>,
+}
+
+impl BlockReport {
+    /// Total subjects blocked, which is `blocks.len()` by definition.
+    pub fn count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// The JSON both surfaces return.
+    pub fn to_json(&self) -> serde_json::Value {
+        json!({
+            "ok": true,
+            "count": self.count(),
+            "blocks": self
+                .blocks
+                .iter()
+                .map(|e| json!({
+                    "subject_kind": e.subject_kind_raw,
+                    "subject_id": e.subject_id,
+                    "reason": e.reason,
+                    "blocked_at": e.blocked_at,
+                    "source": e.source,
+                }))
+                .collect::<Vec<_>>(),
+            "counts": self
+                .counts
+                .iter()
+                .map(|(kind, n)| json!({ "subject_kind": kind, "count": n }))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Read every block and its per-kind breakdown in one pass over one snapshot.
+///
+/// Errors propagate. A `blocks` read that fails is not evidence that nothing is
+/// blocked, so reporting must not quietly present a broken table as an empty
+/// block list.
+pub fn block_report(conn: &Connection) -> CliResult<BlockReport> {
+    let blocks = list_blocks(conn)?;
+
+    // First-seen order, over a list already ordered by `subject_kind`, so the
+    // breakdown is stable rather than whatever order the rows happened to land
+    // in. Grouped on the raw label so an unrecognised kind keeps its own
+    // heading instead of being folded into `resource`, where a lookup would
+    // find the wrong number.
+    let mut counts: Vec<(String, i64)> = Vec::new();
+    for entry in &blocks {
+        let label = entry.subject_kind_raw.clone();
+        match counts.iter_mut().find(|(kind, _)| *kind == label) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((label, 1)),
+        }
+    }
+
+    Ok(BlockReport { blocks, counts })
 }
 
 fn open_db() -> CliResult<Connection> {
@@ -410,26 +488,8 @@ pub fn run(
     let conn = open_db()?;
 
     if list {
-        let entries = list_blocks(&conn)?;
-        let by_kind = counts(&conn)?;
-        let report = json!({
-            "ok": true,
-            "count": entries.len(),
-            "blocks": entries
-                .iter()
-                .map(|e| json!({
-                    "subject_kind": e.subject_kind.as_str(),
-                    "subject_id": e.subject_id,
-                    "reason": e.reason,
-                    "blocked_at": e.blocked_at,
-                    "source": e.source,
-                }))
-                .collect::<Vec<_>>(),
-            "counts": by_kind
-                .iter()
-                .map(|(k, n)| json!({ "subject_kind": k.as_str(), "count": n }))
-                .collect::<Vec<_>>(),
-        });
+        let report = block_report(&conn)?;
+        let entries = &report.blocks;
         print_output(
             cli.non_interactive,
             || {
@@ -437,7 +497,7 @@ pub fn run(
                     println!("No blocks. Nothing is filtered or refused.");
                     return;
                 }
-                for e in &entries {
+                for e in entries {
                     let reason = e
                         .reason
                         .as_deref()
@@ -448,13 +508,13 @@ pub fn run(
                     // truncated one would fail to match.
                     println!(
                         "  {} {}{}",
-                        console::style(e.subject_kind.as_str()).yellow().bold(),
+                        console::style(&e.subject_kind_raw).yellow().bold(),
                         console::style(&e.subject_id).cyan(),
                         reason
                     );
                 }
             },
-            &report,
+            &report.to_json(),
         );
         return Ok(());
     }
@@ -576,8 +636,7 @@ pub fn run_unblock(
     let conn = open_db()?;
 
     if all {
-        let existing = counts(&conn)?;
-        let total: i64 = existing.iter().map(|(_, n)| n).sum();
+        let total = block_report(&conn)?.count() as i64;
         if total == 0 {
             let report = json!({ "ok": true, "removed": 0, "unblocked": false });
             print_output(

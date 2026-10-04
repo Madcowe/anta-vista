@@ -39,6 +39,14 @@ impl BlockKind {
 #[derive(Debug, Clone)]
 pub struct BlockEntry {
     pub subject_kind: BlockKind,
+    /// The `subject_kind` exactly as stored.
+    ///
+    /// Kept alongside the parsed kind because `BlockKind` cannot represent a
+    /// value it does not know, and `subject_kind` has no CHECK constraint: a
+    /// row written by a newer build, or a corrupted database, would otherwise
+    /// be silently reported as a `resource` block. Callers that *display* a
+    /// subject should use this, and reserve `subject_kind` for matching.
+    pub subject_kind_raw: String,
     pub subject_id: String,
     pub reason: Option<String>,
     pub blocked_at: i64,
@@ -119,6 +127,7 @@ pub fn list_all(conn: &Connection) -> SqlResult<Vec<BlockEntry>> {
         let kind_str: String = row.get(0)?;
         Ok(BlockEntry {
             subject_kind: BlockKind::parse(&kind_str).unwrap_or(BlockKind::Resource),
+            subject_kind_raw: kind_str,
             subject_id: row.get(1)?,
             reason: row.get(2)?,
             blocked_at: row.get(3)?,
@@ -138,27 +147,6 @@ pub fn clear(conn: &Connection, kind: Option<BlockKind>) -> SqlResult<usize> {
         ),
         None => conn.execute("DELETE FROM blocks", []),
     }
-}
-
-/// How many subjects of each kind are blocked, for `av status`.
-///
-/// Returns an empty map if the table is missing, so status reporting cannot
-/// itself become the thing that breaks.
-pub fn counts_by_kind(conn: &Connection) -> SqlResult<Vec<(BlockKind, i64)>> {
-    let mut stmt =
-        match conn.prepare("SELECT subject_kind, COUNT(*) FROM blocks GROUP BY subject_kind") {
-            Ok(s) => s,
-            Err(_) => return Ok(vec![]),
-        };
-    let rows = stmt.query_map([], |row| {
-        let kind_str: String = row.get(0)?;
-        let n: i64 = row.get(1)?;
-        Ok((
-            BlockKind::parse(&kind_str).unwrap_or(BlockKind::Resource),
-            n,
-        ))
-    })?;
-    rows.collect()
 }
 
 /// Delete a resource row, relying on the `ON DELETE CASCADE` foreign keys that

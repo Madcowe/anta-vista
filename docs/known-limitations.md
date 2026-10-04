@@ -202,3 +202,33 @@ All other crates are fully tested on Windows. Run
 first use, then serves every later call from disk. Weights are cached under the
 OS cache dir (`av_core::paths::cache_dir`); set `FASTEMBED_CACHE_DIR` to choose a
 different location. Air-gapped environments must pre-cache the model there.
+
+## Opening a large or undisplayable Autonomi record
+A record the browser cannot usefully display is downloaded rather than opened, and
+so is anything over the 32 MB viewer limit, which `POST /api/view/blob` enforces.
+In both cases the bytes are already in the browser, so the file is written straight
+from memory with the server-supplied name and nothing is uploaded; the 64 MB record
+at `autonomi://f6eeba94008f493a8518186b0647df6d39dbde75f41d5b79549e9a4e63a1ab43`
+completes in about 35 s this way, and the status line names every reason that
+applied.
+
+The SDK reports `application/octet-stream` for most records, so the page sends the
+leading 16 KB to `POST /api/view/plan` and lets the *content* decide the type
+before deciding to upload anything. Images, PDFs and pages are therefore shown
+rather than downloaded despite carrying no content type of their own.
+
+That recovery is deliberately partial. A prefix may confirm a specific type but
+never assert a generic one: magic numbers, an HTML marker and a markdown convention
+are positive signals that survive truncation, but "this whole file is text" follows
+from the *absence* of binary structure, and a prefix cannot establish an absence.
+A record whose type is only knowable from the whole file — a plain `.txt` with no
+marker and no trustworthy name in its location — is therefore still downloaded, and
+so is a `.md` whose first line is a paragraph rather than a heading. Guessing
+`text/plain` would show the former and render mojibake, which is worse than a
+download that always works.
+
+Markdown is the sharpest case of this: it has no content signature at all, so it is
+recognised only when it opens with front matter or an ATX heading, and it is always
+*downloaded* rather than opened even then — a browser handed `text/markdown`
+treats it as an unknown type. What the recognition buys is the name, `doc.md`
+instead of an untyped blob.

@@ -608,6 +608,452 @@ fn the_viewer_serves_the_bytes_inline_from_its_own_origin() {
 }
 
 #[test]
+fn a_renderable_type_is_served_inline_and_a_binary_one_is_offered_as_a_file() {
+    // The disposition was hardcoded `inline`, which for a type a browser cannot
+    // display is an empty window with no error and no download — the complaint
+    // that an Autonomi link "just closes". The two cases have to differ, decided
+    // by `is_browser_renderable` rather than by anything the page believes.
+    let s = server();
+
+    let html = s.post_binary(
+        "/api/view/blob",
+        b"<!doctype html><title>renderable</title>",
+        &[("X-Anta-Uri", test_address("disp-html").as_str())],
+    );
+    assert_eq!(html.status, 200, "{}", html.body);
+    let (port, path) = split_viewer_url(&html.json()["url"].as_str().unwrap());
+    let (status, head, _) = get_on_port(port, &path);
+    assert_eq!(status, 200);
+    assert!(
+        head.contains("content-disposition: inline"),
+        "a webpage must open as a webpage: {head}"
+    );
+
+    // Bytes with nothing to display them: named, and downloaded.
+    let bin = s.post_binary(
+        "/api/view/blob",
+        &[0x00, 0x01, 0x02, 0xff, 0xfe],
+        &[("X-Anta-Uri", test_address("disp-bin").as_str())],
+    );
+    assert_eq!(bin.status, 200, "{}", bin.body);
+    let name = bin.json()["filename"].as_str().unwrap().to_string();
+    let (port, path) = split_viewer_url(&bin.json()["url"].as_str().unwrap());
+    let (status, head, _) = get_on_port(port, &path);
+    assert_eq!(status, 200);
+    assert!(
+        head.contains("content-disposition: attachment"),
+        "an undisplayable type must be offered as a file, not shown as a blank window: {head}"
+    );
+    assert!(
+        head.contains(&format!("filename=\"{name}\"")),
+        "the attachment does not name the file ({name}): {head}"
+    );
+}
+
+#[test]
+fn a_hostile_filename_cannot_inject_a_viewer_header() {
+    // The name reaches a header the browser parses, on an origin that is allowed
+    // to serve text/html. `suggest_filename` reduces this to one path segment
+    // today, so the escaping is belt-and-braces — but a builder that cannot
+    // escape is a trap, and this one is four lines.
+    let s = server();
+    let uri = format!(
+        "autonomi://{}/\"injected\":\r\nX-Evil:\r\nyes",
+        "a".repeat(64)
+    );
+    let res = s.post_binary(
+        "/api/view/blob",
+        &[0u8, 1, 2],
+        &[("X-Anta-Uri", uri.as_str())],
+    );
+    // The location may be refused outright, which is also fine; what must never
+    // happen is a second header appearing.
+    if res.status == 200 {
+        let (port, path) = split_viewer_url(&res.json()["url"].as_str().unwrap());
+        let (_, head, _) = get_on_port(port, &path);
+        assert!(
+            !head.contains("x-evil"),
+            "a filename injected a response header: {head}"
+        );
+        assert!(
+            !head.contains("\r\ninjected"),
+            "a filename broke out of the header value: {head}"
+        );
+    }
+}
+
+#[test]
+fn view_plan_answers_from_a_prefix_without_the_file() {
+    // The whole point: a 64 MB record was fetched successfully, then failed
+    // because asking for its *name* meant uploading all 64 MB to `/api/view/blob`
+    // and hitting `MAX_BODY`. So the plan sends at most a bounded prefix, and
+    // an empty body still works — the hint-only answers below are the
+    // no-bytes-at-all case, not a special mode.
+    let s = server();
+    let uri = test_address("plan");
+
+    let res = s.request_raw(
+        "POST",
+        "/api/view/plan",
+        b"",
+        None,
+        &[("X-Anta-Uri", uri.as_str()), ("X-Anta-Mime", "text/html")],
+    );
+    assert_eq!(res.status, 200, "{}", res.body);
+    let body = res.json();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["renderable"], true, "text/html is displayable: {body}");
+    assert!(
+        body["filename"].as_str().unwrap().ends_with(".html"),
+        "the name should come from the location and type: {body}"
+    );
+
+    // A type we cannot place must answer "download it", which always works.
+    let vague = s.request_raw(
+        "POST",
+        "/api/view/plan",
+        b"",
+        None,
+        &[
+            ("X-Anta-Uri", uri.as_str()),
+            ("X-Anta-Mime", "application/octet-stream"),
+        ],
+    );
+    assert_eq!(vague.json()["renderable"], false, "{:?}", vague.body);
+
+    // And an absent hint is treated as unknown rather than as permission.
+    let none = s.request_raw(
+        "POST",
+        "/api/view/plan",
+        b"",
+        None,
+        &[("X-Anta-Uri", uri.as_str())],
+    );
+    assert_eq!(none.json()["renderable"], false, "{:?}", none.body);
+}
+
+#[test]
+fn the_plan_reads_the_bytes_when_the_sdk_reports_octet_stream() {
+    // The Autonomi SDK hands the page `application/octet-stream` for most real
+    // records, because a DataMap chunk carries no content type. Believing that
+    // sent every real image and PDF to a download instead of showing it, so the
+    // plan gets the leading bytes and lets content win.
+    let s = server();
+    let uri = test_address("prefix-sniff");
+
+    // A JPEG's magic number is three bytes. Octet-stream hint, JPEG bytes.
+    let jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00";
+    let res = s.request_raw(
+        "POST",
+        "/api/view/plan",
+        jpeg,
+        None,
+        &[
+            ("X-Anta-Uri", uri.as_str()),
+            ("X-Anta-Mime", "application/octet-stream"),
+        ],
+    );
+    assert_eq!(res.status, 200, "{}", res.body);
+    let body = res.json();
+    assert_eq!(body["mime_type"], "image/jpeg", "{body}");
+    assert_eq!(body["renderable"], true, "a JPEG is displayable: {body}");
+    assert!(
+        body["filename"].as_str().unwrap().ends_with(".jpg"),
+        "the name should follow the sniffed type: {body}"
+    );
+
+    // A prefix that decodes cleanly but proves nothing stays unrenderable.
+    // Calling it text would display mojibake; "download it" always works.
+    let vague = s.request_raw(
+        "POST",
+        "/api/view/plan",
+        b"just some leading bytes that say nothing at all",
+        None,
+        &[
+            ("X-Anta-Uri", uri.as_str()),
+            ("X-Anta-Mime", "application/octet-stream"),
+        ],
+    );
+    let vague = vague.json();
+    assert_eq!(vague["mime_type"], "application/octet-stream", "{vague}");
+    assert_eq!(vague["renderable"], false, "{vague}");
+
+    // An HTML page is recognised from the marker, so a fetched web page opens
+    // rather than downloading even though its bytes are only a prefix.
+    let page = b"<!DOCTYPE html>\n<html><head><title>t</title></head><body>hi</body></html>";
+    let page = s.request_raw(
+        "POST",
+        "/api/view/plan",
+        page,
+        None,
+        &[
+            ("X-Anta-Uri", uri.as_str()),
+            ("X-Anta-Mime", "application/octet-stream"),
+        ],
+    );
+    assert_eq!(page.json()["renderable"], true, "{}", page.body);
+}
+
+#[test]
+fn a_download_is_named_with_an_extension_we_know() {
+    // The author's name wins, but a name with no extension leaves the operating
+    // system unable to open what it just saved. We already know the type by this
+    // point, so the extension is added rather than left off.
+    let s = server();
+    let uri = test_address("named-record");
+
+    // A record the author published as `autonomi://<hex>/photo`.
+    let named = format!("{uri}/photo");
+    let res = s.request_raw(
+        "POST",
+        "/api/view/plan",
+        b"\xff\xd8\xff\xe0\x00\x10JFIF\x00",
+        None,
+        &[("X-Anta-Uri", named.as_str())],
+    );
+    let body = res.json();
+    assert_eq!(body["filename"], "photo.jpg", "{body}");
+
+    // An extension the author did choose is left exactly as they wrote it.
+    let chosen = format!("{uri}/photo.png");
+    let kept = s
+        .request_raw(
+            "POST",
+            "/api/view/plan",
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00",
+            None,
+            &[("X-Anta-Uri", chosen.as_str())],
+        )
+        .json();
+    assert_eq!(kept["filename"], "photo.png", "{kept}");
+}
+
+#[test]
+fn a_seeded_autonomi_record_is_searchable_and_gets_the_open_and_save_actions() {
+    // The end of the chain the prefix sniff exists to serve: a real Autonomi
+    // location, embedded under the profile search actually loads, reaches the
+    // page as a result row with both actions offered. The content here is what
+    // `indexAutonomiInBrowser` stores, so if that path changed shape this would
+    // be the test to notice.
+    let server = server();
+    let id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let uri = test_address("seeded-record");
+    seed_searchable_resource(&server.db, id, &uri, "text/html");
+
+    let found = server.json("/api/search?q=quokka%20telemetry");
+    let hit = found["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .find(|r| r["resource_id"] == id)
+        .unwrap_or_else(|| panic!("the seeded record was not searchable: {found}"));
+    assert_eq!(hit["location"], uri.as_str());
+    assert_eq!(hit["source"], "local", "it is held locally: {hit}");
+}
+
+#[test]
+fn an_octet_stream_typed_record_is_served_inline_when_its_bytes_say_otherwise() {
+    // The server half of the fix. The viewer already sniffed full bytes, so this
+    // did not change; it is pinned because the *client* used to decide against
+    // the SDK's reported type and download a record the viewer would happily
+    // have displayed. If this regresses, the page stops being able to open real
+    // images and only the download path remains.
+    let server = server();
+    let uri = test_address("inline-jpeg");
+    let jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00";
+
+    let body = server
+        .post_binary(
+            "/api/view/blob",
+            jpeg,
+            &[
+                ("X-Anta-Uri", uri.as_str()),
+                ("X-Anta-Mime", "application/octet-stream"),
+            ],
+        )
+        .json();
+    let (port, path) = split_viewer_url(body["url"].as_str().expect("url"));
+    let (status, head, _bytes) = get_on_port(port, &path);
+    let head = head.to_lowercase();
+
+    assert_eq!(status, 200);
+    assert!(
+        head.contains("content-disposition: inline"),
+        "a JPEG must be shown, not downloaded: {head}"
+    );
+    assert!(
+        head.contains("content-type: image/jpeg"),
+        "served as the sniffed type: {head}"
+    );
+}
+
+#[test]
+fn the_client_and_server_agree_on_the_prefix_cap() {
+    // Two constants in two languages. If they drift, the page either gets a 400
+    // it cannot explain or uploads more than it means to, and neither is visible
+    // from either side alone.
+    let js = js_code(&server().get("/assets/app.js").body);
+    assert!(
+        js.contains("PLAN_PREFIX = 16 * 1024"),
+        "the page's prefix cap changed without the server following"
+    );
+    assert!(
+        js.contains("blob.slice(0, PLAN_PREFIX)"),
+        "the page stopped bounding what it sends"
+    );
+}
+
+#[test]
+fn a_markdown_record_is_named_from_its_content() {
+    // Markdown has no signature, so `infer` cannot see it, and the SDK reports
+    // octet-stream for it anyway. It arrived as an untyped blob with no
+    // extension at all; it is now named for what it is.
+    let s = server();
+    let uri = test_address("markdown");
+    let doc = b"# Weather log\n\nWind is picking up from the west.\n\n## Tomorrow\n\nRain.";
+
+    let res = s.request_raw(
+        "POST",
+        "/api/view/plan",
+        doc,
+        None,
+        &[
+            ("X-Anta-Uri", uri.as_str()),
+            ("X-Anta-Mime", "application/octet-stream"),
+        ],
+    );
+    let body = res.json();
+    assert_eq!(body["mime_type"], "text/markdown", "{body}");
+    assert!(
+        body["filename"].as_str().unwrap().ends_with(".md"),
+        "a markdown record should be named .md: {body}"
+    );
+    // Not displayable, and deliberately so: a browser given `text/markdown`
+    // treats it as an unknown type, so opening it is the blank-window case. The
+    // name was the thing that was missing.
+    assert_eq!(body["renderable"], false, "{body}");
+}
+
+#[test]
+fn the_plan_refuses_a_body_larger_than_its_prefix_cap() {
+    // Clamping would be defensible here (a truncated prefix is still a prefix)
+    // but it would hide a page uploading far more than it means to, and this
+    // endpoint's whole premise is that it uploads very little.
+    let s = server();
+    let uri = test_address("prefix-cap");
+    let over = vec![b'a'; 16 * 1024 + 1];
+    let res = s.request_raw(
+        "POST",
+        "/api/view/plan",
+        &over,
+        None,
+        &[("X-Anta-Uri", uri.as_str())],
+    );
+    assert_eq!(res.status, 400, "{}", res.body);
+    assert_eq!(res.json()["error"], "body_too_large", "{}", res.body);
+
+    // Exactly at the cap is allowed, so the limit is not off by one.
+    let at = vec![b'a'; 16 * 1024];
+    let ok = s.request_raw(
+        "POST",
+        "/api/view/plan",
+        &at,
+        None,
+        &[("X-Anta-Uri", uri.as_str())],
+    );
+    assert_eq!(ok.status, 200, "{}", ok.body);
+}
+
+#[test]
+fn a_failed_fetch_explains_itself_in_the_tab_it_opened() {
+    // The tab used to close on every error, leaving the explanation behind it.
+    let s = server();
+    for code in [
+        "fetch_failed",
+        "no_backend",
+        "blocked_popup",
+        "anything_else",
+    ] {
+        let res = s.get(&format!("/view/error?code={code}"));
+        assert_eq!(res.status, 200, "{code}: {}", res.body);
+        assert!(
+            res.body.contains("</html>"),
+            "{code} did not render a page: {}",
+            res.body
+        );
+    }
+
+    // Nothing from the network reaches this page: an SDK error string is
+    // attacker-influenced, so the vocabulary is these codes and nothing else.
+    let injected = s.get("/view/error?code=%3Cscript%3Ealert(1)%3C/script%3E");
+    assert!(
+        !injected.body.contains("<script>"),
+        "the code parameter was reflected as markup: {}",
+        injected.body
+    );
+}
+
+#[test]
+fn opening_severs_the_opener_and_saving_never_uploads_the_file() {
+    // Two regressions, both static. `window.open`'s `noopener` feature returns
+    // null, which is why the handle is used and `opener` is nulled by hand —
+    // cross-origin stops a fetched document reading the app, but nothing stopped
+    // it navigating the app, and content from a peer is exactly the untrusted
+    // input here.
+    let js = js_code(&server().get("/assets/app.js").body);
+    assert!(
+        js.contains("tab.opener = null"),
+        "the opened tab keeps a reference to the app"
+    );
+    assert!(
+        !js.contains("'noopener'"),
+        "the noopener feature returns null and would break the redirect"
+    );
+
+    // Save used to POST the record to /api/view/blob to read back a filename,
+    // so saving anything over MAX_BODY failed after downloading it fine.
+    // Bounded by the next handler, so an unrelated later block cannot satisfy or
+    // break the assertion.
+    let save = js
+        .split("saveBtn.addEventListener")
+        .nth(1)
+        .expect("no save handler")
+        .split("stopBtn.addEventListener")
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !save.contains("postBlob"),
+        "save still uploads the file to learn its name: {save}"
+    );
+    assert!(
+        save.contains("postPlan("),
+        "save does not ask the server for the name: {save}"
+    );
+
+    // Asking the server now means sending *some* bytes, because the Autonomi SDK
+    // reports octet-stream for most records and the type has to come from the
+    // content. What must never come true is sending the whole file: that is the
+    // bug this endpoint exists to avoid, and a prefix makes it cheap to keep
+    // avoiding it.
+    assert!(
+        js.contains("blob.slice(0, PLAN_PREFIX)"),
+        "the plan sends the whole file rather than a prefix"
+    );
+    let plan = js
+        .split("const postPlan")
+        .nth(1)
+        .expect("no postPlan")
+        .split("function downloadBlob")
+        .next()
+        .unwrap_or_default();
+    assert!(
+        !plan.contains("postBlob"),
+        "the plan routes the file through the full-body uploader: {plan}"
+    );
+}
+
+#[test]
 fn the_viewer_only_serves_its_own_token() {
     let uri = test_address("viewer-scope");
     let body = server()
@@ -1361,6 +1807,65 @@ fn seed_resource(db: &std::path::Path, id: &str, location: &str) {
     .expect("insert embedding");
 }
 
+/// Seed a resource that a real search will actually return.
+///
+/// The `p-purge` helper above is deliberately invisible to search: it embeds
+/// under a profile no search loads, so it cannot perturb another test's
+/// results. This one is the opposite — it exists to be *found* — so it embeds
+/// under the profile `MockEmbeddingProvider` reports (`all-MiniLM-L6-v2:v1`).
+///
+/// The vector must be 384-dimensional to match that profile, and unit-length
+/// because the profile declares `normalized`. `cosine_similarity` opens with
+/// `debug_assert_eq!(a.len(), b.len())`, so a short vector panics every search
+/// in this file under `cargo test`; with assertions compiled out it would be
+/// worse, since `iter().zip()` would silently score against a truncated vector.
+/// A one-hot vector is unit-length by construction.
+fn seed_searchable_resource(db: &std::path::Path, id: &str, location: &str, mime: &str) {
+    use av_core::types::{ResourceDescriptor, ResourceKind};
+
+    const PROFILE: &str = "all-MiniLM-L6-v2:v1";
+    const DIM: usize = 384;
+
+    let conn = av_store::open(db).expect("open test db");
+    av_store::repo::resources::insert(
+        &conn,
+        &ResourceDescriptor {
+            id: id.to_string(),
+            kind: ResourceKind::Text,
+            location: location.to_string(),
+            location_scheme: Some("autonomi".to_string()),
+            location_canonical: Some(location.to_string()),
+            mime_type: mime.to_string(),
+            filename: None,
+            metadata_json: serde_json::json!({}),
+            description_text: "a seeded record about quokka telemetry".to_string(),
+            created_at: 1_700_000_000,
+        },
+    )
+    .expect("insert resource");
+
+    // OR IGNORE: the tests share one database, so another test may have created
+    // this profile already.
+    conn.execute(
+        "INSERT OR IGNORE INTO embedding_profiles
+           (profile_id, model_id, model_version, dim, normalized, preproc_version)
+         VALUES (?1, 'all-MiniLM-L6-v2', 'v1', ?2, 1, 'v1')",
+        rusqlite::params![PROFILE, DIM as i64],
+    )
+    .expect("insert profile");
+
+    // One-hot: a single 1.0 in an otherwise zero vector. Unit length, so it is a
+    // legal normalised embedding without depending on the real model.
+    let mut vector = vec![0.0f32; DIM];
+    vector[0] = 1.0;
+    conn.execute(
+        "INSERT INTO embeddings (resource_id, profile_id, vector_json, l2_norm, created_at)
+         VALUES (?1, ?2, ?3, 1.0, 1700000000)",
+        rusqlite::params![id, PROFILE, serde_json::to_string(&vector).unwrap()],
+    )
+    .expect("insert embedding");
+}
+
 /// Count rows for one subject. `resources` keys on `id` while everything that
 /// references it uses `resource_id`, so the column is passed in.
 fn count_rows(db: &std::path::Path, table: &str, column: &str, id: &str) -> i64 {
@@ -1820,6 +2325,35 @@ fn the_status_trigger_is_a_toggle_rather_than_an_open_button() {
             .contains(r#"id="open-status" class="btn btn-quiet" aria-expanded="false""#),
         "the status trigger must advertise its collapsed state up front"
     );
+}
+
+/// Strip `/* */` and `//` comments from JavaScript, so an assertion about code
+/// cannot pass or fail on the word appearing in the comment explaining it.
+///
+/// The same trap `css_rule` exists to avoid: this file's own comments name the
+/// identifiers the tests look for, including the one this feature is about, so a
+/// bare `contains` here would match prose. Not a full parser — string literals
+/// are passed through untouched, which is fine because the assertions only look
+/// for call shapes.
+fn js_code(js: &str) -> String {
+    let mut out = String::with_capacity(js.len());
+    let mut rest = js;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        rest = match rest[start + 2..].find("*/") {
+            Some(end) => &rest[start + 2 + end + 2..],
+            None => return out,
+        };
+    }
+    out.push_str(rest);
+
+    out.lines()
+        .map(|line| match line.find("//") {
+            Some(i) => &line[..i],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]

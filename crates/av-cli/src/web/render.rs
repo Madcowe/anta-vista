@@ -427,3 +427,110 @@ const JS_MIME: &str = "application/javascript; charset=utf-8";
 /// content type other than this, so serving the SDK's WASM as anything else
 /// fails at download time with a MIME error that reads like a network problem.
 const WASM_MIME: &str = "application/wasm";
+
+/// The page a fetch failure lands in, shown in the tab that was opened for the
+/// file.
+///
+/// It exists because the tab used to just close. A tab that vanishes leaves the
+/// explanation behind it, in a row on a page the user has to go back to; a tab
+/// that says why keeps the reason where the user is already looking. It is
+/// deliberately standalone — no `app.js`, no stylesheet, no API access — and the
+/// only input is a code matched against a fixed table below.
+///
+/// Nothing from the network reaches this page. An SDK error string is attacker-
+/// influenced, so it is written into the row's status line with `textContent`
+/// and never interpolated into markup here; the codes below are the whole
+/// vocabulary.
+pub fn view_error_page(query: &str) -> WebResponse {
+    let code = query_param(query, "code").unwrap_or_default();
+    let (title, detail) = match code.as_str() {
+        "fetch_failed" => (
+            "That file could not be fetched",
+            "The Autonomi network did not deliver this record. It may be offline, \
+             or the address may not point at anything fetchable.",
+        ),
+        "no_backend" => (
+            "No way to open this file",
+            "This browser cannot reach the Autonomi network, and no local daemon \
+             is available to fetch it instead.",
+        ),
+        "blocked_popup" => (
+            "Your browser blocked the tab",
+            "Allow pop-ups for this page, then try Open again.",
+        ),
+        _ => (
+            "That file could not be opened",
+            "Something went wrong before the file could be shown. The details are \
+             in the anta-vista tab this one was opened from.",
+        ),
+    };
+
+    text_response(200, HTML_MIME, &error_page_html(title, detail))
+}
+
+/// Pull one parameter out of a raw query string, percent-decoding it.
+///
+/// Deliberately minimal and allocation-light: the only caller passes a `code`
+/// that is matched against fixed strings, so a malformed escape yields no match
+/// rather than an error path of its own.
+fn query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=')?;
+        if k == key {
+            return Some(v.replace('+', " "));
+        }
+    }
+    None
+}
+
+/// Escapes the two characters that matter in text content. `title` and `detail`
+/// are compile-time constants today, so this is belt-and-braces for the next
+/// caller rather than a live need — but an HTML builder that cannot escape is a
+/// trap, and this one is small.
+fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn error_page_html(title: &str, detail: &str) -> String {
+    let t = esc(title);
+    let d = esc(detail);
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{t}</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    padding: 2rem; box-sizing: border-box;
+    font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+    background: Canvas; color: CanvasText;
+  }}
+  main {{ max-width: 34rem; }}
+  h1 {{ font-size: 1.25rem; margin: 0 0 .5rem; }}
+  p {{ margin: 0; opacity: .8; }}
+</style>
+</head>
+<body>
+<main>
+<h1>{t}</h1>
+<p>{d}</p>
+</main>
+</body>
+</html>
+"#
+    )
+}

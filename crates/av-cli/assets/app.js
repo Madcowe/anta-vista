@@ -142,6 +142,51 @@ const postBlob = (path, uri, blob, extra = {}) =>
     body: blob,
   });
 
+/* Mirrors the server's PLAN_PREFIX_CAP. Bytes decide the type in the first few
+ * hundred, so this is generous rather than tuned; it exists to keep the request
+ * small, not to cut a signal short. `slice` caps it, so the page cannot send
+ * more however large the record is. */
+const PLAN_PREFIX = 16 * 1024;
+
+/* Ask the server what a file should be called and whether a browser can show it.
+ *
+ * Sends the leading PLAN_PREFIX bytes, not the file. The point of this call is
+ * to avoid uploading a file already sitting in memory, and the Autonomi SDK
+ * reports `application/octet-stream` for most records — a DataMap chunk carries
+ * no content type — so trusting that type alone sent real images and PDFs to a
+ * download. A prefix is enough to see magic bytes and an HTML marker, which is
+ * what the verdict actually turns on.
+ *
+ * The renderable verdict is computed server-side from `is_browser_renderable`,
+ * because the viewer independently applies the same policy when it picks
+ * `inline` versus `attachment` — two copies of "can a browser display this?"
+ * would drift, and the drift would show up as a blank window. */
+const postPlan = (uri, mimeType, blob) =>
+  api('/api/view/plan', {
+    method: 'POST',
+    headers: {
+      'X-Anta-Uri': uri,
+      'X-Anta-Mime': mimeType || '',
+      'Content-Type': 'application/octet-stream',
+    },
+    body: blob ? blob.slice(0, PLAN_PREFIX) : null,
+  });
+
+/* Hand bytes straight to the browser as a file, named by the server.
+ *
+ * A Blob the page already holds needs no server round-trip and no size limit;
+ * the object URL is the only way to get at it. Revoking on the next tick rather
+ * than synchronously matters: revoking it immediately can cancel the download
+ * in some browsers before it has started reading. */
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 const AUTONOMI_SCHEME = /^autonomi:\/\//i;
 
 /* The record address an `autonomi://` location refers to: bare 64 hex.
@@ -330,6 +375,14 @@ function wireFetch(node, result, statusEl) {
    * starts, and be pointed at the result once it arrives. */
   const openView = async (statusEl) => {
     const tab = window.open('', '_blank');
+    /* Sever the opener relationship immediately. `window.open`'s `noopener`
+     * feature cannot be used for this, because it makes the call return null
+     * and the handle is what the finished file is loaded into. Cross-origin
+     * means the fetched document cannot *read* the app, but it can *navigate*
+     * it, which is enough to replace this page with something convincing. The
+     * tab is still blank scriptless about:blank at this point, so there is no
+     * window to exploit between the open and this line. */
+    if (tab) tab.opener = null;
     if (!tab) {
       setStatus(
         statusEl,
@@ -339,6 +392,33 @@ function wireFetch(node, result, statusEl) {
     }
     try {
       const blob = await obtain(statusEl);
+
+      /* Decide before uploading. Both reasons used to be discovered by POSTing
+       * the file and being refused: a 64 MB record was fetched successfully and
+       * then failed with "request body is larger than the 33554432 byte limit",
+       * and an unrenderable type was served `inline` and shown as an empty
+       * window. We are already holding the bytes in both cases, so neither needs
+       * the round-trip — ask for the name and the verdict, then act. Only the
+       * leading prefix goes up, so this stays cheap for a 64 MB record. */
+      const plan = await postPlan(result.location, blob.type, blob);
+
+      if (!plan.renderable || blob.size > MAX_UPLOAD) {
+        /* Both reasons are stated when both apply. A large binary hits both, and
+         * naming only the type would leave the size — the thing that actually
+         * made this slow — unmentioned. */
+        const why = [
+          !plan.renderable && 'this file type cannot be shown in a browser',
+          blob.size > MAX_UPLOAD &&
+            `it is ${formatBytes(blob.size)}, over the ${formatBytes(MAX_UPLOAD)} viewer limit`,
+        ]
+          .filter(Boolean)
+          .join(', and ');
+        downloadBlob(blob, plan.filename);
+        if (tab) tab.close();
+        setStatus(statusEl, `Downloaded as ${plan.filename} \u2014 ${why}.`, 'ok');
+        return;
+      }
+
       setStatus(statusEl, 'Opening\u2026', '');
       const view = await postBlob('/api/view/blob', result.location, blob);
       if (tab) {
@@ -353,10 +433,17 @@ function wireFetch(node, result, statusEl) {
         );
       }
     } catch (err) {
-      if (tab) tab.close();
+      /* The tab is kept, and told why. It used to be closed on every error,
+       * which is what made a 64 MB file look like a link that "does nothing":
+       * the tab vanished and the explanation sat in a row behind it. */
       if (err.name === 'DownloadCancelled') {
+        if (tab) tab.close();
         setStatus(statusEl, 'Stopped.', '');
       } else {
+        const failedEarly = !cached;
+        if (tab) {
+          tab.location.replace(`/view/error?code=${failedEarly ? 'fetch_failed' : 'viewer_failed'}`);
+        }
         setStatus(statusEl, `Could not fetch that file: ${err.message}`, 'bad');
       }
     }
@@ -393,17 +480,15 @@ function wireFetch(node, result, statusEl) {
       const blob = await obtain(statusEl);
       /* Ask the server for the name rather than using the SDK's: it reports
        * `public-file-<8hex>.bin` for every file, so a save here would put
-       * everything on disk under the same name. */
-      const view = await postBlob('/api/view/blob', result.location, blob);
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = view.filename;
-      link.click();
-      /* Released on the next tick: revoking it synchronously can cancel the
-       * download in some browsers before it has started reading. */
-      setTimeout(() => URL.revokeObjectURL(url), 0);
-      setStatus(statusEl, `Saved as ${view.filename}.`, 'ok');
+       * everything on disk under the same name.
+       *
+       * It used to POST the whole record to `/api/view/blob` purely to read that
+       * name back, which meant saving anything over `MAX_BODY` failed — having
+       * downloaded it successfully first. The bytes are already here; only the
+       * name and the verdict are needed, so only a prefix is asked for. */
+      const plan = await postPlan(result.location, blob.type, blob);
+      downloadBlob(blob, plan.filename);
+      setStatus(statusEl, `Saved as ${plan.filename}.`, 'ok');
     } catch (err) {
       if (err.name === 'DownloadCancelled') {
         setStatus(statusEl, 'Stopped.', '');

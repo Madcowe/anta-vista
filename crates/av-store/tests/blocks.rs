@@ -134,25 +134,37 @@ fn clear_can_target_one_kind_or_everything() {
 }
 
 #[test]
-fn counts_by_kind_reports_each_kind() {
+fn the_stored_kind_label_is_preserved_verbatim() {
+    // `subject_kind` has no CHECK constraint, so a row written by a newer build
+    // (or a corrupted file) can hold a value `BlockKind` cannot represent.
+    // Reporting it as a `resource` block would be a lie about local policy, so
+    // the raw label travels alongside the parsed kind for callers to display.
     let conn = open_in_memory().expect("in-memory db");
-    blocks::add(&conn, BlockKind::Agent, AGENT_A, None, now(), "cli").unwrap();
-    blocks::add(&conn, BlockKind::Agent, AGENT_B, None, now(), "cli").unwrap();
     blocks::add(&conn, BlockKind::Resource, RES_A, None, now(), "cli").unwrap();
+    conn.execute(
+        "INSERT INTO blocks (subject_kind, subject_id, blocked_at, source)
+         VALUES ('watchlist', 'wl-1', 1, 'manual')",
+        [],
+    )
+    .expect("insert a kind this build does not know");
 
-    let counts = blocks::counts_by_kind(&conn).unwrap();
-    let agent_count = counts
+    let entries = blocks::list_all(&conn).unwrap();
+    let unknown = entries
         .iter()
-        .find(|(k, _)| *k == BlockKind::Agent)
-        .map(|(_, n)| *n)
-        .unwrap();
-    let resource_count = counts
-        .iter()
-        .find(|(k, _)| *k == BlockKind::Resource)
-        .map(|(_, n)| *n)
-        .unwrap();
-    assert_eq!(agent_count, 2);
-    assert_eq!(resource_count, 1);
+        .find(|e| e.subject_id == "wl-1")
+        .expect("the unknown-kind row must still be listed");
+    assert_eq!(unknown.subject_kind_raw, "watchlist");
+    // The parsed kind stays a `BlockKind` for matching, so typed callers are
+    // unaffected by the extra field.
+    assert_eq!(unknown.subject_kind, BlockKind::Resource);
+    assert_eq!(
+        entries
+            .iter()
+            .find(|e| e.subject_id == RES_A)
+            .unwrap()
+            .subject_kind_raw,
+        "resource"
+    );
 }
 
 #[test]

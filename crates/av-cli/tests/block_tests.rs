@@ -390,7 +390,7 @@ fn an_agent_id_that_cannot_be_an_agent_id_is_rejected() {
         );
     }
     assert_eq!(
-        blocks::counts_by_kind(&conn).unwrap().len(),
+        blocks::list_all(&conn).unwrap().len(),
         0,
         "nothing was stored"
     );
@@ -574,8 +574,18 @@ fn list_reports_every_kind_with_a_count() {
             .any(|e| e.subject_id == "r1" && e.reason.as_deref() == Some("spam"))
     );
 
-    let counts = block::counts(&conn).unwrap();
-    assert_eq!(counts.iter().map(|(_, n)| *n).sum::<i64>(), 3);
+    // The per-kind breakdown must account for every listed subject: a total
+    // that disagrees with its own parts is the bug this report shape had.
+    let report = block::block_report(&conn).unwrap();
+    assert_eq!(report.count(), 3);
+    assert_eq!(
+        report
+            .counts
+            .iter()
+            .map(|(_, n)| *n as usize)
+            .sum::<usize>(),
+        3
+    );
 }
 
 #[test]
@@ -745,7 +755,7 @@ fn an_abbreviated_id_of_a_local_resource_is_refused_with_the_full_id() {
         .unwrap(),
         "the full id must not have been blocked by an abbreviated request"
     );
-    assert_eq!(blocks::counts_by_kind(&conn).unwrap().len(), 0);
+    assert_eq!(blocks::list_all(&conn).unwrap().len(), 0);
 
     drop(dir);
 }
@@ -817,7 +827,7 @@ fn an_abbreviated_id_of_a_local_name_record_is_refused() {
         err.to_string()
             .contains("550e8400-e29b-41d4-a716-446655440000")
     );
-    assert_eq!(blocks::counts_by_kind(&conn).unwrap().len(), 0);
+    assert_eq!(blocks::list_all(&conn).unwrap().len(), 0);
 }
 
 #[test]
@@ -878,7 +888,7 @@ fn a_dropped_blocks_table_fails_closed_rather_than_serving_everything() {
     let (_dir, conn) = setup_with_populated_resource(
         "aaaabbbbccccddddeeeeffff00001111222233334444555566667777888899990",
     );
-    assert!(blocks::counts_by_kind(&conn).is_ok(), "precondition");
+    assert!(blocks::list_all(&conn).is_ok(), "precondition");
 
     // Simulate the block list becoming unreadable the way a real failure would:
     // the table is gone. Every policy read must refuse rather than treat the
@@ -955,4 +965,103 @@ fn a_dropped_blocks_table_fails_closed_rather_than_serving_everything() {
         err.is_err(),
         "name lookup must fail closed when the block list is unreadable, got {err:?}"
     );
+}
+
+#[test]
+fn the_per_kind_breakdown_accounts_for_every_listed_block() {
+    let _guard = env_lock();
+    let (_dir, conn) = setup_with_populated_resource("res-report");
+    for kind in [BlockKind::Resource, BlockKind::Name, BlockKind::Agent] {
+        blocks::add(&conn, kind, &format!("{kind:?}-subject"), None, 1, "cli").unwrap();
+    }
+
+    let report = block::block_report(&conn).unwrap();
+    let sum: i64 = report.counts.iter().map(|(_, n)| *n).sum();
+    assert_eq!(
+        sum as usize,
+        report.count(),
+        "the breakdown must add up to the total it summarises"
+    );
+    assert_eq!(report.counts.len(), 3, "one group per kind");
+}
+
+#[test]
+fn a_kind_this_build_does_not_know_keeps_its_own_heading() {
+    // `subject_kind` carries no CHECK constraint, so a row can hold a value
+    // `BlockKind` cannot represent. Grouping on the parsed kind would file it
+    // under `resource`, where a lookup finds a number that does not include it.
+    let _guard = env_lock();
+    let (_dir, conn) = setup_with_populated_resource("res-unknown-kind");
+    blocks::add(&conn, BlockKind::Resource, "res-a", None, 1, "cli").unwrap();
+    conn.execute(
+        "INSERT INTO blocks (subject_kind, subject_id, blocked_at, source)
+         VALUES ('watchlist', 'wl-1', 1, 'manual')",
+        [],
+    )
+    .unwrap();
+
+    let report = block::block_report(&conn).unwrap();
+    assert_eq!(report.count(), 2);
+    assert_eq!(report.counts.iter().map(|(_, n)| *n).sum::<i64>(), 2);
+    assert_eq!(
+        report.counts,
+        vec![("resource".to_string(), 1), ("watchlist".to_string(), 1)],
+        "an unknown kind is reported as itself, not folded into resource"
+    );
+    // And it is still listed, with the honest label.
+    let listed = report
+        .blocks
+        .iter()
+        .find(|e| e.subject_id == "wl-1")
+        .expect("listed");
+    assert_eq!(listed.subject_kind_raw, "watchlist");
+}
+
+#[test]
+fn the_breakdown_holds_while_another_thread_is_blocking() {
+    // The original defect: the total came from one query and the breakdown from
+    // a second, so a block landing between them produced a summary whose parts
+    // did not add up to its total. It reproduced roughly once in five full runs,
+    // which is why this asserts the invariant in a loop rather than one fixed
+    // number — a single snapshot would almost always pass.
+    let _guard = env_lock();
+    let (_dir, conn) = setup_with_populated_resource("res-race");
+
+    let writer_path = _dir.path().join("blocks.db");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_stop = stop.clone();
+    let writer = std::thread::spawn(move || {
+        let wconn = av_store::open(&writer_path).unwrap();
+        for i in 0..400u32 {
+            if writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            blocks::add(
+                &wconn,
+                BlockKind::Resource,
+                &format!("racer-{i:04}"),
+                None,
+                1,
+                "cli",
+            )
+            .unwrap();
+        }
+    });
+
+    let mut reads = 0;
+    for _ in 0..400 {
+        let report = block::block_report(&conn).unwrap();
+        let sum: i64 = report.counts.iter().map(|(_, n)| *n).sum();
+        assert_eq!(
+            sum as usize,
+            report.count(),
+            "count {} and breakdown {sum} disagree",
+            report.count()
+        );
+        reads += 1;
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(reads > 0);
 }

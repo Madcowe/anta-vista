@@ -14,6 +14,10 @@ use super::state::AppState;
 const URI_HEADER: &str = "X-Anta-Uri";
 const TAGS_HEADER: &str = "X-Anta-Tags";
 const FORCE_HEADER: &str = "X-Anta-Force";
+/// The MIME the page believes the fetched bytes have, used only to decide
+/// whether a browser can display them. It is a hint, not an assertion: the
+/// server still sniffs the bytes whenever it actually has them.
+const MIME_HEADER: &str = "X-Anta-Mime";
 
 /// Number of worker threads. Search fans out to peers over HTTP and can block
 /// for seconds, so a single-threaded server would let one slow query wedge the
@@ -23,6 +27,14 @@ const WORKERS: usize = 4;
 
 /// Largest request body we will buffer, to bound memory from a stray upload.
 const MAX_BODY: usize = 32 * 1024 * 1024;
+
+/// How many leading bytes `POST /api/view/plan` will accept.
+///
+/// Every MIME decision worth making is made in the first few hundred bytes —
+/// magic numbers are shorter still, and the HTML check reads 512 — so this is
+/// generous rather than tuned. It exists to bound the request, not to truncate
+/// a signal: a caller sending more is a bug worth reporting.
+const PLAN_PREFIX_CAP: usize = 16 * 1024;
 
 /// tiny_http buffers string bodies in a `Cursor`; one alias keeps signatures short.
 pub type WebResponse = Response<Cursor<Vec<u8>>>;
@@ -146,6 +158,9 @@ fn route(
         (Method::Get, "/api/search") => Ok(handlers::search(state, query)),
         (Method::Get, "/api/download") => Ok(handlers::download(state, query)),
         (Method::Get, "/api/blocks") => Ok(handlers::blocks_list(state)),
+        // Stands alone on its own origin: no app.js, no API access, and the only
+        // input is an enum, so an SDK error string can never be reflected here.
+        (Method::Get, "/view/error") => Ok(render::view_error_page(query)),
 
         (Method::Post, p) => {
             // Binary bodies are dispatched *before* the UTF-8 read below, which
@@ -164,6 +179,23 @@ fn route(
                     let uri = header(request, URI_HEADER).unwrap_or_default();
                     let body = read_body_bytes(request).map_err(RouteError::ready)?;
                     Ok(handlers::view_blob(&uri, &body))
+                }
+                // A bounded prefix of the bytes, never the whole file. It exists
+                // so the page can learn a filename it cannot invent itself, and
+                // whether the record is worth displaying, without uploading the
+                // file to ask — the mistake that made a 64 MB record fail with a
+                // "request body is larger" error after a successful fetch.
+                //
+                // The prefix is what makes that verdict honest: the Autonomi SDK
+                // reports `application/octet-stream` for most records, so
+                // trusting the reported type alone sent real images and PDFs to
+                // a download.
+                "/api/view/plan" => {
+                    let uri = header(request, URI_HEADER).unwrap_or_default();
+                    let mime = header(request, MIME_HEADER).unwrap_or_default();
+                    let prefix =
+                        read_body_capped(request, PLAN_PREFIX_CAP).map_err(RouteError::ready)?;
+                    Ok(handlers::view_plan(&uri, &mime, &prefix))
                 }
                 _ => {
                     let body = read_body(request)?;
@@ -264,6 +296,28 @@ fn read_body_bytes(request: &mut Request) -> Result<Vec<u8>, WebResponse> {
                 "request body is larger than the {MAX_BODY} byte limit; \
                  this file has to be fetched by the local daemon instead"
             ),
+        ));
+    }
+    Ok(buf)
+}
+
+/// Read a request body up to `cap` bytes, refusing anything larger.
+///
+/// Same rule as [`read_body_bytes`] — refused, never clamped — but with a cap of
+/// the caller's choosing rather than the upload limit. A truncated prefix would
+/// still be a valid prefix, so clamping here would not corrupt anything, but a
+/// silent clamp hides a page that is uploading far more than it means to, and
+/// this endpoint's whole premise is that it uploads very little.
+fn read_body_capped(request: &mut Request, cap: usize) -> Result<Vec<u8>, WebResponse> {
+    let mut buf = Vec::new();
+    Read::take(request.as_reader(), cap as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| json_error(400, "read_failed", &e.to_string()))?;
+    if buf.len() > cap {
+        return Err(json_error(
+            400,
+            "body_too_large",
+            &format!("request body is larger than the {cap} byte limit"),
         ));
     }
     Ok(buf)
