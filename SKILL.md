@@ -219,6 +219,37 @@ av stop --force                  # SIGKILL immediately, no grace period
 
 `av stop` runs offline (no x0x daemon needed) and sweeps every running `av listen` process — the PID-file-tracked one plus any others found via a `/proc` cmdline scan — sending SIGTERM then SIGKILL after ~3s, then clearing the PID file.
 
+### `av web`
+
+Browser interface. Serves search, indexing, naming, rating and blocking over
+loopback, and — unlike every other command — can fetch Autonomi records itself,
+from the browser, with nothing installed.
+
+```bash
+av web                        # serve, and open a browser
+av web --no-open              # serve only
+av web --port 8787            # fixed port (default is ephemeral; the URL is printed)
+```
+
+Autonomi links work in two transports, and the interface says which one ran:
+
+- **The browser** (default for `autonomi://`). A vendored copy of the official
+  Autonomi browser library is loaded lazily and fetches the record over WebRTC,
+  so neither the `ant` CLI nor the `antd` daemon is required. "Add a Link" uses
+  this route and falls back to the daemon only when the browser cannot do it —
+  no WebRTC, or a file over 32 MiB — naming the reason either way.
+- **The daemon** (always, for `http(s)`). Unchanged, via antd or the `ant` CLI.
+
+A fetched record opens as a real document: the bytes are served from a
+throwaway loopback port at an unguessable path and open in a new tab. That
+second port is deliberate — it is a separate origin, so a fetched document cannot
+reach the API. "Save" writes the same bytes to disk instead.
+
+Limits worth knowing: only one record is fetched, so a multi-file site will not
+render (absolute `http(s)` subresources load, relative ones and `autonomi://`
+subresources do not); files are held in memory; and a record only resolves while
+enough of the nodes holding it are online. See `docs/known-limitations.md`.
+
 ## Key distinction: Rate vs Propagate
 
 Both commands help preserve knowledge, but operate at fundamentally different levels:
@@ -553,7 +584,7 @@ let should_cluster = needs_clustering(trusted_agent_count, 3);
 
 | Format | Example | Behaviour |
 |--------|---------|-----------|
-| `autonomi://<64hex>` | `autonomi://711c7e20006ff3e...` | Canonical form. `download.rs` uses antd REST API / ant CLI to fetch content |
+| `autonomi://<64hex>` | `autonomi://711c7e20006ff3e...` | Canonical form. `av web` fetches it over WebRTC from the browser (no install); the CLI's `download.rs` uses antd REST API / ant CLI |
 | `ant://<64hex>` | `ant://711c7e20006ff3e...` | Input alias — `normalize_scheme("ant")` → `"autonomi"` |
 | Bare 64-hex | `711c7e20006ff3e...` | Auto-detected by `normalize_uri()`, prepends `autonomi://` |
 | `https://...` | `https://example.com/doc` | Standard HTTP — fetched via `ureq` |

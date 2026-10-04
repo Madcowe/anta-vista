@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use super::server::{WebResponse, text_response};
+use super::server::{WebResponse, binary_response, text_response};
 use super::state::AppState;
 
 pub fn index_page(_state: &Arc<AppState>) -> WebResponse {
@@ -29,6 +29,9 @@ const BOOT_SCRIPT: &str = r#"(function () {
     // Private mode or storage disabled: fall back to the default.
     document.documentElement.dataset.theme = 'modern';
   }
+  // Where the vendored Autonomi SDK is served. app.js is a classic script, so
+  // it cannot `import` this statically; it reads it from here instead.
+  window.__AV_SDK_BASE__ = "__SDK_BASE__";
 })();"#;
 
 const PAGE: &str = r##"<!doctype html>
@@ -209,6 +212,22 @@ const PAGE: &str = r##"<!doctype html>
         <button type="button" class="btn btn-quiet btn-block" data-role="block"
           title="Never show or serve this again on this machine">Block</button>
       </span>
+      <!-- Only for an Autonomi result, and only once the browser library is
+           known to be usable; app.js owns the visibility. "Stop" is hidden
+           until a fetch is actually running, because an offer to cancel
+           nothing is noise. -->
+      <span class="result-fetch" data-role="fetch" hidden>
+        <button type="button" class="btn btn-quiet btn-open" data-role="open"
+          title="Fetch this from the Autonomi network and open it in a tab">Open</button>
+        <button type="button" class="btn btn-quiet btn-save" data-role="save"
+          title="Fetch this from the Autonomi network and save it to this device">Save</button>
+        <button type="button" class="btn btn-quiet btn-fetch-stop" data-role="fetch-stop" hidden
+          title="Stop fetching this file">Stop</button>
+      </span>
+      <!-- Fetch progress and outcome get their own line rather than reusing
+           rate-status: rating, blocking and removing all report there, and a
+           fetch that overwrites their message would lose it. -->
+      <span class="fetch-status" data-role="fetch-status" role="status"></span>
       <span class="rate-status" data-role="rate-status" role="status"></span>
     </div>
   </li>
@@ -222,6 +241,7 @@ const PAGE: &str = r##"<!doctype html>
 
 fn page() -> String {
     PAGE.replace("__BOOT__", BOOT_SCRIPT)
+        .replace("__SDK_BASE__", SDK_BASE)
 }
 
 pub fn retro_css() -> WebResponse {
@@ -240,5 +260,170 @@ pub fn retro_js() -> WebResponse {
     text_response(200, JS_MIME, include_str!("../../assets/retro.js"))
 }
 
+/// Vendored third-party browser code, served under a version-prefixed path.
+///
+/// The Autonomi browser SDK is an ES module graph plus a WebAssembly binary that
+/// the browser loads lazily, when the user first asks to view or index an
+/// Autonomi link. It is vendored rather than pulled from a CDN so the bytes we
+/// execute are pinned in the repository and reviewed like any other dependency.
+///
+/// `include_bytes!` instead of a directory walk: the file set is fixed at
+/// compile time, a missing or renamed file is a build error rather than a 404
+/// that only shows up when a user clicks a link, and it needs no new dependency
+/// to do the embedding.
+///
+/// Only the files reachable from `index.js` are vendored, minus source maps and
+/// type declarations. The set was derived mechanically by walking the import
+/// graph -- including the imports *inside* `new Worker(new URL(...))` scripts,
+/// which a naive walk misses and which fail only at runtime, inside the worker.
+pub fn vendor_asset(rel: &str) -> Option<WebResponse> {
+    let (mime, body): (&str, &[u8]) = match rel {
+        "capabilities.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/capabilities.js").as_slice(),
+        ),
+        "client.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/client.js").as_slice(),
+        ),
+        "errors.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/errors.js").as_slice(),
+        ),
+        "file-reader.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/file-reader.js").as_slice(),
+        ),
+        "index.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/index.js").as_slice(),
+        ),
+        "internal/abort.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/abort.js")
+                .as_slice(),
+        ),
+        "internal/media.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/media.js")
+                .as_slice(),
+        ),
+        "internal/payment-network.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/payment-network.js")
+                .as_slice(),
+        ),
+        "internal/progress.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/progress.js")
+                .as_slice(),
+        ),
+        "internal/protocol.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/protocol.js")
+                .as_slice(),
+        ),
+        "internal/record-store.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/record-store.js")
+                .as_slice(),
+        ),
+        "internal/runtime.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/runtime.js")
+                .as_slice(),
+        ),
+        "internal/snapshot.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/snapshot.js")
+                .as_slice(),
+        ),
+        "internal/staging.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/staging.js")
+                .as_slice(),
+        ),
+        "internal/upload-recovery.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/upload-recovery.js")
+                .as_slice(),
+        ),
+        "internal/upload-sources.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/upload-sources.js")
+                .as_slice(),
+        ),
+        "internal/window-checkpoint.js" => (
+            JS_MIME,
+            include_bytes!(
+                "../../assets/vendor/ant-browser-sdk/0.1.1/internal/window-checkpoint.js"
+            )
+            .as_slice(),
+        ),
+        "internal/window-stager.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/window-stager.js")
+                .as_slice(),
+        ),
+        "limits.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/limits.js").as_slice(),
+        ),
+        "manual-payment.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/manual-payment.js")
+                .as_slice(),
+        ),
+        "network-profile.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/network-profile.js")
+                .as_slice(),
+        ),
+        "payment.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/payment.js").as_slice(),
+        ),
+        "save.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/save.js").as_slice(),
+        ),
+        "upload-worker.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/upload-worker.js").as_slice(),
+        ),
+        "wasm/ant_core.js" => (
+            JS_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/wasm/ant_core.js").as_slice(),
+        ),
+        "wasm/ant_core_bg.wasm" => (
+            WASM_MIME,
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/wasm/ant_core_bg.wasm")
+                .as_slice(),
+        ),
+        _ => return None,
+    };
+    Some(binary_response(200, mime, body.to_vec()))
+}
+
+/// Strip the [`SDK_BASE`] prefix from a request path, yielding the vendored
+/// relative path, or `None` if the path is not under it.
+pub fn vendor_rel_path(path: &str) -> Option<&str> {
+    path.strip_prefix(SDK_BASE)
+        .filter(|r| !r.is_empty() && !r.contains(".."))
+}
+
+/// Version of the vendored Autonomi browser SDK. Part of the asset path so a
+/// future SDK lands under a new prefix and browsers cannot serve a stale mix of
+/// two versions' modules against one cached WASM binary.
+pub const SDK_VERSION: &str = "0.1.1";
+
+/// Where the vendored SDK is served from, relative to this server's root.
+pub const SDK_BASE: &str = "/assets/vendor/autonomi-sdk/0.1.1/";
+
 const CSS_MIME: &str = "text/css; charset=utf-8";
 const JS_MIME: &str = "application/javascript; charset=utf-8";
+
+/// Mandatory, not cosmetic: `WebAssembly.instantiateStreaming` refuses any
+/// content type other than this, so serving the SDK's WASM as anything else
+/// fails at download time with a MIME error that reads like a network problem.
+const WASM_MIME: &str = "application/wasm";

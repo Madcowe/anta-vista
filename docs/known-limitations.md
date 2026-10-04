@@ -122,6 +122,58 @@ has them all claim one resource drives that term toward 1.0 for that resource
 alone. The topic is gossiped, so the cost of doing so is low. Restoring the
 signal needs a Sybil answer first, not just a publisher.
 
+## Autonomi in the browser
+
+`av web` can fetch Autonomi records over WebRTC from the browser, so viewing and
+indexing an `autonomi://` link needs nothing installed. These limits are about
+that path.
+
+### The browser viewer fetches one record, not a site
+
+`Open` downloads a single record and serves it as one document on a throwaway
+loopback port. Consequences for content that references other files:
+
+- **Absolute** `http(s)` subresources load.
+- **Relative** ones do not — there is no directory to resolve them against, so
+  `try.autonomi.com`'s own markup will render without its stylesheet or images.
+- `autonomi://` subresources cannot resolve at all. There is no browser-side
+  crawl: nothing reads a record's bytes looking for references to fetch.
+
+Multi-file sites that depend on relative paths therefore do not work through
+`Open`. This is why `try.autonomi.com` is not a good demo of the feature even
+though it is the obvious thing to try. A single self-contained file does work, but
+`try.autonomi.com` also ships a strict `Content-Security-Policy`, and the served
+page inherits nothing from the original record's headers.
+
+Folder and manifest support is expected to arrive in the Autonomi client rather
+than be reimplemented here.
+
+### Downloads depend on how many seeds are reachable
+
+A record resolves through the DataMap of its holders, so it can only be fetched
+when enough of them are online and reachable over WebRTC. In practice this is a
+small set, so a large file can time out even when a small one succeeds: there is
+no size-dependent negotiation here, only whether the nodes are there. A fetch
+that reaches the transfer phase and then fails is not a bug in the UI, and the
+progress line will say so rather than hanging.
+
+### Everything is held in memory
+
+Both the browser route and the daemon fallback read the whole file into memory
+before storing or serving it. The browser path additionally refuses anything
+over `MAX_BODY` (32 MiB) and sends it to the daemon instead, which has the same
+characteristic. There is no streaming path in either direction, so indexing a
+large file costs roughly its size in RAM.
+
+### Filenames come from the location, not the record
+
+A bare `autonomi://<64hex>` carries no filename, and the Autonomi browser library
+synthesises a placeholder of the form `public-file-<8hex>.bin` — identical in
+shape for every record. Download names therefore come from the location's
+optional trailing path segment, and otherwise from a short prefix of the address
+plus an extension implied by the detected type. A record with no name in its
+location gets a machine-style name.
+
 ## Network
 
 ### x0x daemon required for P2P

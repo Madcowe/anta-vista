@@ -39,7 +39,7 @@ pub struct IndexOutcome {
     pub broadcast: bool,
 }
 
-/// Download, ingest, embed and store a URI, then announce it to the network.
+/// Fetch a URI, then hand the bytes to the shared indexing pipeline.
 ///
 /// This is the whole of `av index` minus the interactive prompts, so the web
 /// interface can index a link without reimplementing the pipeline. Never
@@ -60,6 +60,9 @@ pub fn index_resource(
     on_progress: Option<&dyn Fn(DownloadEvent)>,
 ) -> CliResult<IndexOutcome> {
     // --- Step 1: Verify URI (unless skipped) --------------------------------
+    // Only this path checks, because it is the one that has to reach the resource
+    // before it can fetch it. A caller already holding the bytes has, by
+    // definition, already reached it.
     if !no_verify {
         verify_uri_exists(uri).map_err(|e| CliError::Network(format!("URI unreachable: {e}")))?;
     }
@@ -76,11 +79,35 @@ pub fn index_resource(
         };
         download_content(uri, Some(&progress))?
     };
+
+    index_resource_from_bytes(state, conn, provider, &bytes, uri, tags, force)
+}
+
+/// Ingest, embed and store bytes the caller already holds, then announce them.
+///
+/// Shared by every transport, so the stored result cannot depend on how the bytes
+/// were obtained: `av index` and the web interface both land here, and both pass
+/// `filename: None` so the description derives from the location rather than from
+/// whatever a fetcher called the file. That matters because the browser SDK
+/// invents names like `public-file-<8 hex>.bin`, which would otherwise become the
+/// stored filename and the basis of the embedded description.
+///
+/// Deliberately has no reachability check, so it must only ever be reached with
+/// bytes resolved from the address the caller supplied.
+pub fn index_resource_from_bytes(
+    state: &StartupState,
+    conn: &Connection,
+    provider: &MiniLmProvider,
+    bytes: &[u8],
+    uri: &str,
+    tags: &[String],
+    force: bool,
+) -> CliResult<IndexOutcome> {
     let bytes_len = bytes.len();
 
     // --- Step 3: Ingest and build ResourceDescriptor ------------------------
     let mut resource =
-        ingest_bytes(&bytes, None, uri).map_err(|e| CliError::Ingest(e.to_string()))?;
+        ingest_bytes(bytes, None, uri).map_err(|e| CliError::Ingest(e.to_string()))?;
 
     if !tags.is_empty() {
         av_ingest::apply_tags(&mut resource, tags);

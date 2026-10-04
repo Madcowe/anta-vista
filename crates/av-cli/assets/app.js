@@ -121,6 +121,314 @@ const postJSON = (path, payload) =>
     body: JSON.stringify(payload),
   });
 
+/* ------------------------------------------------------------ autonomi fetch -- */
+
+/* Mirrors the server's MAX_BODY. The server rejects an oversized body rather
+ * than truncating it, but discovering that after a fetch that may have taken
+ * half a minute is a poor trade, so the check happens before the upload. */
+const MAX_UPLOAD = 32 * 1024 * 1024;
+
+/* The two binary endpoints take the file as the request body, so the location
+ * rides in a header. Both are same-origin POSTs from this page, which is what
+ * the server's cross-site guard keys on. */
+const postBlob = (path, uri, blob, extra = {}) =>
+  api(path, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'X-Anta-Uri': uri,
+      ...extra,
+    },
+    body: blob,
+  });
+
+const AUTONOMI_SCHEME = /^autonomi:\/\//i;
+
+/* The record address an `autonomi://` location refers to: bare 64 hex.
+ *
+ * The SDK rejects a scheme-prefixed value with a message about expecting 32
+ * hexadecimal bytes, so the scheme has to come off here. A trailing `/name`
+ * segment is the author's label for the file, not part of the address, so it is
+ * dropped too — `?name=` is the query-string form of the same idea.
+ *
+ * Returns null when the location is not an Autonomi address this SDK could ask
+ * for, so callers can keep treating it as an ordinary link. */
+function autonomiAddress(location) {
+  if (!AUTONOMI_SCHEME.test(location)) return null;
+  const rest = location
+    .replace(AUTONOMI_SCHEME, '')
+    .split(/[/?#]/)[0]
+    .toLowerCase();
+  return /^[0-9a-f]{64}$/.test(rest) ? rest : null;
+}
+
+let sdkPromise = null;
+
+/* Load the vendored Autonomi browser library once, on first use.
+ *
+ * Lazy because the library is mostly WASM and most sessions never touch an
+ * Autonomi link, so its cost should not land on page load. The result is cached
+ * *including* a failure: a browser that cannot run it should say so once, not
+ * on every click, and a transient network blip should not leave a permanently
+ * poisoned cache. */
+function loadSdk() {
+  if (!sdkPromise) {
+    const base = window.__AV_SDK_BASE__ || '/assets/vendor/autonomi-sdk/0.1.1/';
+    sdkPromise = import(`${base}index.js`).then(
+      (mod) => ({ mod }),
+      (err) => ({ error: `the Autonomi browser library could not be loaded (${err.message})` })
+    );
+  }
+  return sdkPromise;
+}
+
+/* Whether this browser can fetch from the Autonomi network at all.
+ *
+ * The SDK checks the pieces it needs — WebAssembly, workers, IndexedDB, and
+ * above all a usable WebRTC data channel — and reports which operation is
+ * unavailable. Asking once and explaining beats offering an Open button that
+ * fails, since the failure modes (a file:// page, no WebRTC) are not things the
+ * user can fix by clicking harder. */
+async function autonomiCapability() {
+  const { mod, error } = await loadSdk();
+  if (error) return { available: false, reason: error };
+  const caps = (mod.getBrowserCapabilities && mod.getBrowserCapabilities()) || {};
+  const download = (caps.operations && caps.operations.download) || {};
+  if (download.available === false) {
+    return {
+      available: false,
+      reason:
+        download.reason ||
+        'this browser cannot reach the Autonomi network, so files cannot be fetched here',
+    };
+  }
+  return { available: true };
+}
+
+const PHASE_LABELS = {
+  initializing: 'Starting the Autonomi library',
+  connecting: 'Connecting to Autonomi nodes',
+  lookup: 'Finding the nodes holding this file',
+  preparing: 'Preparing the download',
+  downloading: 'Downloading',
+  complete: 'Downloading done',
+  failed: 'Downloading failed',
+};
+
+const formatBytes = (n) => {
+  if (!Number.isFinite(n)) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+};
+
+/* Progress events arrive from both calls below, so the handler is shared: a
+ * phase with no byte counts gets a plain label, and one with them gets
+ * `n of total`. An event missing `phase` must still produce text, because a
+ * blank status line reads as a hung page. */
+function progressLine(event) {
+  const label = PHASE_LABELS[event.phase] || event.phase || 'Working';
+  if (event.phase === 'downloading' && Number(event.total) > 0) {
+    return `${label} \u2014 ${formatBytes(Number(event.completed || 0))} of ${formatBytes(
+      Number(event.total)
+    )}`;
+  }
+  return label;
+}
+
+/* Fetch one Autonomi file over WebRTC, reporting progress as it goes.
+ *
+ * Both the connect and the download call get an `onProgress`, and that is not
+ * redundancy: `download()` only emits `downloading`/`complete`, while the phases
+ * a user actually watches — connecting, looking up which nodes hold the file —
+ * are emitted during `connect()`. Subscribing to the download alone leaves the
+ * status line blank for the ~6s a lookup takes regardless of file size, which is
+ * exactly when a user decides it is broken.
+ *
+ * Throws `DownloadCancelled` when the user stops it, so callers can say nothing
+ * rather than reporting a failure the user asked for. */
+class DownloadCancelled extends Error {
+  constructor() {
+    super('stopped');
+    this.name = 'DownloadCancelled';
+  }
+}
+
+async function fetchAutonomi(address, { onProgress, signal } = {}) {
+  const { mod, error } = await loadSdk();
+  if (error) throw new Error(error);
+  if (signal && signal.aborted) throw new DownloadCancelled();
+
+  const progress = (event) => {
+    if (event && onProgress) onProgress(event);
+  };
+  const client = await mod.AutonomiClient.connect({ onProgress: progress }, { signal });
+  const out = await client.download(address, { onProgress: progress, signal });
+  if (!out || !out.blob) throw new Error('the Autonomi library returned no file data');
+
+  /* Nonfatal seed churn is expected: the SDK retries and, when it succeeds,
+   * logs nothing to report. Only a settled failure reaches here. */
+  return { blob: out.blob };
+}
+
+/* Wire Open and Save for one Autonomi result row. */
+function wireFetch(node, result, statusEl) {
+  const wrap = node.querySelector('[data-role="fetch"]');
+  const openBtn = node.querySelector('[data-role="open"]');
+  const saveBtn = node.querySelector('[data-role="save"]');
+  const stopBtn = node.querySelector('[data-role="fetch-stop"]');
+
+  const address = autonomiAddress(result.location || '');
+  if (!address) {
+    /* Not an Autonomi address, so there is nothing to fetch. Stays hidden. */
+    return;
+  }
+  wrap.hidden = false;
+
+  let controller = null;
+
+  const setBusy = (busy) => {
+    openBtn.disabled = busy;
+    saveBtn.disabled = busy;
+    stopBtn.hidden = !busy;
+  };
+
+  /* Share one fetch between the two buttons: picking Open over Save and then
+   * changing your mind should reuse the bytes already fetched, not pay for the
+   * whole download twice. The Blob stays valid after the AbortController is
+   * dropped, so it can outlive the fetch it came from. */
+  let cached = null;
+
+  const obtain = async (statusEl) => {
+    if (cached) return cached;
+    controller = new AbortController();
+    setBusy(true);
+    setStatus(
+      statusEl,
+      'Looking for the nodes holding this file\u2026',
+      ''
+    );
+    try {
+      const { blob } = await fetchAutonomi(address, {
+        onProgress: (event) => setStatus(statusEl, progressLine(event), ''),
+        signal: controller.signal,
+      });
+      cached = blob;
+      return blob;
+    } finally {
+      setBusy(false);
+      controller = null;
+    }
+  };
+
+  /* Fetch, then hand the bytes to the server to serve on its own origin.
+   *
+   * `window.open` is the first statement, and both the Open button and a click
+   * on the location call this directly from their handler, so the popup has a
+   * user gesture behind it. A `window.open` after an await is a popup with no
+   * gesture and browsers block it — so the tab has to exist before the download
+   * starts, and be pointed at the result once it arrives. */
+  const openView = async (statusEl) => {
+    const tab = window.open('', '_blank');
+    if (!tab) {
+      setStatus(
+        statusEl,
+        'Your browser blocked the new tab. Allow pop-ups for this page, then try again.',
+        'warn'
+      );
+    }
+    try {
+      const blob = await obtain(statusEl);
+      setStatus(statusEl, 'Opening\u2026', '');
+      const view = await postBlob('/api/view/blob', result.location, blob);
+      if (tab) {
+        /* replace, not assign: the blank tab should not sit in history with a
+         * dead address behind it. */
+        tab.location.replace(view.url);
+      } else {
+        setStatus(
+          statusEl,
+          'The file was fetched but not opened. Allow pop-ups for this page, then try Open again.',
+          'warn'
+        );
+      }
+    } catch (err) {
+      if (tab) tab.close();
+      if (err.name === 'DownloadCancelled') {
+        setStatus(statusEl, 'Stopped.', '');
+      } else {
+        setStatus(statusEl, `Could not fetch that file: ${err.message}`, 'bad');
+      }
+    }
+  };
+
+  openBtn.addEventListener('click', () => openView(statusEl));
+
+  /* The location itself opens the file. It is the thing that looks like a link,
+   * so leaving it inert made a link-shaped element that underlined on hover and
+   * did nothing — the Open button existing elsewhere in the row does not make
+   * that discoverable. */
+  const loc = node.querySelector('.result-loc');
+  if (loc) {
+    /* The class selects the pointer cursor in both themes; `role` and
+     * `tabindex` are what make this reachable and announced as activatable. All
+     * three are set here, with the handlers, so the element can never look
+     * clickable and not be. */
+    loc.classList.add('is-openable');
+    loc.setAttribute('role', 'button');
+    loc.setAttribute('tabindex', '0');
+    loc.title = 'Open this file from the Autonomi network';
+    loc.addEventListener('click', () => openView(statusEl));
+    loc.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        /* Space would otherwise scroll the page. */
+        event.preventDefault();
+        openView(statusEl);
+      }
+    });
+  }
+
+  saveBtn.addEventListener('click', async () => {
+    try {
+      const blob = await obtain(statusEl);
+      /* Ask the server for the name rather than using the SDK's: it reports
+       * `public-file-<8hex>.bin` for every file, so a save here would put
+       * everything on disk under the same name. */
+      const view = await postBlob('/api/view/blob', result.location, blob);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = view.filename;
+      link.click();
+      /* Released on the next tick: revoking it synchronously can cancel the
+       * download in some browsers before it has started reading. */
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      setStatus(statusEl, `Saved as ${view.filename}.`, 'ok');
+    } catch (err) {
+      if (err.name === 'DownloadCancelled') {
+        setStatus(statusEl, 'Stopped.', '');
+      } else {
+        setStatus(statusEl, `Could not fetch that file: ${err.message}`, 'bad');
+      }
+    }
+  });
+
+  stopBtn.addEventListener('click', () => {
+    if (controller) controller.abort();
+  });
+
+  /* Gate the buttons on what this browser can actually do, once, so the reason
+   * is stated where the button is rather than as a failure afterwards. */
+  autonomiCapability().then((cap) => {
+    if (cap.available) return;
+    openBtn.disabled = true;
+    saveBtn.disabled = true;
+    openBtn.title = `Cannot fetch from Autonomi here: ${cap.reason}`;
+    saveBtn.title = openBtn.title;
+    setStatus(statusEl, cap.reason, 'warn');
+  });
+}
+
 /* --------------------------------------------------------------- search -- */
 
 ui.form.addEventListener('submit', async (event) => {
@@ -255,9 +563,12 @@ function renderResult(result) {
   const heading = source === 'name' ? result.description || location : location;
   const detail = source === 'name' ? location : result.description || '';
 
-  /* Autonomi locations are not openable from the browser yet. Rather than
-   * link to a scheme nothing handles, show the location as text and let the
-   * open/download path be filled in once the server can fetch it. */
+  /* An `http(s)` location is a plain link. An Autonomi location has no handler
+   * registered for its scheme, so it is never an `autonomi://` href — but it is
+   * openable, so it keeps the affordances of the link it looks like: app.js
+   * wires a click on it below and it takes a pointer cursor. Rendering it as
+   * inert text (which is what it was) read as broken: it underlined on hover,
+   * showed a question-mark cursor, and did nothing when clicked. */
   const title = pick('title');
   if (/^https?:\/\//i.test(location)) {
     title.textContent = heading;
@@ -266,10 +577,12 @@ function renderResult(result) {
     const span = document.createElement('span');
     span.className = 'result-loc';
     span.textContent = heading;
-    /* Say why it is not a link, rather than leaving the user to guess. */
-    span.title =
-      'Autonomi locations cannot be opened or downloaded yet: the server has no ' +
-      'way to fetch them without the ant tooling.';
+    /* The openable case is completed by wireFetch below, which is where the
+     * click handler is added — role, tabindex, title and cursor all live with
+     * the handler so a focusable "button" can never exist without one. */
+    if (!autonomiAddress(location)) {
+      span.title = 'Not a location this page can open.';
+    }
     title.replaceWith(span);
     node.classList.add('is-locatable');
   }
@@ -293,6 +606,9 @@ function renderResult(result) {
   wireRecommend(node, result, pick('rate-status'));
   wireBlock(node, result, pick('rate-status'), pick('block'));
   wireRemove(node, result, pick('rate-status'), pick('remove'));
+  /* Its own status line: a fetch is concurrent with rating/blocking, and
+   * sharing a line would mean one overwrote the other's message. */
+  wireFetch(node, result, pick('fetch-status'));
   return node;
 }
 
@@ -654,6 +970,54 @@ function setDismissibleStatus(node, message, warningId, tone) {
 
 /* ---------------------------------------------------------- add a link -- */
 
+/* Thrown by the browser route to say "the daemon can do this instead", carrying
+ * why. It is a routing decision rather than a failure, so it must not reach the
+ * user as an error. */
+class DaemonFallback extends Error {
+  constructor(reason) {
+    super(reason);
+    this.name = 'DaemonFallback';
+  }
+}
+
+/* Index an Autonomi location using the browser as the fetcher.
+ *
+ * Returns null when the location is not an Autonomi address — that is a decline,
+ * not an error, and the caller should use the daemon route for it. Throws
+ * [`DaemonFallback`] when the browser cannot or should not do the fetch. */
+async function indexAutonomiInBrowser(uri, tags) {
+  const address = autonomiAddress(uri);
+  if (!address) return null;
+
+  const cap = await autonomiCapability();
+  if (!cap.available) throw new DaemonFallback(cap.reason);
+
+  setStatus(ui.addStatus, 'Looking for the nodes holding this file\u2026', '');
+  let blob;
+  try {
+    ({ blob } = await fetchAutonomi(address, {
+      onProgress: (event) => setStatus(ui.addStatus, progressLine(event), ''),
+    }));
+  } catch (err) {
+    /* The SDK's failures are worth trying the daemon on: a WebRTC path that
+     * cannot form a data channel here may work fine through a local daemon, and
+     * the daemon path is what worked before any of this existed. */
+    throw new DaemonFallback(`the browser could not fetch it (${err.message})`);
+  }
+
+  /* Checked before the upload, not after: the server rejects an oversized body
+   * rather than truncating it, so the bytes are already here and the size is
+   * known. Sending them anyway would waste the transfer to learn nothing. */
+  if (blob.size > MAX_UPLOAD) {
+    throw new DaemonFallback(
+      `it is ${formatBytes(blob.size)}, and this page holds at most ${formatBytes(MAX_UPLOAD)}`
+    );
+  }
+
+  setStatus(ui.addStatus, 'Indexing\u2026', '');
+  return postBlob('/api/index/bytes', uri, blob, tags ? { 'X-Anta-Tags': tags } : {});
+}
+
 ui.addForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const uri = el('uri').value.trim();
@@ -661,10 +1025,38 @@ ui.addForm.addEventListener('submit', async (event) => {
 
   const tags = el('tags').value.trim();
   ui.addStatus.hidden = false;
-  setStatus(ui.addStatus, 'Fetching and indexing\u2026', '');
 
+  /* Two routes, in order of preference: the browser fetches when the location is
+   * an Autonomi address and this browser can do it, and the local daemon does
+   * everything else. The status line names the route that ran, because "indexed"
+   * meaning two different transports would otherwise be invisible. */
+  const routes = [
+    { via: 'your browser', start: 'Fetching in your browser\u2026', run: () => indexAutonomiInBrowser(uri, tags) },
+    { via: 'the local daemon', start: 'Fetching and indexing\u2026', run: () => postJSON('/api/index', { uri, tags }) },
+  ];
+
+  let data = null;
+  let usedVia = null;
+  let fellBack = null;
   try {
-    const data = await postJSON('/api/index', tags ? { uri, tags } : { uri });
+    for (const route of routes) {
+      setStatus(ui.addStatus, route.start, '');
+      try {
+        const result = await route.run();
+        if (result === null) continue;
+        data = result;
+        usedVia = route.via;
+        break;
+      } catch (err) {
+        /* Only the browser route signals a fallback; on the daemon route every
+         * error is a real failure the user needs to see. */
+        if (!(err instanceof DaemonFallback)) throw err;
+        fellBack = err.message;
+        setStatus(ui.addStatus, `Using the local daemon: ${fellBack}.`, '');
+      }
+    }
+    if (data === null) throw new Error('no route could index that location');
+
     if (data.duplicate) {
       setStatus(
         ui.addStatus,
@@ -674,7 +1066,7 @@ ui.addForm.addEventListener('submit', async (event) => {
     } else {
       setStatus(
         ui.addStatus,
-        `Added \u201c${data.description || data.location}\u201d (${data.embedding_dim} dimensions).`,
+        `Added \u201c${data.description || data.location}\u201d (${data.embedding_dim} dimensions) via ${usedVia}.`,
         'ok'
       );
     }

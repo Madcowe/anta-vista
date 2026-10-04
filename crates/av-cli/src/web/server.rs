@@ -9,6 +9,12 @@ use super::handlers;
 use super::render;
 use super::state::AppState;
 
+/// Header carrying the location on the two binary endpoints, whose request body
+/// is the file itself and so has no room for a JSON envelope.
+const URI_HEADER: &str = "X-Anta-Uri";
+const TAGS_HEADER: &str = "X-Anta-Tags";
+const FORCE_HEADER: &str = "X-Anta-Force";
+
 /// Number of worker threads. Search fans out to peers over HTTP and can block
 /// for seconds, so a single-threaded server would let one slow query wedge the
 /// whole UI. Requests are otherwise cheap and SQLite connections are
@@ -49,6 +55,11 @@ pub fn serve(state: Arc<AppState>, server: Server, run_for: Option<u64>) -> Resu
     for h in handles {
         let _ = h.join();
     }
+
+    // Retire any viewer listeners still holding a port and a temp file, rather
+    // than leaving them to outlive the server that authorised them.
+    super::viewer::stop_all();
+
     Ok(())
 }
 
@@ -93,11 +104,22 @@ fn handle(mut request: Request, state: Arc<AppState>) -> Result<(), String> {
         return request.respond(resp).map_err(|e| e.to_string());
     }
 
+    // Second, independent guard, and neither substitutes for the other. The
+    // Host check cannot see a cross-origin request that legitimately names us;
+    // this one cannot see a non-browser caller. Only state-changing methods are
+    // gated, because a cross-site GET of a page is harmless.
+    if method == Method::Post
+        && let Err(resp) = check_fetch_site(&request)
+    {
+        return request.respond(resp).map_err(|e| e.to_string());
+    }
+
     let response = route(&mut request, &method, &path, &query, &state);
 
     let response = match response {
         Ok(r) => r,
-        Err(msg) => json_error(500, "internal_error", &msg),
+        Err(RouteError::Ready(r)) => r,
+        Err(RouteError::Internal(msg)) => json_error(500, "internal_error", &msg),
     };
     request.respond(response).map_err(|e| e.to_string())
 }
@@ -108,7 +130,7 @@ fn route(
     path: &str,
     query: &str,
     state: &Arc<AppState>,
-) -> Result<WebResponse, String> {
+) -> Result<WebResponse, RouteError> {
     match (method, path) {
         (_, "/") | (_, "/index.html") => Ok(render::index_page(state)),
 
@@ -126,21 +148,43 @@ fn route(
         (Method::Get, "/api/blocks") => Ok(handlers::blocks_list(state)),
 
         (Method::Post, p) => {
-            let body = read_body(request)?;
-            Ok(match p {
-                "/api/rate" => handlers::rate(state, &body),
-                "/api/index" => handlers::index(state, &body),
-                "/api/block" => handlers::block(state, &body),
-                "/api/purge" => handlers::purge(state, &body),
-                "/api/unblock" => handlers::unblock(state, &body),
-                "/api/listener/stop" => handlers::listener_stop(state),
-                "/api/listener/start" => handlers::listener_start(state),
-                "/api/deps/x0x/start" => handlers::start_x0x(state),
-                "/api/deps/antd/start" => handlers::start_antd(state),
-                "/api/deps/x0x/install" => handlers::install_x0x(state),
-                "/api/deps/ant/install" => handlers::install_ant(state),
-                other => json_error(404, "not_found", &format!("no API route for POST {other}")),
-            })
+            // Binary bodies are dispatched *before* the UTF-8 read below, which
+            // would reject them outright. These two carry an uploaded file, so
+            // there is nothing to parse as JSON.
+            match p {
+                "/api/index/bytes" => {
+                    // Metadata rides in headers because the body is the file.
+                    let uri = header(request, URI_HEADER).unwrap_or_default();
+                    let tags = header(request, TAGS_HEADER).unwrap_or_default();
+                    let force = header(request, FORCE_HEADER).as_deref() == Some("1");
+                    let body = read_body_bytes(request).map_err(RouteError::ready)?;
+                    Ok(handlers::index_bytes(state, &uri, &tags, force, &body))
+                }
+                "/api/view/blob" => {
+                    let uri = header(request, URI_HEADER).unwrap_or_default();
+                    let body = read_body_bytes(request).map_err(RouteError::ready)?;
+                    Ok(handlers::view_blob(&uri, &body))
+                }
+                _ => {
+                    let body = read_body(request)?;
+                    Ok(match p {
+                        "/api/rate" => handlers::rate(state, &body),
+                        "/api/index" => handlers::index(state, &body),
+                        "/api/block" => handlers::block(state, &body),
+                        "/api/purge" => handlers::purge(state, &body),
+                        "/api/unblock" => handlers::unblock(state, &body),
+                        "/api/listener/stop" => handlers::listener_stop(state),
+                        "/api/listener/start" => handlers::listener_start(state),
+                        "/api/deps/x0x/start" => handlers::start_x0x(state),
+                        "/api/deps/antd/start" => handlers::start_antd(state),
+                        "/api/deps/x0x/install" => handlers::install_x0x(state),
+                        "/api/deps/ant/install" => handlers::install_ant(state),
+                        other => {
+                            json_error(404, "not_found", &format!("no API route for POST {other}"))
+                        }
+                    })
+                }
+            }
         }
 
         (Method::Get, p) if p.starts_with("/api/") => Ok(json_error(
@@ -149,12 +193,22 @@ fn route(
             &format!("no API route for GET {p}"),
         )),
 
-        _ => Ok(text_response(
-            404,
-            "text/plain; charset=utf-8",
-            "Not found. The web interface is served from '/'.\n",
-        )),
+        // The vendored Autonomi SDK: ES modules and the WASM binary, served from
+        // a versioned prefix rather than the hand-listed asset arms above,
+        // because the file set is whatever its import graph reaches.
+        (_, p) => match render::vendor_rel_path(p) {
+            Some(rel) => Ok(render::vendor_asset(rel).unwrap_or_else(|| not_found(p))),
+            None => Ok(not_found(p)),
+        },
     }
+}
+
+fn not_found(path: &str) -> WebResponse {
+    text_response(
+        404,
+        "text/plain; charset=utf-8",
+        &format!("Not found: {path}\n"),
+    )
 }
 
 fn read_body(request: &mut Request) -> Result<String, String> {
@@ -163,6 +217,99 @@ fn read_body(request: &mut Request) -> Result<String, String> {
         .read_to_end(&mut buf)
         .map_err(|e| e.to_string())?;
     String::from_utf8(buf).map_err(|e| format!("request body is not valid UTF-8: {e}"))
+}
+
+/// Why a route could not produce a response.
+///
+/// Two kinds, and the distinction is load-bearing: [`Self::Ready`] is a refusal
+/// that is *already* the right answer (an oversized body is a 400 with a code the
+/// browser branches on), and collapsing it into `Internal` would report a
+/// client-side problem as a 500 and tell the user the server broke.
+enum RouteError {
+    Ready(WebResponse),
+    Internal(String),
+}
+
+impl RouteError {
+    fn ready(response: WebResponse) -> Self {
+        Self::Ready(response)
+    }
+}
+
+impl From<String> for RouteError {
+    fn from(msg: String) -> Self {
+        Self::Internal(msg)
+    }
+}
+
+/// Read a binary request body, refusing anything over [`MAX_BODY`].
+///
+/// Returns a ready-made 400 rather than a bare message: an oversized upload is
+/// the caller's problem to fix by taking the daemon route, and a 500 would say
+/// the server broke when it did not. The previous JSON `read` silently truncated
+/// at the cap via `Read::take`, which would have indexed a corrupt prefix of a
+/// large file and reported success — so the cap is *refused*, never clamped.
+fn read_body_bytes(request: &mut Request) -> Result<Vec<u8>, WebResponse> {
+    let mut buf = Vec::new();
+    // Read one byte past the cap so "exactly at the limit" stays allowed and
+    // "over it" is detectable, instead of the cap being a rounding error.
+    Read::take(request.as_reader(), MAX_BODY as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| json_error(400, "read_failed", &e.to_string()))?;
+    if buf.len() > MAX_BODY {
+        return Err(json_error(
+            400,
+            "body_too_large",
+            &format!(
+                "request body is larger than the {MAX_BODY} byte limit; \
+                 this file has to be fetched by the local daemon instead"
+            ),
+        ));
+    }
+    Ok(buf)
+}
+
+/// Read one request header by name.
+///
+/// `&'static str` rather than `&str`: `Header::equiv` needs the name to outlive
+/// `'static`, which is why the guards above can only pass literals and consts.
+fn header(request: &Request, name: &'static str) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+/// Reject cross-site state-changing requests.
+///
+/// A page on any origin can issue a request to this loopback server, and the
+/// Host header cannot catch it, because such a request genuinely arrives
+/// carrying our own Host. Browsers additionally send `Sec-Fetch-Site`, which
+/// they compute themselves and script cannot forge, so a POST arriving as
+/// `cross-site` came from a page we did not serve. Without this, peer-supplied
+/// content viewed in one of our own origins could drive our API.
+///
+/// Deliberately permissive when the header is absent: this defends against
+/// browser CSRF from other origins, it is not authentication. `curl` and the
+/// test harness send no such header and have to keep working, and an attacker
+/// who is not a browser is not stopped by anything here.
+fn check_fetch_site(request: &Request) -> Result<(), WebResponse> {
+    let site = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Sec-Fetch-Site"))
+        .map(|h| h.value.as_str())
+        .unwrap_or_default();
+
+    if site.eq_ignore_ascii_case("cross-site") {
+        return Err(json_error(
+            403,
+            "cross_site_request",
+            "Refusing a state-changing request that came from another site.",
+        ));
+    }
+    Ok(())
 }
 
 /// Reject requests whose `Host` header names somewhere other than this machine.
@@ -257,6 +404,20 @@ pub fn text_response(status: u16, mime: &str, body: &str) -> WebResponse {
     Response::from_string(body.to_string())
         .with_status_code(StatusCode(status))
         .with_header(content_type(mime))
+}
+
+/// A response carrying raw bytes rather than text.
+///
+/// Used for the vendored WASM — a browser refuses to stream-compile it unless
+/// it arrives as `application/wasm`, so the type is load-bearing rather than
+/// cosmetic — and for serving a downloaded file to the one-shot viewer.
+pub fn binary_response(status: u16, mime: &str, body: Vec<u8>) -> WebResponse {
+    Response::from_data(body)
+        .with_status_code(StatusCode(status))
+        .with_header(content_type(mime))
+        .with_header(
+            Header::from_bytes("X-Content-Type-Options", "nosniff").expect("static header"),
+        )
 }
 
 fn content_type(mime: &str) -> Header {

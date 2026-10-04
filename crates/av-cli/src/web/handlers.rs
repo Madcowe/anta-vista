@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use super::server::{WebResponse, json_error, json_error_fields, json_response};
+use super::server::{WebResponse, binary_response, json_error, json_error_fields, json_response};
 use super::state::AppState;
 
 /// Percent-decode and parse a query string into key/value pairs.
@@ -230,16 +230,139 @@ pub fn search(state: &Arc<AppState>, query: &str) -> WebResponse {
 /// Opening and downloading Autonomi locations needs the ant client to hand us
 /// real bytes. The UI shows these controls as unavailable rather than
 /// pretending, so this answers 501 until that path exists.
-pub fn download(_state: &Arc<AppState>, query: &str) -> WebResponse {
+pub fn download(state: &Arc<AppState>, query: &str) -> WebResponse {
     let params = parse_query(query);
-    let location = param(&params, "location").unwrap_or("");
-    json_error(
-        501,
-        "not_implemented",
-        &format!(
-            "downloading Autonomi locations from the browser is not implemented yet (requested: {location:?})"
+    let location = param(&params, "location").unwrap_or("").trim().to_string();
+    if location.is_empty() {
+        return json_error(400, "validation_error", "missing 'location'");
+    }
+    let uri = av_ingest::location::normalize_uri(&location);
+
+    // The daemon is the *fallback* transport: the browser fetches Autonomi bytes
+    // itself over WebRTC, which needs nothing installed. This route exists for
+    // the cases where that cannot be used — a file too large to hand back to the
+    // server, or a browser that cannot run the SDK.
+    let startup = match state.startup.read() {
+        Ok(s) => s,
+        Err(_) => return json_error(500, "state_error", "startup state is poisoned"),
+    };
+    let lower = uri.to_lowercase();
+    if (lower.starts_with("ant://") || lower.starts_with("autonomi://"))
+        && !startup.antd_running
+        && !crate::startup::ant_cli_binary_available()
+    {
+        let command = crate::startup::ant_install_command();
+        return json_error_fields(
+            503,
+            "no_download_backend",
+            &format!(
+                "Neither antd daemon nor ant CLI are available, so this Autonomi location cannot be fetched. Install the ant CLI with: {command}"
+            ),
+            json!({
+                "dependency": "ant",
+                "command": command,
+                "start": false,
+            }),
+        );
+    }
+
+    let bytes = match crate::download::download_content(&uri, None) {
+        Ok(b) => b,
+        Err(e) => return json_error(502, "download_failed", &e.to_string()),
+    };
+
+    // Same policy the indexer uses, so a file served here is typed the way it was
+    // stored. The location's optional filename segment is the only hint there is.
+    let filename = av_ingest::location::analyze_location(&uri).inferred_filename;
+    let mime = av_ingest::mime::detect_mime_with_hint(&bytes, filename.as_deref())
+        .unwrap_or_else(|_| "application/octet-stream".to_string());
+
+    // Inline: the browser decides whether to render or save, exactly as it does
+    // for an http result. Only the bytes and their type — never an error the
+    // caller might save to disk by mistake, which is why failures above are JSON.
+    binary_response(200, &mime, bytes)
+}
+
+/// `POST /api/view/blob` — raw body is the file; metadata arrives in headers.
+///
+/// Publishes the bytes on a throwaway loopback port so they can be opened as a
+/// real document on an origin that cannot reach the API. See [`crate::web::viewer`]
+/// for why a `blob:` URL is not usable here.
+pub fn view_blob(uri: &str, body: &[u8]) -> WebResponse {
+    let uri = av_ingest::location::normalize_uri(uri);
+    let filename = av_ingest::location::analyze_location(&uri).inferred_filename;
+    let mime = match av_ingest::mime::detect_mime_with_hint(body, filename.as_deref()) {
+        Ok(m) => m,
+        // An empty body cannot be sniffed, and there is nothing to show.
+        Err(e) => {
+            return json_error(
+                400,
+                "validation_error",
+                &format!("cannot serve this file: {e}"),
+            );
+        }
+    };
+
+    match crate::web::viewer::publish(body, &mime) {
+        Ok(handle) => json_response(
+            json!({
+                "ok": true,
+                "url": handle.url,
+                "mime_type": mime,
+                "bytes": body.len(),
+                // The name comes from the server so the browser's Save action
+                // and the CLI cannot invent two different names for one file.
+                "filename": av_ingest::filename::suggest_filename(&uri, &mime),
+                "expires_in": handle.expires_in,
+            })
+            .to_string(),
         ),
-    )
+        Err(e) => json_error(500, "viewer_failed", &e),
+    }
+}
+
+/// `POST /api/index/bytes` — raw body is the file; metadata arrives in headers.
+///
+/// The browser half of indexing: the SDK has already fetched the bytes over
+/// WebRTC, so this stores exactly what the daemon path would have stored, with
+/// no second network round trip and no dependency installed.
+pub fn index_bytes(
+    state: &Arc<AppState>,
+    uri: &str,
+    tags: &str,
+    force: bool,
+    body: &[u8],
+) -> WebResponse {
+    let uri = av_ingest::location::normalize_uri(uri.trim());
+    if uri.is_empty() {
+        return json_error(400, "validation_error", "missing 'X-Anta-Uri'");
+    }
+
+    let tags: Vec<String> = tags
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let provider = match provider(state) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let conn = match db_conn(state) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let startup = match state.startup.read() {
+        Ok(s) => s,
+        Err(_) => return json_error(500, "state_error", "startup state is poisoned"),
+    };
+
+    match crate::cmd::index::index_resource_from_bytes(
+        &startup, &conn, &provider, body, &uri, &tags, force,
+    ) {
+        Ok(outcome) => json_response(outcome_json(&outcome).to_string()),
+        Err(e) => json_error(500, "index_failed", &e.to_string()),
+    }
 }
 
 /// `POST /api/rate` — body `{resource_id, rating, query, result?}`.
@@ -490,21 +613,30 @@ pub fn index(state: &Arc<AppState>, body: &str) -> WebResponse {
         Err(e) => return error_response(e),
     };
 
-    json_response(
-        json!({
-            "ok": true,
-            "resource_id": outcome.resource_id,
-            "location": outcome.location,
-            "mime_type": outcome.mime_type,
-            "kind": outcome.kind,
-            "description": outcome.description,
-            "embedding_dim": outcome.embedding_dim,
-            "duplicate": outcome.duplicate,
-            "duplicate_by": outcome.duplicate_by,
-            "broadcast": outcome.broadcast,
-        })
-        .to_string(),
-    )
+    json_response(outcome_json(&outcome).to_string())
+}
+
+/// The JSON body both index routes return.
+///
+/// Shared so the daemon path (`POST /api/index`) and the browser path
+/// (`POST /api/index/bytes`) cannot drift apart in what they report: the same
+/// run through either transport has to produce the same response, or "indexed"
+/// would mean two different things depending on which transport the browser
+/// happened to pick.
+fn outcome_json(outcome: &crate::cmd::index::IndexOutcome) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "resource_id": outcome.resource_id,
+        "location": outcome.location,
+        "mime_type": outcome.mime_type,
+        "kind": outcome.kind,
+        "description": outcome.description,
+        "embedding_dim": outcome.embedding_dim,
+        "bytes_len": outcome.bytes_len,
+        "duplicate": outcome.duplicate,
+        "duplicate_by": outcome.duplicate_by,
+        "broadcast": outcome.broadcast,
+    })
 }
 
 /// `POST /api/listener/stop` — stop every running `av listen`.

@@ -204,7 +204,12 @@ input[type="text"] {
   margin-top: 10px;
 }
 
-.rate-status {
+/* Two independent status lines on one row: `rate-status` carries
+ * recommend/block/remove, `fetch-status` carries an Autonomi download. They are
+ * grouped rather than styled twice so a tone cannot mean one thing on one line
+ * and another on the other. */
+.rate-status,
+.fetch-status {
   font-size: 0.8rem;
   opacity: 0.75;
 }
@@ -224,6 +229,17 @@ input[type="text"] {
 
 .results-note[data-tone="warn"] {
   color: var(--warn, #8a5b00);
+}
+
+/* Open/Save for an Autonomi result. Sits next to Recommend rather than in the
+ * deny group: these are the actions that get you the file, not the ones that
+ * make it go away. `display` here is exactly the case the `[hidden]` guard at
+ * the top of this file exists for — app.js hides the whole group for a
+ * non-Autonomi row by setting `hidden`. */
+.result-fetch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 /* Groups the two "make this go away" actions so they stay together at the end
@@ -455,17 +471,20 @@ input[type="text"] {
   background: rgba(0, 0, 0, 0.5);
 }
 
-[data-theme="modern"] .rate-status[data-tone="ok"] {
+[data-theme="modern"] .rate-status[data-tone="ok"],
+[data-theme="modern"] .fetch-status[data-tone="ok"] {
   color: var(--ok);
   opacity: 1;
 }
 
-[data-theme="modern"] .rate-status[data-tone="warn"] {
+[data-theme="modern"] .rate-status[data-tone="warn"],
+[data-theme="modern"] .fetch-status[data-tone="warn"] {
   color: var(--warn);
   opacity: 1;
 }
 
-[data-theme="modern"] .rate-status[data-tone="bad"] {
+[data-theme="modern"] .rate-status[data-tone="bad"],
+[data-theme="modern"] .fetch-status[data-tone="bad"] {
   color: var(--bad);
   opacity: 1;
 }
@@ -500,16 +519,31 @@ input[type="text"] {
   outline-offset: 2px;
 }
 
-/* An Autonomi location has no open/download path yet, so it is shown as
- * non-interactive text rather than a link that would 501. It keeps the visual
- * weight of the title so the result does not look broken, and is dimmed to
- * signal that it cannot be followed. */
+/* An Autonomi location is never an `autonomi://` href — nothing handles that
+ * scheme — so it is an element of its own. app.js adds `is-openable` when it
+ * wired a click on it, and that is what decides the cursor.
+ *
+ * The two states must not look alike. This used to be `cursor: help` on every
+ * Autonomi location with a comment saying there was "no open/download path
+ * yet", which by then was false: the element underlined on hover, showed a
+ * question-mark cursor, and did nothing when clicked. An affordance that lies
+ * about being clickable is worse than one that looks plainly inert. */
 [data-theme="modern"] .result-loc {
   color: var(--fg);
   font-weight: 600;
-  cursor: help;
+  opacity: 0.7;
   text-decoration: underline dotted;
   text-underline-offset: 3px;
+}
+
+[data-theme="modern"] .result-loc.is-openable {
+  cursor: pointer;
+  opacity: 1;
+}
+
+[data-theme="modern"] .result-loc.is-openable:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
 }
 
 /* Blocking controls. `flex-wrap` on .result-actions already handles the extra

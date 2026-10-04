@@ -16,6 +16,7 @@ pub mod handlers;
 pub mod render;
 pub mod server;
 pub mod state;
+pub mod viewer;
 
 pub use state::AppState;
 

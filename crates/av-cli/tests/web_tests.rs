@@ -156,6 +156,27 @@ impl TestServer {
         body: Option<&str>,
         host: Option<&str>,
     ) -> HttpResponse {
+        self.request_raw(method, path, body.unwrap_or("").as_bytes(), host, &[])
+    }
+
+    /// POST a body of bytes with extra headers.
+    ///
+    /// Separate from [`Self::request`] because the binary endpoints take a file
+    /// as the request body and carry their metadata in `X-Anta-*` headers, and
+    /// because the cross-site guard is driven by a `Sec-Fetch-Site` header. The
+    /// JSON-only helper above cannot express either.
+    fn post_binary(&self, path: &str, body: &[u8], headers: &[(&str, &str)]) -> HttpResponse {
+        self.request_raw("POST", path, body, None, headers)
+    }
+
+    fn request_raw(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        host: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> HttpResponse {
         let host = host.unwrap_or("127.0.0.1");
         // The banner is printed from the thread that has already bound, so the
         // socket is listening by the time we see the port. Retry anyway, and
@@ -186,27 +207,37 @@ impl TestServer {
             )
         });
 
-        let body = body.unwrap_or("");
-        let request = format!(
+        let mut head = format!(
             "{method} {path} HTTP/1.1\r\n\
              Host: {host}:{}\r\n\
              Connection: close\r\n\
              Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             \r\n\
-             {body}",
+             Content-Length: {}\r\n",
             self.port,
             body.len()
         );
-        stream.write_all(request.as_bytes()).expect("write request");
+        for (name, value) in extra {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+
+        let mut wire = head.into_bytes();
+        wire.extend_from_slice(body);
+        stream.write_all(&wire).expect("write request");
         stream.flush().ok();
 
-        let mut response = String::new();
-        stream.read_to_string(&mut response).expect("read response");
-
-        let (head, body) = response
-            .split_once("\r\n\r\n")
+        // Read bytes, not text: the viewer serves arbitrary file content back,
+        // and a UTF-8 read would mangle or reject it.
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read response");
+        let split = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
             .unwrap_or_else(|| panic!("malformed HTTP response: {response:?}"));
+        let (head, body) = response.split_at(split);
+        let body = &body[4..];
+        let head = String::from_utf8_lossy(head).into_owned();
+        let lower = head.to_lowercase();
         let status: u16 = head
             .lines()
             .next()
@@ -214,10 +245,20 @@ impl TestServer {
             .and_then(|s| s.parse().ok())
             .expect("status line");
 
+        // Anything big enough is sent chunked, and a naive reader would return
+        // the chunk-size lines as if they were content — which looks exactly
+        // like corrupt data rather than like framing.
+        let body = if lower.contains("transfer-encoding: chunked") {
+            decode_chunked(body)
+        } else {
+            body.to_vec()
+        };
+
         HttpResponse {
             status,
-            headers: head.to_lowercase(),
-            body: body.to_string(),
+            headers: lower,
+            body: String::from_utf8_lossy(&body).into_owned(),
+            raw: body,
         }
     }
 
@@ -238,10 +279,50 @@ impl Drop for TestServer {
     }
 }
 
+/// Decode a chunked transfer body.
+///
+/// Only what a server actually emits: `<hex-size>[;ext]CRLF data CRLF` repeated,
+/// ended by a zero-size chunk, then trailers. Anything malformed is returned as
+/// received rather than panicking, so a broken framing shows up as a content
+/// mismatch in the assertion that cares.
+fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let Some(nl) = find_crlf(body) else {
+            return out;
+        };
+        let size_line = String::from_utf8_lossy(&body[..nl]);
+        // Strip any chunk extension after `;`.
+        let size_text = size_line.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_text, 16) else {
+            return out;
+        };
+        if size == 0 {
+            return out;
+        }
+        let start = nl + 2;
+        let end = start + size;
+        if end > body.len() {
+            out.extend_from_slice(&body[start..]);
+            return out;
+        }
+        out.extend_from_slice(&body[start..end]);
+        // Step over the data and the CRLF that terminates it.
+        body = &body[(end + 2).min(body.len())..];
+    }
+}
+
+fn find_crlf(haystack: &[u8]) -> Option<usize> {
+    haystack.windows(2).position(|w| w == b"\r\n")
+}
+
 struct HttpResponse {
     status: u16,
     headers: String,
+    /// Lossy rendering of `raw`, for the JSON tests that assert on text.
     body: String,
+    /// The response body as received, for the tests that assert on bytes.
+    raw: Vec<u8>,
 }
 
 impl HttpResponse {
@@ -381,10 +462,370 @@ fn search_percent_decodes_the_query() {
 }
 
 #[test]
-fn download_is_an_explicit_not_implemented() {
-    let res = server().get("/api/download?location=autonomi%3A%2F%2Fabc");
-    assert_eq!(res.status, 501, "download must not pretend to work");
-    assert_eq!(res.json()["error"], "not_implemented");
+fn download_is_a_real_daemon_fallback_not_a_stub() {
+    // A random address cannot exist, and whether *this* machine has ant tooling
+    // decides which honest failure comes back: 503 with an install command when
+    // it does not, 502 when the fetch itself fails. Assert the invariant that
+    // holds either way rather than assuming a host with nothing installed.
+    let res = server().get(&format!(
+        "/api/download?location=autonomi%3A%2F%2F{}",
+        "ab".repeat(32)
+    ));
+    assert_ne!(
+        res.status, 501,
+        "download must not pretend to be unimplemented"
+    );
+    assert!(
+        res.status == 502 || res.status == 503,
+        "expected a daemon failure, got {} {}",
+        res.status,
+        res.body
+    );
+    let body = res.json();
+    assert_eq!(body["ok"], false);
+    assert!(
+        body["error"] == "download_failed" || body["error"] == "no_download_backend",
+        "unexpected error code: {}",
+        body["error"]
+    );
+}
+
+#[test]
+fn download_still_validates_before_doing_any_work() {
+    let res = server().get("/api/download");
+    assert_eq!(res.status, 400);
+    assert_eq!(res.json()["error"], "validation_error");
+}
+
+/* ------------------------------------------------------- browser fetch path -- */
+
+/// A distinct, well-formed Autonomi address per call site.
+///
+/// Hand-built rather than hashed, because the tests only need the SDK-shaped
+/// constraints to hold: 64 hex characters, and no two tests sharing a location
+/// so a stored resource cannot satisfy the wrong assertion. No hashing crate is
+/// needed for that, and these are not security-sensitive values.
+fn test_address(tag: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Two 16-hex halves make 32 bytes, which is the length the SDK expects.
+    format!("autonomi://{:016x}{:016x}", tag.len(), n)
+}
+
+/// Split a viewer URL into its port and request path.
+fn split_viewer_url(url: &str) -> (u16, String) {
+    let (_, after_host) = url
+        .split_once("127.0.0.1:")
+        .expect("viewer url is loopback");
+    let (port, path) = match after_host.split_once('/') {
+        Some((port, path)) => (port, format!("/{path}")),
+        None => (after_host, "/".to_string()),
+    };
+    let port: u16 = port
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("viewer url has no port: {url}"));
+    (port, path)
+}
+
+/// GET against an arbitrary loopback port.
+///
+/// The viewer deliberately binds a *different* port from the API, so testing it
+/// through the shared `TestServer` request helper would test nothing. Asserting
+/// the port differs is itself one of the security properties: it is what keeps
+/// the document off the origin that holds the API.
+fn get_on_port(port: u16, path: &str) -> (u16, String, Vec<u8>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to viewer");
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read");
+    let split = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("malformed response");
+    let head = String::from_utf8_lossy(&response[..split]).into_owned();
+    let body = response[split + 4..].to_vec();
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .expect("status line");
+    (status, head.to_lowercase(), body)
+}
+
+#[test]
+fn the_viewer_serves_the_bytes_inline_from_its_own_origin() {
+    let uri = test_address("viewer-html");
+    let page = b"<!doctype html><title>viewer test</title><p>hello from the viewer";
+    let res = server().post_binary(
+        "/api/view/blob",
+        page,
+        &[
+            ("X-Anta-Uri", uri.as_str()),
+            ("Content-Type", "application/octet-stream"),
+        ],
+    );
+    assert_eq!(res.status, 200, "view_blob failed: {}", res.body);
+    let body = res.json();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["mime_type"], "text/html");
+    assert_eq!(body["bytes"], page.len());
+    /* A name from the server, never the SDK's `public-file-<8hex>.bin`. */
+    let filename = body["filename"].as_str().expect("filename");
+    assert!(
+        !filename.starts_with("public-file-"),
+        "got SDK filename {filename}"
+    );
+    assert!(filename.ends_with(".html"), "got {filename}");
+
+    let (port, path) = split_viewer_url(body["url"].as_str().expect("url"));
+
+    /* The isolation property: not the API's origin. */
+    assert_ne!(port, server().port, "viewer must not share the API origin");
+
+    let (status, headers, served) = get_on_port(port, &path);
+    assert_eq!(status, 200);
+    assert_eq!(
+        served, page,
+        "viewer must serve the exact bytes it was given"
+    );
+    assert!(headers.contains("content-type: text/html"), "{headers}");
+    /* Inline, so a document renders as a document; and locked down, because this
+     * is attacker-supplied content on a loopback port. */
+    assert!(headers.contains("content-disposition: inline"), "{headers}");
+    assert!(
+        headers.contains("x-content-type-options: nosniff"),
+        "{headers}"
+    );
+    assert!(headers.contains("cache-control: no-store"), "{headers}");
+    assert!(
+        headers.contains("referrer-policy: no-referrer"),
+        "{headers}"
+    );
+}
+
+#[test]
+fn the_viewer_only_serves_its_own_token() {
+    let uri = test_address("viewer-scope");
+    let body = server()
+        .post_binary(
+            "/api/view/blob",
+            b"secret bytes",
+            &[("X-Anta-Uri", uri.as_str())],
+        )
+        .json();
+    let (port, path) = split_viewer_url(body["url"].as_str().expect("url"));
+    let token = path.trim_start_matches("/v/").to_string();
+
+    /* The exact token works... */
+    assert_eq!(get_on_port(port, &path).0, 200);
+    /* ...and nothing else on that port does. An unguessable path is the entire
+     * authorisation: there is no cookie and no shared secret, so a second
+     * listener's bytes must not be reachable through the first one's port. */
+    assert_eq!(get_on_port(port, "/v/not-the-token").0, 404);
+    assert_eq!(get_on_port(port, "/").0, 404);
+    assert_eq!(get_on_port(port, &format!("/v/{token}/../{token}")).0, 404);
+    assert_eq!(get_on_port(port, &format!("/v/{token}x")).0, 404);
+}
+
+#[test]
+fn a_cross_site_post_is_refused() {
+    // The viewer page is on another origin, and the API is reachable by any page
+    // the user has open, so a state-changing POST from elsewhere is refused.
+    let res = server().post_binary(
+        "/api/index/bytes",
+        b"payload from another site",
+        &[
+            ("Sec-Fetch-Site", "cross-site"),
+            ("X-Anta-Uri", "autonomi://deadbeef"),
+        ],
+    );
+    assert_eq!(
+        res.status, 403,
+        "cross-site POST was not refused: {}",
+        res.body
+    );
+    assert_eq!(res.json()["error"], "cross_site_request");
+}
+
+#[test]
+fn the_same_origin_post_is_allowed() {
+    // The guard must not block the app's own fetches: a browser sends
+    // `same-origin` for these, and curl and the tests send nothing at all.
+    let res = server().post_binary(
+        "/api/view/blob",
+        b"<!doctype html><p>same origin",
+        &[
+            ("Sec-Fetch-Site", "same-origin"),
+            ("X-Anta-Uri", "autonomi://sameorigin"),
+        ],
+    );
+    assert_eq!(
+        res.status, 200,
+        "same-origin POST was refused: {}",
+        res.body
+    );
+}
+
+#[test]
+fn bytes_indexed_by_the_browser_are_stored_and_searchable() {
+    let uri = test_address("browser-index");
+    let body = "zorbulax quixotic telemetry beacon for the browser upload path";
+    let res = server().post_binary(
+        "/api/index/bytes",
+        body.as_bytes(),
+        &[
+            ("X-Anta-Uri", uri.as_str()),
+            ("X-Anta-Tags", "browser,upload"),
+            ("Content-Type", "application/octet-stream"),
+        ],
+    );
+    assert_eq!(res.status, 200, "index/bytes failed: {}", res.body);
+    let out = res.json();
+    assert_eq!(out["ok"], true);
+    assert_eq!(out["location"], uri.as_str());
+    assert!(out["resource_id"].is_string());
+    /* The resource id is the SHA-256 of the bytes, so it is stable across
+     * transports and matches what a peer would report for the same file. */
+    assert_eq!(out["resource_id"].as_str().unwrap().len(), 64);
+
+    // And it is really in the index, not just acknowledged.
+    let found = server().json("/api/search?q=zorbulax");
+    let hit = found["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["location"] == uri.as_str())
+        .expect("browser-uploaded bytes are searchable");
+    assert_eq!(hit["source"], "local");
+}
+
+#[test]
+fn an_oversized_upload_is_refused_rather_than_truncated() {
+    // Truncating here would index a corrupt prefix of a large file and report
+    // success, so over-cap must be a refusal with a code the browser can branch
+    // on to take the daemon route instead.
+    let uri = test_address("oversize");
+    let over = vec![b'a'; 32 * 1024 * 1024 + 1];
+    let res = server().post_binary("/api/index/bytes", &over, &[("X-Anta-Uri", uri.as_str())]);
+    assert_eq!(
+        res.status, 400,
+        "oversized body was not refused: {}",
+        res.status
+    );
+    assert_eq!(res.json()["error"], "body_too_large");
+}
+
+#[test]
+fn the_vendored_sdk_is_served_with_types_the_browser_accepts() {
+    let s = server();
+    let js = s.get("/assets/vendor/autonomi-sdk/0.1.1/index.js");
+    assert_eq!(js.status, 200, "vendor index.js missing: {}", js.body);
+    assert!(js.headers.contains("javascript"), "{}", js.headers);
+
+    // The WASM is the reason the WASM MIME rule exists: served as
+    // `application/octet-stream` a module import fails to stream-compile.
+    let wasm = s.get("/assets/vendor/autonomi-sdk/0.1.1/wasm/ant_core_bg.wasm");
+    assert_eq!(wasm.status, 200);
+    assert!(
+        wasm.headers.contains("application/wasm"),
+        "{}",
+        wasm.headers
+    );
+    assert_eq!(&wasm.raw[0..4], b"\0asm", "not a WASM module");
+
+    // The runtime prefix and the boot global the classic app.js reads must agree.
+    let page = s.get("/");
+    assert!(
+        page.body.contains("/assets/vendor/autonomi-sdk/0.1.1/"),
+        "page does not name the sdk base"
+    );
+}
+
+#[test]
+fn vendor_paths_cannot_escape_the_vendored_directory() {
+    for path in [
+        "/assets/vendor/antonomi-sdk/0.1.1/../../../etc/passwd",
+        "/assets/vendor/autonomi-sdk/0.1.1/wasm/../../../../Cargo.toml",
+    ] {
+        let res = server().get(path);
+        assert!(
+            res.status == 404 || res.status == 400,
+            "traversal through {path} returned {}",
+            res.status
+        );
+    }
+}
+
+#[test]
+fn an_autonomi_location_looks_clickable_because_it_is() {
+    // Regression: `.result-loc` carried `cursor: help` and a comment claiming an
+    // Autonomi location had "no open/download path yet". The path existed, but
+    // only on a button elsewhere in the row — so the address underlined on
+    // hover, showed a question-mark cursor, and did nothing when clicked. The
+    // affordance has to match the behaviour.
+    let s = server();
+    let modern = s.get("/assets/modern.css").body;
+    let retro = s.get("/assets/retro.css").body;
+
+    // Inert by default, pointer once app.js says it wired a click.
+    let inert =
+        css_rule(&modern, r#"[data-theme="modern"] .result-loc"#).expect("modern .result-loc");
+    assert!(
+        !inert.contains("cursor"),
+        "the default state must not claim to be clickable: {inert}"
+    );
+    for (label, css) in [("modern", &modern), ("retro", &retro)] {
+        let openable = css_rule(
+            css,
+            &format!(r#"[data-theme="{label}"] .result-loc.is-openable"#),
+        )
+        .unwrap_or_else(|| panic!("{label} has no .result-loc.is-openable rule"));
+        assert!(
+            openable.contains("cursor: pointer"),
+            "{label} .result-loc.is-openable does not take a pointer cursor: {openable}"
+        );
+    }
+
+    // And the click is really wired, keyed as well as pointed.
+    let js = s.get("/assets/app.js").body;
+    assert!(
+        js.contains("is-openable"),
+        "app.js never marks the location openable"
+    );
+    assert!(
+        js.contains(r#"loc.addEventListener('click'"#),
+        "the location has no click handler"
+    );
+    assert!(
+        js.contains("event.key === 'Enter'"),
+        "the location is focusable but has no key handler"
+    );
+}
+
+#[test]
+fn the_page_offers_open_and_save_for_an_autonomi_row() {
+    let script = server().get("/assets/app.js");
+    assert_eq!(script.status, 200);
+    let js = script.body.as_str();
+    for needle in [
+        "data-role=\"open\"",
+        "data-role=\"save\"",
+        "autonomiAddress",
+        "/api/index/bytes",
+        "/api/view/blob",
+    ] {
+        assert!(js.contains(needle), "app.js is missing {needle}");
+    }
+    /* No 501 stub is left to call, and the honest refusal to guess a filename
+     * must not come back: the server supplies the name. */
+    assert!(
+        !js.contains("not_implemented"),
+        "app.js still expects a not-implemented download"
+    );
 }
 
 #[test]

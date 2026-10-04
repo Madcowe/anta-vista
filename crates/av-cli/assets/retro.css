@@ -260,12 +260,16 @@
   [data-theme="retro"] #q.typing { animation: none; }
 }
 
-/* An Autonomi location is not a link: there is no open/download path yet. It
- * looks like a title but reads as unfollowable. */
+/* An Autonomi location is not an href — nothing handles `autonomi://` — but it
+ * *is* openable, so it takes the pointer cursor once app.js marks it so. The
+ * un-marked case stays unclickable-looking rather than pretending. */
 [data-theme="retro"] .result-loc {
   font-weight: bold;
-  cursor: help;
   text-decoration: underline dotted;
+}
+
+[data-theme="retro"] .result-loc.is-openable {
+  cursor: pointer;
 }
 
 [data-theme="retro"] .block-agents {

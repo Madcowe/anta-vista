@@ -3,7 +3,7 @@ use crate::{
     error::IngestResult,
     location::analyze_location,
     metadata::extract,
-    mime::{canonicalize_mime, detect_mime, mime_major},
+    mime::{canonicalize_mime, detect_mime_with_hint, mime_major},
     watchlist::{classify, to_extracted_meta},
 };
 use av_core::constants::WATCHLIST_MIME;
@@ -48,7 +48,12 @@ pub fn ingest_bytes(
             (mime, kind, meta)
         }
         None => {
-            let mime_raw = detect_mime(bytes)?;
+            // The hint keeps the stored `mime_type` consistent with what the web
+            // viewer later serves for the same bytes, so a file that sniffing
+            // calls `text/plain` does not show up as plain text in results and
+            // then open as a PDF. A bare Autonomi address carries no filename and
+            // so gets no hint, which is correct: there is nothing to go on.
+            let mime_raw = detect_mime_with_hint(bytes, effective_filename)?;
             let mime = canonicalize_mime(&mime_raw);
             let kind = kind_from_mime(&mime);
             let meta = extract(bytes, &mime);
