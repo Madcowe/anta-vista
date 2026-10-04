@@ -178,7 +178,7 @@ fn route(
                 "/api/view/blob" => {
                     let uri = header(request, URI_HEADER).unwrap_or_default();
                     let body = read_body_bytes(request).map_err(RouteError::ready)?;
-                    Ok(handlers::view_blob(&uri, &body))
+                    Ok(handlers::view_blob(state, &uri, &body))
                 }
                 // A bounded prefix of the bytes, never the whole file. It exists
                 // so the page can learn a filename it cannot invent itself, and
@@ -195,7 +195,7 @@ fn route(
                     let mime = header(request, MIME_HEADER).unwrap_or_default();
                     let prefix =
                         read_body_capped(request, PLAN_PREFIX_CAP).map_err(RouteError::ready)?;
-                    Ok(handlers::view_plan(&uri, &mime, &prefix))
+                    Ok(handlers::view_plan(state, &uri, &mime, &prefix))
                 }
                 _ => {
                     let body = read_body(request)?;

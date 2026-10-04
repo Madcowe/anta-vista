@@ -33,23 +33,35 @@ pub fn tokenize_filename_opt(filename: &str) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Pick a download filename for content fetched from a location.
+/// Pick a download filename for content fetched from a location, using only what
+/// the location itself says. See [`suggest_filename_with`] for the version that
+/// can also be told a name we already hold.
+pub fn suggest_filename(location: &str, mime: &str) -> String {
+    suggest_filename_with(location, None, mime)
+}
+
+/// Pick a download filename, optionally preferring a name we already hold.
 ///
-/// A bare `autonomi://<hex>` carries no name, and the SDK's `file.name` is not
-/// one either: it is always a synthetic `public-file-<8hex>.bin` derived from the
-/// record's public key. Handing that to a browser's download attribute would put
-/// every file on a user's disk under the same meaningless name, so the name is
-/// taken from the location instead:
+/// The precedence is deliberate and ordered by how much the author meant it:
 ///
-/// 1. A trailing path segment, when the location has one (`autonomi://<hex>/report.pdf`)
-///    — the human-facing name, sanitized.
-/// 2. Otherwise a short prefix of the address plus an extension implied by the
-///    detected MIME type, so the file is at least recognisable and typed.
+/// 1. A trailing path segment or `?name=` on the location, when there is one
+///    (`autonomi://<hex>/report.pdf`) — the author's live intent, spelled out in
+///    the link the user is looking at right now.
+/// 2. `known_name`, a name we stored when we indexed the record. This is what
+///    rescues the bare-address case: an Autonomi record's *canonical* location
+///    is the address alone, because that is its identity for dedup and blocking,
+///    so a search result carries `autonomi://<hex>` and the `/welcome.md` the
+///    author published is only in `resources.filename`. Without this the name is
+///    written to one field and read from a different one, and every download is
+///    named after the first 16 hex of the address.
+/// 3. A short address prefix plus an extension implied by the detected MIME.
+///
+/// The later sources never override an earlier one, so a stored name cannot
+/// mask a name the link still carries.
 ///
 /// Anything found is reduced to a safe single path segment: a name taken from a
 /// location is attacker-influenced input that ends up in a browser's download
-/// directory, so separators and `..` cannot be allowed through.
-pub fn suggest_filename(location: &str, mime: &str) -> String {
+pub fn suggest_filename_with(location: &str, known_name: Option<&str>, mime: &str) -> String {
     let sanitized = |raw: &str| -> String {
         let cleaned: String = raw
             .chars()
@@ -80,6 +92,7 @@ pub fn suggest_filename(location: &str, mime: &str) -> String {
         // with no path it is the *only* place one can appear — which this used
         // to ignore, falling back to an address-derived name.
         .or_else(|| crate::location::analyze_location(location).inferred_filename)
+        .or_else(|| known_name.map(str::to_string))
         .map(|name| sanitized(&name))
         .filter(|name| !name.is_empty());
 
@@ -157,7 +170,67 @@ pub(crate) fn extension_for_mime(mime: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::suggest_filename;
+    use super::{suggest_filename, suggest_filename_with};
+
+    #[test]
+    fn a_known_name_is_used_when_the_location_carries_none() {
+        // The bare-address case, and the reason this function takes a name at
+        // all: the canonical location of an Autonomi record is the address
+        // alone, so the `/welcome.md` the author published reaches us only as a
+        // stored column.
+        let uri = format!("autonomi://{HEX}");
+        assert_eq!(
+            suggest_filename(&uri, "text/markdown"),
+            "0123456789abcdef.md"
+        );
+        assert_eq!(
+            suggest_filename_with(&uri, Some("welcome.md"), "text/markdown"),
+            "welcome.md"
+        );
+    }
+
+    #[test]
+    fn the_location_still_outranks_a_name_we_hold() {
+        // Ordered by how much the author meant it: the link in front of the user
+        // is live intent, and a stored name must not mask it.
+        let uri = format!("autonomi://{HEX}/report.pdf");
+        assert_eq!(
+            suggest_filename_with(&uri, Some("welcome.md"), "application/pdf"),
+            "report.pdf"
+        );
+        let query = format!("autonomi://{HEX}?name=notes");
+        assert_eq!(
+            suggest_filename_with(&query, Some("welcome.md"), "text/plain"),
+            "notes.txt"
+        );
+    }
+
+    #[test]
+    fn a_known_name_gets_an_extension_and_keeps_its_own() {
+        let uri = format!("autonomi://{HEX}");
+        assert_eq!(
+            suggest_filename_with(&uri, Some("notes"), "text/markdown"),
+            "notes.md"
+        );
+        // An unrecognised extension is still the author's, and overriding it
+        // would let the content rename the file they published.
+        assert_eq!(
+            suggest_filename_with(&uri, Some("notes.xyz"), "text/markdown"),
+            "notes.xyz"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_blank_known_name_is_no_name_at_all() {
+        let uri = format!("autonomi://{HEX}");
+        for blank in ["", "   ", "..", "."] {
+            assert_eq!(
+                suggest_filename_with(&uri, Some(blank), "text/markdown"),
+                "0123456789abcdef.md",
+                "{blank:?} must not produce an empty or dotted name"
+            );
+        }
+    }
 
     #[test]
     fn a_bare_address_is_typed_from_what_we_know_about_the_content() {

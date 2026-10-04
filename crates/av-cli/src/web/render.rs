@@ -189,6 +189,13 @@ const PAGE: &str = r##"<!doctype html>
     <div class="result-head">
       <span class="badge" data-role="source"></span>
       <a class="result-title" data-role="title" target="_blank" rel="noopener noreferrer"></a>
+      <!-- The name the author published, when we hold one. Sits beside the
+           location rather than replacing it, because the location is what every
+           command takes and for Autonomi it is the bare address. app.js leaves it
+           `hidden` when there is no name, and the `[hidden] { display: none
+           !important }` guard at the top of modern.css is what makes that stick
+           against the display rule below. -->
+      <span class="result-name" data-role="name" hidden></span>
     </div>
     <p class="result-desc" data-role="desc"></p>
     <div class="result-meta">

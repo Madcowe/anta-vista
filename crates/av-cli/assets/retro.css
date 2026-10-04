@@ -159,6 +159,15 @@
   color: #ee0000;
 }
 
+/* Same role as in modern.css: the stored filename, annotating the location.
+   No `display` here, so the unguarded `[hidden]` rule in modern.css covers it
+   whichever theme is active. */
+[data-theme="retro"] .result-name {
+  color: #555;
+  font-family: monospace;
+  font-size: 0.85em;
+}
+
 /* The description sits under the location, and it is the text anta-vista
    embeds — up to 800 characters of a document's own content. Keep it indented
    like `av search` prints it, and let it wrap rather than stretch the row. */

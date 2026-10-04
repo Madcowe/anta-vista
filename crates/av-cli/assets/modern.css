@@ -449,6 +449,22 @@ input[type="text"] {
   text-decoration: underline;
 }
 
+/* The stored filename annotates the location beside it. `inline-block` is a
+   display declaration on an element app.js toggles with `hidden`, so it only
+   works because of the `[hidden] { display: none !important }` guard at the top
+   of this file — do not remove that guard, and do not read this rule as a
+   reason to. */
+[data-theme="modern"] .result-name {
+  display: inline-block;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.85em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 14rem;
+}
+
 [data-theme="modern"] .rid,
 [data-theme="modern"] .hint,
 [data-theme="modern"] .status-line,

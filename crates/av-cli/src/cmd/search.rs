@@ -94,6 +94,11 @@ pub fn collect_results(
             "location": location,
             "description": r.resource.description_text,
             "mime_type": r.resource.mime_type,
+            // The name the author published, which `location` cannot show: an
+            // Autonomi record's canonical location is the address alone, so
+            // `autonomi://<hex>/welcome.md` reaches the page as `autonomi://<hex>`
+            // and the only surviving copy of the name is this column.
+            "filename": r.resource.filename,
             "kind": format!("{:?}", r.resource.kind),
             "score": r.score,
             "score_breakdown": {
@@ -248,11 +253,26 @@ pub fn run(
                 match source {
                     "local" => {
                         let mime_type = result["mime_type"].as_str().unwrap_or("");
+                        // The stored name annotates the identifier rather than
+                        // replacing it: the location is what every command takes,
+                        // and for Autonomi it is the address, which reads as noise
+                        // on its own. Only local rows have one — a peer does not
+                        // send a filename, and inventing one would be a lie.
+                        let filename = result["filename"].as_str().unwrap_or("");
+                        let identified = if filename.is_empty() {
+                            console::style(location).green().to_string()
+                        } else {
+                            format!(
+                                "{} \u{b7} {}",
+                                console::style(location).green(),
+                                console::style(filename).dim()
+                            )
+                        };
                         println!(
                             "  {}. [{}] {} (score: {:.3})",
                             rank + 1,
                             console::style("local").dim(),
-                            console::style(location).green(),
+                            identified,
                             score,
                         );
                         println!("     {} [{}]", description, mime_type);

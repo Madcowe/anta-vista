@@ -1064,10 +1064,22 @@ fn the_viewer_only_serves_its_own_token() {
         )
         .json();
     let (port, path) = split_viewer_url(body["url"].as_str().expect("url"));
-    let token = path.trim_start_matches("/v/").to_string();
+    /* The token is the *first* segment only. The published URL also carries the
+     * filename so the tab is titled with it, and taking the whole remainder here
+     * would have quietly turned `/v/{token}x` into a well-formed named path —
+     * which is why this test needed rewriting rather than loosening: the
+     * neighbour assertions are the load-bearing half. */
+    let token = path
+        .trim_start_matches("/v/")
+        .split('/')
+        .next()
+        .expect("a token")
+        .to_string();
 
-    /* The exact token works... */
+    /* The published URL works, and so does the bare token — the name is
+     * decoration, so a viewer that never learned it can still be opened. */
     assert_eq!(get_on_port(port, &path).0, 200);
+    assert_eq!(get_on_port(port, &format!("/v/{token}")).0, 200);
     /* ...and nothing else on that port does. An unguessable path is the entire
      * authorisation: there is no cookie and no shared secret, so a second
      * listener's bytes must not be reachable through the first one's port. */
@@ -1075,6 +1087,12 @@ fn the_viewer_only_serves_its_own_token() {
     assert_eq!(get_on_port(port, "/").0, 404);
     assert_eq!(get_on_port(port, &format!("/v/{token}/../{token}")).0, 404);
     assert_eq!(get_on_port(port, &format!("/v/{token}x")).0, 404);
+    /* A second segment is not a name, it is a different resource: the name is
+     * one segment and only ever appended, so nothing may follow it. */
+    assert_eq!(get_on_port(port, &format!("/v/{token}/name/extra")).0, 404);
+    /* Traversal dressed as a name, and an empty one. */
+    assert_eq!(get_on_port(port, &format!("/v/{token}/..")).0, 404);
+    assert_eq!(get_on_port(port, &format!("/v/{token}/")).0, 404);
 }
 
 #[test]
@@ -1761,6 +1779,138 @@ fn an_agent_blocked_in_the_browser_says_the_transport_is_untouched() {
     );
 }
 
+// --- The stored name, end to end -------------------------------------------
+//
+// A record published at `autonomi://<hex>/welcome.md` stores the name, and its
+// *canonical* location is the address alone — that is its identity, for dedup and
+// for the block bridge. So the search result carries `autonomi://<hex>`, the page
+// echoes that back, and the name is nowhere in the request. These pin that the
+// name still reaches every route that names a file.
+
+/// The `X-Anta-Uri` the page actually sends for a record we hold: the canonical
+/// address, with the author's path segment already gone.
+fn held_record_address(tag: &str) -> (String, String) {
+    let hex = format!("{:0>64}", tag);
+    let canonical = format!("autonomi://{hex}");
+    let with_name = format!("{canonical}/welcome.md");
+    (canonical, with_name)
+}
+
+/// Seed the shape `ingest_bytes` produces for an Autonomi record with a name.
+fn seed_named_record(db: &std::path::Path, id: &str, canonical: &str, location: &str) {
+    use av_core::types::{ResourceDescriptor, ResourceKind};
+
+    let conn = av_store::open(db).expect("open test db");
+    av_store::repo::resources::insert(
+        &conn,
+        &ResourceDescriptor {
+            id: id.to_string(),
+            kind: ResourceKind::Text,
+            location: location.to_string(),
+            location_scheme: Some("autonomi".to_string()),
+            location_canonical: Some(canonical.to_string()),
+            mime_type: "text/markdown".to_string(),
+            filename: Some("welcome.md".to_string()),
+            metadata_json: serde_json::json!({}),
+            description_text: "seeded for the stored-name test".to_string(),
+            created_at: 1_700_000_000,
+        },
+    )
+    .expect("insert resource");
+}
+
+#[test]
+fn the_plan_names_a_file_from_the_name_we_stored_for_it() {
+    // The reported bug, exactly: `autonomi://<hex>/welcome.md` saved as
+    // `52af8a181c6171f8.md` because the name was written to `resources.filename`
+    // and read back out of the URI, which by then was the address alone.
+    let s = server();
+    let id = "5aaf8a181c6171f8e12896ca734cdf60839c3b324dfbeadf857226dfc7cb453b";
+    let (canonical, location) = held_record_address(id);
+    seed_named_record(&s.db, id, &canonical, &location);
+
+    let res = s.request_raw(
+        "POST",
+        "/api/view/plan",
+        b"# Weather log\n\nWind is picking up from the west.",
+        None,
+        &[
+            ("X-Anta-Uri", canonical.as_str()),
+            ("X-Anta-Mime", "application/octet-stream"),
+        ],
+    );
+    assert_eq!(res.status, 200, "{}", res.body);
+    let body = res.json();
+    assert_eq!(
+        body["filename"], "welcome.md",
+        "the stored name must reach the download: {body}"
+    );
+    assert_eq!(body["mime_type"], "text/markdown", "{body}");
+}
+
+#[test]
+fn an_unheld_record_still_falls_back_to_the_address() {
+    // The lookup is a best-effort improvement to a label, not a new requirement:
+    // a record we have never indexed has no stored name, and the address-derived
+    // name is always safe to produce.
+    let s = server();
+    let uri = test_address("never-indexed");
+    let res = s.request_raw(
+        "POST",
+        "/api/view/plan",
+        b"# Weather log\n\nWind.",
+        None,
+        &[
+            ("X-Anta-Uri", uri.as_str()),
+            ("X-Anta-Mime", "application/octet-stream"),
+        ],
+    );
+    let body = res.json();
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert!(
+        body["filename"].as_str().unwrap().ends_with(".md"),
+        "still typed from the content: {body}"
+    );
+}
+
+#[test]
+fn an_opened_record_is_served_under_its_stored_name() {
+    // The open route, which never named anything: the tab showed a bare uuid and
+    // the browser's own "Save image as..." offered the same uuid with no
+    // extension. Both come from the name reaching the viewer URL and the
+    // disposition.
+    let s = server();
+    let id = "6aaf8a181c6171f8e12896ca734cdf60839c3b324dfbeadf857226dfc7cb453b";
+    let (canonical, location) = held_record_address(id);
+    seed_named_record(&s.db, id, &canonical, &location);
+
+    let res = s.post_binary(
+        "/api/view/blob",
+        b"<!doctype html><title>Weather log</title>",
+        &[("X-Anta-Uri", canonical.as_str())],
+    );
+    assert_eq!(res.status, 200, "{}", res.body);
+    let body = res.json();
+    assert_eq!(body["filename"], "welcome.md", "{body}");
+
+    let url = body["url"].as_str().expect("url");
+    assert!(
+        url.ends_with("/welcome.md"),
+        "the tab must be titled with the name, not the token: {url}"
+    );
+    let (port, path) = split_viewer_url(url);
+    let (status, head, _) = get_on_port(port, &path);
+    assert_eq!(status, 200);
+    assert!(
+        head.contains("content-disposition: inline; filename=\"welcome.md\""),
+        "an inline response must still name the file the browser would write: {head}"
+    );
+    assert!(
+        !head.contains("filename=\"\""),
+        "a doubled pair of quotes is a name the user sees on disk: {head}"
+    );
+}
+
 // --- Remove from local index ----------------------------------------------
 //
 // `POST /api/purge` backs the browser's "Remove from local index" button, so
@@ -2036,6 +2186,81 @@ fn result_rows_lead_with_the_location_like_the_cli() {
     assert!(
         js.contains("title.textContent = heading;") && js.contains("span.textContent = heading;"),
         "the linked and unlinked branches must render the same heading"
+    );
+}
+
+#[test]
+fn a_result_row_shows_the_name_we_hold_beside_the_location() {
+    // The name is an annotation of the identifier, not a replacement for it: the
+    // location is what every command takes, and for Autonomi it is the bare
+    // address, which reads as noise on its own. Asserted against the CSS with
+    // `css_rule`-style whole-selector matching in spirit — the element must exist
+    // in the template, app.js must fill it from `result.filename`, and it must be
+    // `hidden` when there is no name, so a peer result shows no empty gap.
+    let html = &server().get("/").body;
+    assert!(
+        html.contains("data-role=\"name\""),
+        "the row has no place to show a name"
+    );
+
+    let js = &server().get("/assets/app.js").body;
+    let js = js_code(&js);
+    assert!(
+        js.contains("const storedName = result.filename || ''"),
+        "app.js must read the name the CLI projects"
+    );
+    assert!(
+        js.contains("nameEl.hidden = !storedName"),
+        "and hide the element when there is none, rather than leaving a gap"
+    );
+    // It must not become the heading. That is the identifier's job, and the
+    // parity test above is what keeps the two layouts from drifting again.
+    assert!(
+        !js.contains(
+            "const heading = source === 'name' ? result.description || location : storedName"
+        ),
+        "the stored name must not take over the heading"
+    );
+
+    // Both themes style it, so a theme switch cannot leave it unstyled.
+    for sheet in ["modern.css", "retro.css"] {
+        let css = &server().get(&format!("/assets/{sheet}")).body;
+        assert!(
+            css.contains(".result-name"),
+            "{sheet} does not style the stored name"
+        );
+    }
+}
+
+#[test]
+fn the_cli_prints_the_stored_name_beside_the_location_too() {
+    // The browser and the terminal must not disagree about what a row shows, and
+    // this is the half of that the JavaScript assertions cannot see. Only local
+    // rows carry a name: a peer does not send one, so printing an empty field for
+    // a network result would be inventing data.
+    let src = include_str!("../src/cmd/search.rs");
+    assert!(
+        src.contains("\"filename\": r.resource.filename"),
+        "the local result must project the stored name"
+    );
+    assert!(
+        src.contains("let filename = result[\"filename\"].as_str().unwrap_or(\"\")"),
+        "the local row must read it back out"
+    );
+    assert!(
+        src.contains("console::style(filename).dim()"),
+        "and annotate the identifier with it. Deliberately not asserting on the \
+         separator glyph: the source carries the escape, not the character, so \
+         such an assertion tests the spelling rather than the behaviour."
+    );
+    // A network row must not grow one.
+    let network = &src[src.find("\"source\": \"network\"").unwrap_or(0)..];
+    let before_next = &network[..network
+        .find("\"source\": \"name\"")
+        .unwrap_or(network.len())];
+    assert!(
+        !before_next.contains("\"filename\""),
+        "peers do not send a filename; the field would be empty"
     );
 }
 

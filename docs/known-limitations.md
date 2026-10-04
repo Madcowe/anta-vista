@@ -174,6 +174,22 @@ optional trailing path segment, and otherwise from a short prefix of the address
 plus an extension implied by the detected type. A record with no name in its
 location gets a machine-style name.
 
+That name is authoritative and anta-vista keeps it, but it is not in the location a
+search result reports. An Autonomi record's canonical location is the address
+alone, because that is its identity for dedup and for blocking, so
+`autonomi://<hex>/welcome.md` reaches the page as `autonomi://<hex>` and the only
+surviving copy is the `resources.filename` column. Everything naming a file from
+the request URI alone therefore saw no name — see `suggest_filename_with` and
+`resources::find_filename` for how the column is read back.
+
+A name exists only if the publisher put one in the location, as a trailing path
+segment or a `?name=`: the DataMap is a list of encrypted chunk hashes and sizes,
+and the SDK synthesises its `file.name` per read rather than reading it back.
+
+One consequence: **peers do not send a filename.** `ResourceResult` has no such
+field, so only `source: "local"` rows carry a name, and adding one to the network
+result shape would be a protocol change needing peer support.
+
 ## Network
 
 ### x0x daemon required for P2P

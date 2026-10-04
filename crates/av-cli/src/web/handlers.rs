@@ -283,12 +283,33 @@ pub fn download(state: &Arc<AppState>, query: &str) -> WebResponse {
     binary_response(200, &mime, bytes)
 }
 
+/// The name we already hold for a location, if any.
+///
+/// This exists because an Autonomi record's *canonical* location is the address
+/// alone — that is its identity, for dedup and for the block bridge — so the
+/// `/welcome.md` an author published is stripped before a search result ever
+/// reaches the page. The name is not lost, it is in `resources.filename`, but
+/// nothing was reading it: both view endpoints derived the name from the URI
+/// alone, so every download came out as `52af8a181c6171f8.md`.
+///
+/// A read failure is deliberately **not** fatal here. The caller falls back to
+/// the address-derived name, which is always safe to produce; this is a
+/// best-effort improvement to a label, not a policy decision, and it is not the
+/// kind of "we could not check" that the block readers must fail closed on.
+fn stored_filename(state: &Arc<AppState>, uri: &str) -> Option<String> {
+    let conn = state.conn().ok()?;
+    av_store::repo::resources::find_filename(&conn, uri)
+        .ok()
+        .flatten()
+        .filter(|name| !name.trim().is_empty())
+}
+
 /// `POST /api/view/blob` — raw body is the file; metadata arrives in headers.
 ///
 /// Publishes the bytes on a throwaway loopback port so they can be opened as a
 /// real document on an origin that cannot reach the API. See [`crate::web::viewer`]
 /// for why a `blob:` URL is not usable here.
-pub fn view_blob(uri: &str, body: &[u8]) -> WebResponse {
+pub fn view_blob(state: &Arc<AppState>, uri: &str, body: &[u8]) -> WebResponse {
     let uri = av_ingest::location::normalize_uri(uri);
     let filename = av_ingest::location::analyze_location(&uri).inferred_filename;
     let mime = match av_ingest::mime::detect_mime_with_hint(body, filename.as_deref()) {
@@ -303,7 +324,8 @@ pub fn view_blob(uri: &str, body: &[u8]) -> WebResponse {
         }
     };
 
-    let name = av_ingest::filename::suggest_filename(&uri, &mime);
+    let known = stored_filename(state, &uri);
+    let name = av_ingest::filename::suggest_filename_with(&uri, known.as_deref(), &mime);
     match crate::web::viewer::publish(body, &mime, &name) {
         Ok(handle) => json_response(
             json!({
@@ -329,7 +351,7 @@ pub fn view_blob(uri: &str, body: &[u8]) -> WebResponse {
 /// get one, which worked until a record was larger than `MAX_BODY` — at which
 /// point saving a file the browser had already downloaded failed with an error
 /// about the upload, having nothing to do with the save.
-pub fn view_plan(uri: &str, mime_hint: &str, prefix: &[u8]) -> WebResponse {
+pub fn view_plan(state: &Arc<AppState>, uri: &str, mime_hint: &str, prefix: &[u8]) -> WebResponse {
     let uri = av_ingest::location::normalize_uri(uri);
     let info = av_ingest::location::analyze_location(&uri);
     if info.canonical.is_none() {
@@ -368,7 +390,11 @@ pub fn view_plan(uri: &str, mime_hint: &str, prefix: &[u8]) -> WebResponse {
     json_response(
         json!({
             "ok": true,
-            "filename": av_ingest::filename::suggest_filename(&uri, &guess),
+            "filename": av_ingest::filename::suggest_filename_with(
+                &uri,
+                stored_filename(state, &uri).as_deref(),
+                &guess,
+            ),
             "renderable": av_ingest::mime::is_browser_renderable(&guess),
             "mime_type": guess,
         })

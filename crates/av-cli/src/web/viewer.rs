@@ -79,6 +79,11 @@ pub struct ViewHandle {
 /// resource, and `mime` should come from
 /// [`av_ingest::mime::detect_mime_with_hint`] so the type served here agrees
 /// with the type stored for the same bytes.
+///
+/// The filename is appended as a final path segment so the tab is titled
+/// `welcome.md` instead of a uuid. It is decoration only: the **token is the
+/// entire authorization**, and [`respond`] matches on the token whether or not a
+/// name follows, so a viewer URL is no more or less private than before.
 pub fn publish(bytes: &[u8], mime: &str, filename: &str) -> Result<ViewHandle, String> {
     // Bind before writing anything, so a port conflict costs nothing.
     let server =
@@ -98,7 +103,7 @@ pub fn publish(bytes: &[u8], mime: &str, filename: &str) -> Result<ViewHandle, S
 
     let token = Uuid::new_v4();
     let path = format!("/v/{token}");
-    let url = format!("http://127.0.0.1:{port}{path}");
+    let url = format!("http://127.0.0.1:{port}{}/{}", path, path_segment(filename));
     let mime = mime.to_string();
     let filename = filename.to_string();
 
@@ -164,7 +169,7 @@ fn respond(
         return plain(403, "Refusing cross-origin request.\n");
     }
 
-    if request.url() != path {
+    if !path_is_ours(request.url(), path) {
         return plain(404, "Not found.\n");
     }
 
@@ -193,16 +198,26 @@ fn respond(
     // window with no error, which is the failure this whole branch exists to
     // remove. The decision is made here as well as in the page, deliberately: if
     // the two ever disagree, this response still does the safe thing.
+    // `filename` is sent for *both* dispositions, not just attachments. Without
+    // it an inline image answers the browser's own "Save image as..." with the
+    // last path segment — the uuid, with no extension — so right-clicking a
+    // picture the user had just opened produced a file the OS could not open.
+    // It does not name the tab (only the path does that); it names the file the
+    // browser offers to write.
     let disposition = if av_ingest::mime::is_browser_renderable(mime) {
-        header("Content-Disposition", "inline")
+        match disposition_header("inline", filename) {
+            Some(h) => h,
+            // A name we cannot express is not a reason to stop displaying the
+            // file, so a bare `inline` is the fallback rather than an attachment.
+            None => header("Content-Disposition", "inline"),
+        }
     } else {
-        let value = attachment_of(filename);
-        match tiny_http::Header::from_bytes("Content-Disposition", value.as_str()) {
-            Ok(h) => h,
+        match disposition_header("attachment", filename) {
+            Some(h) => h,
             // A filename that cannot be expressed as a header value still has to
             // be downloadable, so fall back to a bare attachment rather than
             // serving it inline.
-            Err(_) => header("Content-Disposition", "attachment"),
+            None => header("Content-Disposition", "attachment"),
         }
     };
     response
@@ -215,16 +230,137 @@ fn respond(
         .with_header(header("Referrer-Policy", "no-referrer"))
 }
 
-/// A `Content-Disposition` value naming `filename`, with the quoting RFC 6266
-/// asks for.
+/// Whether `url` addresses the file published at `path`.
+///
+/// `path` is the unguessable token and is the whole of the authorization. A
+/// filename may be appended as one further segment purely so the tab is titled
+/// with the file's name, so the token alone is still accepted and the name is
+/// never required.
+///
+/// The trailing segment is validated rather than trusted, because the request
+/// line is attacker-controlled and this listener serves peer content: one
+/// segment of URL-unreserved characters or well-formed percent triplets, no
+/// `.` or `..`, and a second `/` means the remainder is not a segment at all.
+/// None of that weakens the token — it only decides whether a name is
+/// *appended* to an already-authorized request.
+fn path_is_ours(url: &str, path: &str) -> bool {
+    if url == path {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix(path) else {
+        return false;
+    };
+    let Some(segment) = rest.strip_prefix('/') else {
+        // `/v/<token>x` — a longer token-looking prefix must not match.
+        return false;
+    };
+    !segment.is_empty() && segment != "." && segment != ".." && is_name_segment(segment)
+}
+
+/// Whether `segment` is URL-unreserved characters and well-formed percent
+/// triplets, and nothing else.
+///
+/// `%` has to be allowed, because [`path_segment`] emits `%20` for a space —
+/// `suggest_filename` permits spaces in a name — so a charset check that stopped
+/// at the unreserved set made every viewer URL with a space in the filename 404.
+/// A *stray* `%` is still refused, so this is not a blanket exemption.
+fn is_name_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            i += 1;
+        } else if b == b'%' {
+            let triplet = bytes.get(i + 1..i + 3).unwrap_or_default();
+            if triplet.len() != 2 || !triplet.iter().all(u8::is_ascii_hexdigit) {
+                return false;
+            }
+            i += 3;
+        } else {
+            return false;
+        }
+    }
+
+    // Defence in depth for a future change that *does* use the name: the segment
+    // is decoration today and never locates bytes, so `%2e%2e` is harmless right
+    // now. Refusing it anyway keeps a traversal from being one refactor away.
+    let decoded = percent_decode_lossy(segment);
+    !decoded.is_empty() && decoded != "." && decoded != ".." && !decoded.contains(['/', '\\', '\0'])
+}
+
+/// Percent-decode for validation only; invalid escapes are left as written.
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(triplet) = bytes.get(i + 1..i + 3)
+            && triplet.len() == 2
+            && triplet.iter().all(u8::is_ascii_hexdigit)
+        {
+            let hex = std::str::from_utf8(triplet).unwrap_or("00");
+            out.push(u8::from_str_radix(hex, 16).unwrap_or(b'%'));
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `filename` as a single URL path segment, percent-encoded.
+///
+/// `suggest_filename` reduces a name to `[A-Za-z0-9._- ]`, and a **space** is in
+/// that set, so encoding is required rather than tidiness — an unencoded space
+/// would produce a URL a browser rewrites and this listener then 404s. Anything
+/// outside the unreserved set is dropped, so the result cannot contain a `/`
+/// that would read as another segment.
+fn path_segment(filename: &str) -> String {
+    let mut out = String::with_capacity(filename.len());
+    for byte in filename.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else if byte == b' ' {
+            out.push_str("%20");
+        }
+    }
+    // A segment that is only dots would be a traversal, not a name.
+    if out.is_empty() || out.chars().all(|c| c == '.') {
+        return "file".to_string();
+    }
+    out
+}
+
+/// `disposition; filename="..."`, or `None` if the value will not parse.
+///
+/// Built with [`tiny_http::Header::from_bytes`] rather than `header()` precisely
+/// so a newline in the name can neither panic nor inject a second header.
+fn disposition_header(kind: &str, filename: &str) -> Option<tiny_http::Header> {
+    let value = disposition_of(kind, filename);
+    tiny_http::Header::from_bytes("Content-Disposition", value.as_str()).ok()
+}
+
+fn disposition_of(kind: &str, filename: &str) -> String {
+    let mut out = String::from(kind);
+    // No quotes here: `quoted_body` supplies them, and adding a second pair is
+    // how this briefly emitted `filename=""x""`.
+    out.push_str("; filename=");
+    out.push_str(&quoted_body(filename));
+    out
+}
+
+/// `filename` as an RFC 6266 quoted-string body, quotes included.
 ///
 /// `suggest_filename` already reduces this to one path segment, but a viewer URL
 /// is served on its own port and its response headers are the one place a
 /// caller-supplied name reaches a parser that is not us, so a quote or a
 /// newline is neutralised here rather than trusted. Escaped quotes inside a
 /// quoted-string are legal, so this cannot terminate the value early.
-fn attachment_of(filename: &str) -> String {
-    let mut out = String::from("attachment; filename=\"");
+fn quoted_body(filename: &str) -> String {
+    let mut out = String::from("\"");
     for c in filename.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -267,4 +403,105 @@ fn plain(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
         .with_status_code(StatusCode(status))
         .with_header(header("Content-Type", "text/plain; charset=utf-8"))
         .with_header(header("X-Content-Type-Options", "nosniff"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{disposition_of, path_is_ours, path_segment};
+
+    const TOKEN: &str = "/v/3f8a9c2e-1b4d-4a77-9e21-0c5b6d8f2a13";
+
+    #[test]
+    fn the_token_is_the_whole_of_the_authorisation() {
+        // A name may be appended, and the token alone must still work: the name
+        // is there to title a tab, so a viewer that never learned one can still
+        // be opened, and widening the match cannot have widened access.
+        assert!(path_is_ours(TOKEN, TOKEN));
+        assert!(path_is_ours(&format!("{TOKEN}/welcome.md"), TOKEN));
+        assert!(path_is_ours(&format!("{TOKEN}/my%20notes.md"), TOKEN));
+    }
+
+    #[test]
+    fn everything_that_is_not_this_token_is_refused() {
+        // The neighbouring-path half is the load-bearing half of this: there is
+        // no cookie and no shared secret, so if any other request is answered,
+        // one listener's bytes are reachable through another's port.
+        for url in [
+            "/v/not-the-token",
+            "/",
+            "",
+            // A longer token-looking prefix must not match.
+            &format!("{TOKEN}x"),
+            &format!("{TOKEN}?x=1"),
+            &format!("{TOKEN}#f"),
+            // Traversal, in the shapes a URL can carry it.
+            &format!("{TOKEN}/../{TOKEN}"),
+            "/v/../v/3f8a9c2e-1b4d-4a77-9e21-0c5b6d8f2a13",
+            // A second segment is a different resource, not a longer name.
+            &format!("{TOKEN}/name/extra"),
+            // Empty and dot-only names.
+            &format!("{TOKEN}/"),
+            &format!("{TOKEN}/."),
+            &format!("{TOKEN}/.."),
+            // Percent-encoded traversal must not decode into one.
+            &format!("{TOKEN}/%2e%2e"),
+            // A slash smuggled in encoded is still a slash once decoded.
+            &format!("{TOKEN}/a%2Fb"),
+            &format!("{TOKEN}/a%5Cb"),
+            // A backslash, which some URL parsers normalise to a slash.
+            &format!("{TOKEN}/a%5Cb"),
+            // A stray percent that is not a triplet.
+            &format!("{TOKEN}/100%.md"),
+            &format!("{TOKEN}/%zz.md"),
+        ] {
+            assert!(
+                !path_is_ours(url, TOKEN),
+                "{url} must not be served by this listener"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_becomes_one_encoded_segment() {
+        assert_eq!(path_segment("welcome.md"), "welcome.md");
+        assert_eq!(path_segment("52af8a181c6171f8.md"), "52af8a181c6171f8.md");
+        // `suggest_filename` allows spaces, and an unencoded space makes a URL a
+        // browser rewrites — which this listener would then 404.
+        assert_eq!(path_segment("my notes.md"), "my%20notes.md");
+        // Anything outside the unreserved set is dropped rather than encoded, so
+        // the result cannot contain a `/` that would read as another segment.
+        assert_eq!(path_segment("a/b.md"), "ab.md");
+        assert_eq!(path_segment("a?b#c.md"), "abc.md");
+        assert_eq!(path_segment("naïve.md"), "nave.md");
+        // A segment of only dots is a traversal, not a name.
+        assert_eq!(path_segment(".."), "file");
+        assert_eq!(path_segment("."), "file");
+        assert_eq!(path_segment(""), "file");
+    }
+
+    #[test]
+    fn both_dispositions_name_the_file_and_neither_can_be_escaped() {
+        // `filename` on an inline response is the fix for the browser answering
+        // "Save image as..." with the last path segment — the uuid, untyped.
+        assert_eq!(
+            disposition_of("inline", "welcome.md"),
+            "inline; filename=\"welcome.md\""
+        );
+        assert_eq!(
+            disposition_of("attachment", "welcome.md"),
+            "attachment; filename=\"welcome.md\""
+        );
+        // Exactly one pair of quotes: an extra pair is what a refactor here once
+        // emitted, and `filename=""x""` is a name the user sees on disk.
+        assert!(!disposition_of("inline", "a.md").contains("\"\""));
+        // A quote or newline in the name cannot terminate the value early.
+        assert_eq!(
+            disposition_of("attachment", "a\"b.md"),
+            "attachment; filename=\"a\\\"b.md\""
+        );
+        assert_eq!(
+            disposition_of("attachment", "a\r\nb.md"),
+            "attachment; filename=\"ab.md\""
+        );
+    }
 }

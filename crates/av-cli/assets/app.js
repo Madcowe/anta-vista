@@ -672,6 +672,17 @@ function renderResult(result) {
     node.classList.add('is-locatable');
   }
 
+  /* The stored name, beside the identifier rather than instead of it. An
+   * Autonomi record's canonical location is the address alone, so the
+   * `/welcome.md` the author published is not in `location`; without this the
+   * row showed a bare address and the name was visible nowhere until the file
+   * was saved. Absent for peers, which do not send one — so it stays hidden
+   * rather than showing an empty gap. */
+  const nameEl = pick('name');
+  const storedName = result.filename || '';
+  nameEl.textContent = storedName;
+  nameEl.hidden = !storedName;
+
   pick('desc').textContent = detail && detail !== heading ? detail : '';
 
   const breakdown = result.score_breakdown;
