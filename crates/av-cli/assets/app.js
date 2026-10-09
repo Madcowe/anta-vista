@@ -77,10 +77,14 @@ let lastQuery = '';
 
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
-  // The label names what the button will switch *to*, which is how the two
-  // themes have always been described.
+  /* The label always names **what the button is showing right now**, and
+   * clicking leaves it: on the 90s it offers to leave them, on modern it offers
+   * to leave now. The previous pairing said "I don't like the 90's" while
+   * pointing *at* the 90s, so on the default theme the button read as an escape
+   * and went the other way. The static markup carries the same string for the
+   * default so there is no flash of a wrong label before this runs. */
   ui.themeToggle.textContent =
-    theme === 'retro' ? 'I don\u2019t like now' : 'I don\u2019t like the 90\u2019s';
+    theme === 'retro' ? 'I don\u2019t like the 90\u2019s' : 'I don\u2019t like now';
   try {
     localStorage.setItem(THEME_KEY, theme);
   } catch (e) {
@@ -1938,6 +1942,6 @@ ui.dialog.addEventListener('close', async () => {
 
 /* ----------------------------------------------------------------- boot -- */
 
-applyTheme(document.documentElement.dataset.theme || 'modern');
+applyTheme(document.documentElement.dataset.theme || 'retro');
 refreshDeps();
 setInterval(refreshDeps, 15000);

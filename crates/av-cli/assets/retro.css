@@ -1,5 +1,17 @@
-/* Retro theme: a late-90s desktop look.
+/* Retro theme: a late-90s desktop look, and the default.
    Loaded always, but only applies when <html data-theme="retro">.
+
+   Load-bearing dependency: the shared shell is laid out by modern.css's
+   UNSCOPED structural rules — `.bar`, `.drawer` and `.banner` get their
+   `display: flex` from there, in every theme. This file only recolours them and adds
+   layout for its own extras (`.result-list`, `.block-list`, `.marquee`). The two
+   never fight — these selectors are (0,2,0), modern's structural ones are
+   (0,1,0), and a [data-theme="modern"] rule cannot match at the same time — so
+   sheet order decides nothing here. What is load-bearing is that unscopedness:
+   scoping modern.css to [data-theme="modern"] to "tidy up" the cascade would
+   leave the default rendering every shell element unstyled, because the retro
+   rules that match it set no `display` at all.
+
    Everything here is real UI surface — no fake chrome, no simulated
    browser/OS furniture, nothing that pretends to be a status the app
    does not actually have. */

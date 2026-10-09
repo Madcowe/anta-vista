@@ -25,11 +25,11 @@ const HTML_MIME: &str = "text/html; charset=utf-8";
 const BOOT_SCRIPT: &str = r#"(function () {
   try {
     var t = localStorage.getItem('anta-vista-theme');
-    if (t !== 'retro' && t !== 'modern') t = 'modern';
+    if (t !== 'retro' && t !== 'modern') t = 'retro';
     document.documentElement.dataset.theme = t;
   } catch (e) {
     // Private mode or storage disabled: fall back to the default.
-    document.documentElement.dataset.theme = 'modern';
+    document.documentElement.dataset.theme = 'retro';
   }
   // Where the vendored Autonomi SDK is served. app.js is a classic script, so
   // it cannot `import` this statically; it reads it from here instead.
@@ -37,7 +37,7 @@ const BOOT_SCRIPT: &str = r#"(function () {
 })();"#;
 
 const PAGE: &str = r##"<!doctype html>
-<html lang="en" data-theme="modern">
+<html lang="en" data-theme="retro">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">

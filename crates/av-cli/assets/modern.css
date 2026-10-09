@@ -1,6 +1,7 @@
-/* Modern theme: the default. Dark, quiet, and legible.
-   Shared structural rules live here so both themes agree on layout;
-   only colour and ornament differ. */
+/* Modern theme: dark, quiet and legible. Reached by leaving the 90s default.
+   Shared structural rules live here so both themes agree on layout; only colour
+   and ornament differ. Those structural rules are deliberately UNSCOPED — see
+   retro.css, which depends on them. */
 
 /* --- shared structure ---------------------------------------------------- */
 

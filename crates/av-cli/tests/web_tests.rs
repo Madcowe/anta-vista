@@ -397,6 +397,109 @@ fn theme_bootstrap_reads_local_storage() {
 }
 
 #[test]
+fn the_90s_are_the_default_theme_and_both_bootstrap_fallbacks_agree() {
+    let page = server().get("/").body;
+    assert!(
+        page.contains(r#"<html lang="en" data-theme="retro">"#),
+        "the default first paint must be the 90s"
+    );
+    /* Two independent fallbacks exist: an unreadable stored value, and storage
+     * being unavailable at all. Both must land on retro, or a hardened browser
+     * boots into the other theme while the markup still says retro. */
+    assert!(
+        page.contains("if (t !== 'retro' && t !== 'modern') t = 'retro';"),
+        "the stored-value fallback is not retro"
+    );
+    assert!(
+        page.contains("document.documentElement.dataset.theme = 'retro';"),
+        "the storage-disabled fallback is not retro"
+    );
+    let js = js_code(&server().get("/assets/app.js").body);
+    assert!(
+        js.contains("applyTheme(document.documentElement.dataset.theme || 'retro');"),
+        "applyTheme's own fallback must match the markup's"
+    );
+}
+
+#[test]
+fn the_theme_button_describes_the_theme_it_is_showing_not_the_one_it_opens() {
+    let js = js_code(&server().get("/assets/app.js").body);
+    /* The label names what is on screen and clicking leaves it. The previous
+     * pairing was inverted: on the default it claimed to dislike the 90s and
+     * then went *to* them, so the button read as an escape that was not one. */
+    assert!(
+        js.contains(
+            r"theme === 'retro' ? 'I don\u2019t like the 90\u2019s' : 'I don\u2019t like now'"
+        ),
+        "the label must name the current theme, not the one it opens"
+    );
+    assert!(
+        !js.contains(r"theme === 'retro' ? 'I don\u2019t like now'"),
+        "the inverted label pairing is back"
+    );
+    assert!(
+        js.contains(
+            "applyTheme(document.documentElement.dataset.theme === 'retro' ? 'modern' : 'retro');"
+        ),
+        "the button must flip the theme rather than jump somewhere else"
+    );
+    assert!(
+        js.contains("localStorage.setItem(THEME_KEY, theme);"),
+        "a chosen theme must survive a reload"
+    );
+}
+
+#[test]
+fn the_static_label_matches_the_default_so_the_header_does_not_flash_a_wrong_one() {
+    let page = server().get("/").body;
+    let js = js_code(&server().get("/assets/app.js").body);
+    /* Before app.js runs, the header shows whatever markup wrote; afterwards
+     * applyTheme rewrites it. They are two copies of one string in two
+     * languages, and both must say the same thing for the default theme or the
+     * button visibly changes its mind on load. */
+    assert!(
+        page.contains("I don&rsquo;t like the 90&rsquo;s"),
+        "the markup label does not match the retro default"
+    );
+    assert!(
+        js.contains(r"theme === 'retro' ? 'I don\u2019t like the 90\u2019s'"),
+        "applyTheme would replace the markup label with a different one"
+    );
+}
+
+#[test]
+fn the_scroll_banner_does_not_outlive_the_theme_that_gives_it_a_reason_to_exist() {
+    let js = js_code(&server().get("/assets/retro.js").body);
+    /* The banner is a second, `aria-hidden` copy of `#results-count` and it is
+     * inserted *before* it, inside the same heading. Leaving it behind after a
+     * switch to modern prints the count twice: once as a stray unstyled line
+     * (it has no `[data-theme="retro"]` rules left) and once as the heading. */
+    assert!(
+        js.contains("strip.remove()"),
+        "the banner is never taken down"
+    );
+    assert!(
+        js.contains("root.dataset.theme === 'retro') install();"),
+        "the toggle only ever installs"
+    );
+    assert!(js.contains("else uninstall();"), "leaving retro is ignored");
+    assert!(
+        js.contains("observer.disconnect();"),
+        "a detached banner would keep its observer awake forever"
+    );
+    /* And the 90s themselves must be untouched: retro still installs the
+     * banner and still mirrors the live heading into it. */
+    assert!(
+        js.contains("heading.parentNode.insertBefore(strip, heading);"),
+        "retro lost its banner"
+    );
+    assert!(
+        js.contains("track.textContent = heading.textContent || 'Anta-Vista';"),
+        "the banner no longer carries real content"
+    );
+}
+
+#[test]
 fn status_reports_counts_and_dependencies() {
     let s = server().json("/api/status");
     assert_eq!(s["ok"], true);
