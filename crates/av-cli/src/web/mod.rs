@@ -12,6 +12,7 @@ use crate::cmd::{CliError, CliResult};
 use crate::startup::StartupState;
 use tiny_http::Server;
 
+pub mod fetchjob;
 pub mod handlers;
 pub mod render;
 pub mod server;

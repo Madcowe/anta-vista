@@ -14,7 +14,7 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use crate::cmd::{CliError, CliResult};
-use crate::download::{DownloadEvent, download_content, verify_uri_exists};
+use crate::download::{DownloadEvent, DownloadOptions, download_content, verify_uri_exists};
 use crate::output::{abbrev, print_output};
 use crate::startup::{
     StartupState, ant_cli_binary_available, install_ant_cli, refresh_ant_path, start_antd_daemon,
@@ -77,7 +77,7 @@ pub fn index_resource(
                 cb(event)
             }
         };
-        download_content(uri, Some(&progress))?
+        download_content(uri, Some(&progress), DownloadOptions::default())?
     };
 
     index_resource_from_bytes(state, conn, provider, &bytes, uri, tags, force)
@@ -378,6 +378,11 @@ pub fn run(
                 finished.set(true);
             }
         }
+        // Unreachable from this path: it fetches with `DownloadOptions::default`,
+        // which leaves `chunk_progress` off, so the ant CLI is never asked for a
+        // diagnostics file. Matched rather than ignored so that turning the option
+        // on here has to be a decision instead of an accident.
+        DownloadEvent::Chunk(_) => {}
     };
 
     let outcome = index_resource(

@@ -13,6 +13,7 @@ use serde_json::json;
 
 use super::server::{WebResponse, binary_response, json_error, json_error_fields, json_response};
 use super::state::AppState;
+use crate::download::DownloadOptions;
 
 /// Percent-decode and parse a query string into key/value pairs.
 pub fn parse_query(query: &str) -> Vec<(String, String)> {
@@ -225,11 +226,12 @@ pub fn search(state: &Arc<AppState>, query: &str) -> WebResponse {
     )
 }
 
-/// `GET /api/download?location=...` — deliberately not implemented yet.
+/// `GET /api/download?location=...` — fetch a location through the local daemon.
 ///
-/// Opening and downloading Autonomi locations needs the ant client to hand us
-/// real bytes. The UI shows these controls as unavailable rather than
-/// pretending, so this answers 501 until that path exists.
+/// The daemon is the *fallback* transport: the browser fetches Autonomi bytes
+/// itself over WebRTC, which needs nothing installed. This route exists for the
+/// cases where that cannot be used — a file too large to hand back to the server,
+/// or a browser that cannot run the SDK.
 pub fn download(state: &Arc<AppState>, query: &str) -> WebResponse {
     let params = parse_query(query);
     let location = param(&params, "location").unwrap_or("").trim().to_string();
@@ -238,35 +240,14 @@ pub fn download(state: &Arc<AppState>, query: &str) -> WebResponse {
     }
     let uri = av_ingest::location::normalize_uri(&location);
 
-    // The daemon is the *fallback* transport: the browser fetches Autonomi bytes
-    // itself over WebRTC, which needs nothing installed. This route exists for
-    // the cases where that cannot be used — a file too large to hand back to the
-    // server, or a browser that cannot run the SDK.
-    let startup = match state.startup.read() {
-        Ok(s) => s,
-        Err(_) => return json_error(500, "state_error", "startup state is poisoned"),
-    };
-    let lower = uri.to_lowercase();
-    if (lower.starts_with("ant://") || lower.starts_with("autonomi://"))
-        && !startup.antd_running
-        && !crate::startup::ant_cli_binary_available()
-    {
-        let command = crate::startup::ant_install_command();
-        return json_error_fields(
-            503,
-            "no_download_backend",
-            &format!(
-                "Neither antd daemon nor ant CLI are available, so this Autonomi location cannot be fetched. Install the ant CLI with: {command}"
-            ),
-            json!({
-                "dependency": "ant",
-                "command": command,
-                "start": false,
-            }),
-        );
+    if let Err(err) = refuse_if_blocked(state, &uri) {
+        return err;
+    }
+    if let Some(err) = no_backend_error(state, &uri) {
+        return err;
     }
 
-    let bytes = match crate::download::download_content(&uri, None) {
+    let bytes = match crate::download::download_content(&uri, None, DownloadOptions::default()) {
         Ok(b) => b,
         Err(e) => return json_error(502, "download_failed", &e.to_string()),
     };
@@ -281,6 +262,78 @@ pub fn download(state: &Arc<AppState>, query: &str) -> WebResponse {
     // for an http result. Only the bytes and their type — never an error the
     // caller might save to disk by mistake, which is why failures above are JSON.
     binary_response(200, &mime, bytes)
+}
+
+/// Refuse to fetch a location the user has blocked, on any route that reaches the
+/// network on their behalf.
+///
+/// Shared by [`download`] and [`view_fetch`] so a new egress path cannot come up
+/// without it, which is the failure this exists to prevent: both routes take a
+/// *location* rather than a `resources.id`, so neither can use
+/// `blocks::is_blocked` and both were reading the network first and deciding
+/// afterwards — or, in `download`'s case, not at all.
+///
+/// Fails closed. A `blocks` read that errors is not evidence that nothing is
+/// blocked, so this returns the error rather than allowing the fetch; see
+/// `blocks::is_location_blocked` for the query and its reasoning.
+fn refuse_if_blocked(state: &Arc<AppState>, uri: &str) -> Result<(), WebResponse> {
+    let conn = match state.conn() {
+        Ok(c) => c,
+        // Cannot open the database, so cannot check. Refusing is the only answer
+        // that is not a guess.
+        Err(_) => {
+            return Err(json_error(
+                503,
+                "block_check_failed",
+                "could not read the block list, so this location was not fetched",
+            ));
+        }
+    };
+    match av_store::repo::blocks::is_location_blocked(&conn, uri) {
+        Ok(true) => Err(json_error(
+            403,
+            "blocked",
+            "that location is blocked on this machine",
+        )),
+        Ok(false) => Ok(()),
+        Err(_) => Err(json_error(
+            503,
+            "block_check_failed",
+            "could not read the block list, so this location was not fetched",
+        )),
+    }
+}
+
+/// The `503 no_download_backend` refusal when an Autonomi location has no way to
+/// be fetched here: neither the antd daemon nor the ant CLI.
+///
+/// Carries the install command so the caller never has to invent one for the
+/// platform it is running on.
+fn no_backend_error(state: &Arc<AppState>, uri: &str) -> Option<WebResponse> {
+    let lower = uri.to_lowercase();
+    if !(lower.starts_with("ant://") || lower.starts_with("autonomi://")) {
+        return None;
+    }
+    let startup = match state.startup.read() {
+        Ok(s) => s,
+        Err(_) => return Some(json_error(500, "state_error", "startup state is poisoned")),
+    };
+    if startup.antd_running || crate::startup::ant_cli_binary_available() {
+        return None;
+    }
+    let command = crate::startup::ant_install_command();
+    Some(json_error_fields(
+        503,
+        "no_download_backend",
+        &format!(
+            "Neither antd daemon nor ant CLI are available, so this Autonomi location cannot be fetched. Install the ant CLI with: {command}"
+        ),
+        json!({
+            "dependency": "ant",
+            "command": command,
+            "start": false,
+        }),
+    ))
 }
 
 /// The name we already hold for a location, if any.
@@ -342,6 +395,199 @@ pub fn view_blob(state: &Arc<AppState>, uri: &str, body: &[u8]) -> WebResponse {
         ),
         Err(e) => json_error(500, "viewer_failed", &e),
     }
+}
+
+/// `POST /api/view/fetch` — fetch a location here, reporting progress as it goes.
+///
+/// The daemon half of Open and Save, for the two cases WebRTC cannot cover: a
+/// browser that cannot run the SDK, and a record larger than `MAX_UPLOAD`. The
+/// browser asks for no bytes at all — the request body is empty — so the 32 MiB
+/// upload cap does not apply, and a large record is no longer one that only
+/// works if the browser can carry it.
+///
+/// The body is newline-delimited JSON rather than one JSON object, because the
+/// interesting part happens *during* the fetch. `Content-Length` is unknown, so
+/// the page reads `response.body` incrementally and learns the outcome as it
+/// happens; a single response would hold every chunk back until the last byte.
+///
+/// Why `fetch` and not the existing `GET /api/download`: this is a POST, so it
+/// inherits the same `Sec-Fetch-Site` guard that keeps another site from driving
+/// this loopback server, and it never sends a caller-supplied byte count.
+pub fn view_fetch(state: &Arc<AppState>, uri: &str) -> WebResponse {
+    let uri = av_ingest::location::normalize_uri(uri);
+    let info = av_ingest::location::analyze_location(&uri);
+    let lower = uri.to_lowercase();
+    let is_http = lower.starts_with("http://") || lower.starts_with("https://");
+    if info.canonical.is_none() && !is_http {
+        return json_error(
+            400,
+            "validation_error",
+            "that is not a location we can fetch",
+        );
+    }
+
+    // Everything that can refuse this happens *here*, before the job exists and
+    // before a thread is started. A blocked location and a missing backend are
+    // answers with a status and a code, not something the page has to watch a
+    // progress log turn into — which is why the caller treats a non-2xx here as a
+    // decline to fall back from.
+    if let Err(err) = refuse_if_blocked(state, &uri) {
+        return err;
+    }
+    if let Some(err) = no_backend_error(state, &uri) {
+        return err;
+    }
+
+    let job = super::fetchjob::start();
+    let worker = Arc::clone(state);
+    let job_for_thread = job.clone();
+    let fetched = uri.clone();
+    std::thread::spawn(move || run_view_fetch(&worker, &fetched, &job_for_thread));
+
+    json_response(
+        json!({
+            "ok": true,
+            "job": job,
+            // Where to ask for events. A path rather than a second absolute URL so
+            // the page cannot be pointed at another origin by this response.
+            "status": format!("/api/view/fetch/{job}"),
+        })
+        .to_string(),
+    )
+}
+
+/// `GET /api/view/fetch/<job>?since=N` — the events a page has not seen.
+///
+/// Polling rather than a streamed body, because tiny_http cannot stream one: it
+/// copies a response body through a chunked encoder that buffers 8 KB and never
+/// flushes, so every event would arrive in one burst at the end. See
+/// [`crate::web::fetchjob`] for the whole argument.
+pub fn view_fetch_status(job: &str, query: &str) -> WebResponse {
+    // Only a page that already knows the id gets here, and the id is a 32-hex
+    // token, so this needs no session of its own. Anything that is not one is
+    // rejected rather than looked up: a `blocks`-style scan is not worth the
+    // possibility of a lookup being a directory of every fetch in flight.
+    if job.is_empty() || job.len() > 64 || !job.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return json_error(404, "not_found", "no such fetch");
+    }
+    // A malformed cursor reads as 0 rather than as a refusal: it can only come
+    // from a page, and resending the whole log is harmless. Refusing it would turn
+    // a stale bookmark into a dead tab.
+    let since = parse_query(query)
+        .iter()
+        .find(|(k, _)| k == "since")
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    match super::fetchjob::read(job, since) {
+        Some(snapshot) => json_response(
+            json!({
+                "ok": true,
+                "events": snapshot.events,
+                // The page sends this back verbatim. Counting received events
+                // instead would be equal to the cursor only while nothing has been
+                // trimmed, and a long fetch is exactly when that stops holding.
+                "next": snapshot.next,
+                "done": snapshot.done,
+            })
+            .to_string(),
+        ),
+        // Expired and never-existed are the same answer. A page that polled past
+        // the retention window gets one refusal, not a stream of them.
+        None => json_error(404, "not_found", "no such fetch"),
+    }
+}
+
+/// Run one fetch on its own thread, appending events to its job.
+///
+/// The thread, not the request, is what makes progress observable: the caller
+/// gets a job id back immediately and can ask about it while this is still
+/// running. Every path out of here calls [`fetchjob::finish`] — which is what
+/// stops the page polling — so it is called once, at the end, rather than left to
+/// each branch to remember.
+fn run_view_fetch(state: &Arc<AppState>, uri: &str, job: &str) {
+    use super::fetchjob::FetchEvent;
+    use crate::download::DownloadEvent;
+
+    let report = |event: DownloadEvent| {
+        let recorded = match event {
+            DownloadEvent::Status(message) => FetchEvent::Status {
+                message: message.to_string(),
+            },
+            // The ant CLI has started; its own output is a status line rather
+            // than a byte count, and the diagnostics file is what carries the
+            // counts.
+            DownloadEvent::SubprocessOutput => FetchEvent::Status {
+                message: "Downloading via the ant CLI...".to_string(),
+            },
+            DownloadEvent::Chunk(chunk) => FetchEvent::Chunk {
+                index: chunk.index,
+                bytes: chunk.bytes,
+                chunks: chunk.chunks,
+                total_bytes: chunk.total_bytes,
+                retried: chunk.retried,
+            },
+        };
+        super::fetchjob::push(job, recorded);
+    };
+
+    let outcome = fetch_and_publish(state, uri, &report);
+
+    match outcome {
+        Ok(done) => super::fetchjob::push(job, done),
+        Err(message) => super::fetchjob::push(job, FetchEvent::Error { message }),
+    }
+    // Last, and on both paths: this is the page's signal to stop asking.
+    super::fetchjob::finish(job);
+}
+
+/// Fetch, type it, name it, and hand it to the viewer.
+///
+/// Split from [`run_view_fetch`] so every failure is one `Err(String)` on one
+/// path, and the "mark it finished" step cannot be skipped by a new error case
+/// added to this one.
+fn fetch_and_publish(
+    state: &Arc<AppState>,
+    uri: &str,
+    report: &dyn Fn(crate::download::DownloadEvent),
+) -> Result<super::fetchjob::FetchEvent, String> {
+    use super::fetchjob::FetchEvent;
+
+    let bytes = crate::download::download_content(
+        uri,
+        Some(report),
+        // On, unlike every other caller: this is the one transport whose chunk
+        // detail can be had, and the whole point of the route is to show it.
+        crate::download::DownloadOptions {
+            chunk_progress: true,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Exactly `view_blob`'s policy, so a file served by this route is named and
+    // typed identically to the same record uploaded by the browser.
+    let hint = av_ingest::location::analyze_location(uri).inferred_filename;
+    let mime = av_ingest::mime::detect_mime_with_hint(&bytes, hint.as_deref())
+        .map_err(|e| format!("cannot serve this file: {e}"))?;
+    let known = stored_filename(state, uri);
+    let name = av_ingest::filename::suggest_filename_with(uri, known.as_deref(), &mime);
+
+    let handle = crate::web::viewer::publish(&bytes, &mime, &name)?;
+
+    // Read before `mime` moves into the event below.
+    let renderable = av_ingest::mime::is_browser_renderable(&mime);
+
+    Ok(FetchEvent::Done {
+        url: handle.url,
+        mime_type: mime,
+        filename: name,
+        bytes: bytes.len() as u64,
+        expires_in: handle.expires_in,
+        // Named so the page can say which transport actually ran it, rather than
+        // letting "opened" cover both.
+        transport: "daemon".to_string(),
+        renderable,
+    })
 }
 
 /// The bodyless half of `/api/view/blob`: a name and a renderability verdict,

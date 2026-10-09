@@ -54,6 +54,22 @@ served. Blocking a resource *and* deleting it is therefore not durable against a
 peer re-asserting the name. "Block, keep local copy" is durable. If you need the
 stronger guarantee, block the name record itself as well as the resource.
 
+### A block imposed before `blocked_locations` cannot refuse a fetch by location
+
+Fetch routes (`GET /api/download`, `POST /api/view/fetch`) are handed a location,
+not a content hash, so they ask `blocks::is_location_blocked`. From migration
+`007_blocked_locations` that answer comes from a table written at block time,
+before `av block` deletes the local copy — which is the only moment the location
+is written down anywhere.
+
+Blocks imposed **before** upgrading have no such row, and their resource row is
+typically gone, so the fallback join finds nothing and a fetch by that location is
+allowed. In practice that means a location-level block made on an older build may
+need re-imposing once: `av unblock --kind resource` then `av block --resource <id>`
+records the location. Blocks made on the current build are unaffected. This is not
+recoverable by migration, because the information needed was deleted along with
+the resource.
+
 ### Names cached before transport origins were recorded cannot be attributed
 
 Blocking a peer suppresses the name records that peer published, which works by
@@ -156,6 +172,20 @@ small set, so a large file can time out even when a small one succeeds: there is
 no size-dependent negotiation here, only whether the nodes are there. A fetch
 that reaches the transfer phase and then fails is not a bug in the UI, and the
 progress line will say so rather than hanging.
+
+### Daemon fetch progress is polled, not streamed
+
+`POST /api/view/fetch` returns a job id immediately and the page polls
+`GET /api/view/fetch/<job>?since=N`. This is not a shortcut. `tiny_http` copies
+response bodies through a chunked encoder that buffers 8 KB without flushing, so a
+single streamed response would deliver the entire progress log in one burst when
+the fetch ended — showing nothing for the six seconds a lookup actually takes, then
+everything at once.
+
+Two consequences worth knowing: the event log is capped (the newest are kept, so a
+tab that has fallen behind shows a jump rather than a stall), and progress is lost
+if the server restarts mid-fetch, while the record itself is not — the fetch can
+simply be retried.
 
 ### Everything is held in memory
 

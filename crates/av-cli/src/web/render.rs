@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use super::server::{WebResponse, binary_response, text_response};
+use tiny_http::Header;
+
+use super::server::{WebResponse, binary_response, text_response, text_response_with};
 use super::state::AppState;
 
 pub fn index_page(_state: &Arc<AppState>) -> WebResponse {
@@ -252,19 +254,52 @@ fn page() -> String {
 }
 
 pub fn retro_css() -> WebResponse {
-    text_response(200, CSS_MIME, include_str!("../../assets/retro.css"))
+    own_asset(text_response(
+        200,
+        CSS_MIME,
+        include_str!("../../assets/retro.css"),
+    ))
 }
 
 pub fn modern_css() -> WebResponse {
-    text_response(200, CSS_MIME, include_str!("../../assets/modern.css"))
+    own_asset(text_response(
+        200,
+        CSS_MIME,
+        include_str!("../../assets/modern.css"),
+    ))
 }
 
 pub fn app_js() -> WebResponse {
-    text_response(200, JS_MIME, include_str!("../../assets/app.js"))
+    own_asset(text_response(
+        200,
+        JS_MIME,
+        include_str!("../../assets/app.js"),
+    ))
 }
 
 pub fn retro_js() -> WebResponse {
-    text_response(200, JS_MIME, include_str!("../../assets/retro.js"))
+    own_asset(text_response(
+        200,
+        JS_MIME,
+        include_str!("../../assets/retro.js"),
+    ))
+}
+
+/// `no-store` for *our own* assets, as opposed to the vendored SDK below.
+///
+/// These are compiled into the binary, so a reload can only ever be stale — but
+/// "stale" here means the browser serves yesterday's `app.js` against today's
+/// server, and the symptom is a UI that quietly behaves in a way the code no longer
+/// explains. That is a far worse failure than a slow page, and it is invisible: the
+/// server was never wrong and nothing in the UI admits to being out of date. So the
+/// app's own code opts out of caching entirely and a reload is always truthful.
+///
+/// The vendored SDK takes the opposite trade, because its URL carries the version and
+/// it is 5.6 MB of compile cost. Caching the thing being edited and not caching the
+/// thing that never changes is backwards, but only for this codebase's own assets —
+/// [`vendor_asset`] is where the large versioned binaries are kept.
+fn own_asset(response: WebResponse) -> WebResponse {
+    response.with_header(Header::from_bytes("Cache-Control", "no-store").expect("static header"))
 }
 
 /// Vendored third-party browser code, served under a version-prefixed path.
@@ -409,7 +444,28 @@ pub fn vendor_asset(rel: &str) -> Option<WebResponse> {
         ),
         _ => return None,
     };
-    Some(binary_response(200, mime, body.to_vec()))
+    Some(
+        binary_response(200, mime, body.to_vec())
+            /* Cache hard, because the URL makes it immutable.
+             *
+             * `SDK_BASE` carries the version, so a new SDK is a new path and nothing
+             * under this prefix can ever change meaning in place. That makes this the
+             * one place we are allowed to hand out a year-long immutable cache — and
+             * it matters far more than the bytes it saves. 5.4 MB of the ~5.6 MB here
+             * is `ant_core_bg.wasm`, and a browser caches *compiled* WASM per URL, so
+             * without this header the compile is redone on every load: the first
+             * stretch of every first fetch spent tens of seconds compiling, and two
+             * tabs opening at once competed for the same CPU doing it twice.
+             *
+             * The app's own `/assets/app.js` and CSS deliberately keep `no-store`, so
+             * a rebuilt binary is picked up on reload. The split is intentional: the
+             * multi-megabyte versioned binaries are cached, the code being actively
+             * edited is not. */
+            .with_header(
+                Header::from_bytes("Cache-Control", "public, max-age=31536000, immutable")
+                    .expect("static header"),
+            ),
+    )
 }
 
 /// Strip the [`SDK_BASE`] prefix from a request path, yielding the vendored
@@ -541,3 +597,270 @@ fn error_page_html(title: &str, detail: &str) -> String {
 "#
     )
 }
+
+/// `GET /view/progress` — the page a fetch tab shows until it has something to
+/// show.
+///
+/// Deliberately blank-but-honest. The tab used to open empty and stay that way
+/// for the six seconds or more an Autonomi lookup takes, which reads as broken
+/// rather than as slow; this says what is happening instead.
+///
+/// **On the app origin, unlike `/view/error`.** This page is written to by
+/// `postMessage` from the tab that opened it, and it must be same-origin to
+/// accept those messages. That is safe precisely because it holds no peer bytes:
+/// the fetched document is handed to a separate throwaway viewer port, so a
+/// hostile record still cannot reach `/api/*`. Moving this page to the viewer
+/// would not, so if the two are ever merged the message check below is what
+/// still holds.
+///
+/// `textContent` only, and both bounds above are load-bearing. SDK status
+/// messages are attacker-influenced — they are built from a network peer's
+/// answers — so an unbounded one would let a peer grow this page without limit,
+/// and any use of `innerHTML` here would hand it script execution instead.
+pub fn view_progress_page() -> WebResponse {
+    text_response_with(
+        200,
+        HTML_MIME,
+        PROGRESS_PAGE_HTML,
+        &[
+            Header::from_bytes("Cache-Control", "no-store").expect("static header"),
+            Header::from_bytes("Referrer-Policy", "no-referrer").expect("static header"),
+            Header::from_bytes("X-Content-Type-Options", "nosniff").expect("static header"),
+            // This page fetches nothing on its own account; everything arrives by
+            // `postMessage` from the tab that opened it. Locking that down means
+            // a bug here cannot become an exfiltration path.
+            Header::from_bytes(
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'",
+            )
+            .expect("static header"),
+        ],
+    )
+}
+
+/// A `const`, not a `format!`: the page takes no input at all, so there is
+/// nothing to interpolate and no reason to own an escaping question it does not
+/// need. The only text that ever appears in it arrives by message.
+const PROGRESS_PAGE_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Fetching…</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh; box-sizing: border-box;
+    padding: 2rem 1.5rem;
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+    background: Canvas; color: CanvasText;
+  }
+  main { max-width: 40rem; margin: 0 auto; }
+  h1 { font-size: 1.1rem; margin: 0 0 .25rem; font-weight: 600; }
+  /* The detail line: the current step beneath the headline. It carries real
+   * progress now, not an explainer about where progress will be, so it gets
+   * enough weight to be read as such. */
+  .sub { margin: 0 0 1.25rem; opacity: .8; font-size: .9375rem; }
+  .sub:empty { margin-bottom: 1.25rem; }
+  .counts {
+    margin: 0 0 1rem; font-variant-numeric: tabular-nums;
+    font-size: 1rem; font-weight: 600;
+  }
+  .counts[hidden] { display: none; }
+  /* The live byte read-out. Same guard as `.counts`, and for the same reason:
+   * `hidden` here only works because no author rule outranks it, so the
+   * `[hidden]` selector is load-bearing rather than decorative. Tabular figures
+   * because the number changes several times a second and a proportional digit
+   * set makes the whole line jitter sideways. */
+  .live {
+    margin: 0 0 1rem; font-variant-numeric: tabular-nums;
+    font-size: .9375rem; opacity: .8;
+  }
+  .live[hidden] { display: none; }
+  ol {
+    margin: 0; padding: 0; list-style: none;
+    max-height: 22rem; overflow-y: auto;
+    font-size: .8125rem; opacity: .8;
+  }
+  li { padding: .15rem 0; border-top: 1px solid color-mix(in srgb, CanvasText 12%, transparent); }
+  li:first-child { border-top: 0; }
+  .failed h1 { color: #b3261e; }
+
+  /* The spinner.
+   *
+   * Purely decorative, so it is `aria-hidden` and the headline carries the meaning.
+   * The border-top colour is transparent so the gap left by it reads as the missing
+   * arc rather than as a second colour.
+   *
+   * `.spin` sets `display`, which is exactly why the `[hidden]` rules below need the
+   * `!important` guard: the user-agent's `[hidden] { display: none }` lives in a
+   * different origin's stylesheet, so any author rule setting `display` silently
+   * outranks it. Without `!important` the spinner would keep spinning forever after
+   * a failure. */
+  .spin {
+    display: inline-block; vertical-align: -0.125em;
+    width: 0.85em; height: 0.85em; margin-right: 0.45em;
+    border: 2px solid color-mix(in srgb, CanvasText 22%, transparent);
+    border-top-color: currentColor; border-radius: 50%;
+    animation: spin 0.75s linear infinite;
+  }
+  .spin[hidden] { display: none !important; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  /* A spinning element is exactly the kind of motion that causes trouble, and the
+   * counts beside it already report progress honestly. */
+  @media (prefers-reduced-motion: reduce) {
+    .spin { animation: none; border-top-color: color-mix(in srgb, CanvasText 22%, transparent); }
+  }
+  /* Belt and braces alongside `.spin[hidden]`: a display rule must never be able
+   * to keep a spinner on screen after the fetch it belonged to is over. */
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main id="main">
+  <h1 id="phase" role="status" aria-live="polite"><span class="spin" id="spin" aria-hidden="true"></span><span id="phase-text">Fetching from Autonomi…</span></h1>
+  <p class="sub" id="sub" role="status" aria-live="polite"></p>
+  <p class="counts" id="counts" hidden></p>
+  <p class="live" id="live" hidden aria-live="off"></p>
+  <ol id="log"></ol>
+</main>
+<script>
+(function () {
+  var MAX_LINES = 40;
+  var MAX_TEXT = 240;
+  var main = document.getElementById('main');
+  var phase = document.getElementById('phase');
+  var phaseText = document.getElementById('phase-text');
+  var spin = document.getElementById('spin');
+  var sub = document.getElementById('sub');
+  var counts = document.getElementById('counts');
+  var live = document.getElementById('live');
+  var log = document.getElementById('log');
+
+  /* Distinguish "nothing to report yet" from "the opener is not talking to me".
+   *
+   * A progress page sitting on its opening sentence is ambiguous: it looks
+   * identical whether the fetch is quiet or the channel to the opener is dead, and
+   * that ambiguity is what made a broken handshake look like a progress bug. If
+   * this page has heard nothing while the opener has certainly reported something
+   * by now, say which one it is.
+   */
+  var heard = false;
+  setTimeout(function () {
+    if (!heard) addLine('Connected to the app. Waiting for the first update\u2026');
+  }, 4000);
+
+  function clamp(value) {
+    var text = (value === null || value === undefined) ? '' : String(value);
+    if (text.length > MAX_TEXT) return text.slice(0, MAX_TEXT - 1) + '…';
+    return text;
+  }
+
+  function addLine(text) {
+    var li = document.createElement('li');
+    li.textContent = clamp(text);
+    log.appendChild(li);
+    while (log.children.length > MAX_LINES) log.removeChild(log.firstChild);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function humanBytes(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+  }
+
+  window.addEventListener('message', function (event) {
+    // Same origin only. `tab.opener` is nulled by the opener, so this channel has
+    // exactly one legitimate sender and anything else is not it.
+    if (event.origin !== window.location.origin) return;
+    var data = event.data;
+    if (!data || typeof data !== 'object') return;
+    heard = true;
+
+    switch (data.type) {
+      case 'phase':
+        /* The detail line, not the headline. The headline states *what the user
+         * is waiting for* — fetching from Autonomi — and must never drift into
+         * phrasing that reads as already done. The step goes beneath it. */
+        sub.textContent = clamp(data.message);
+        break;
+
+      case 'status':
+        addLine(data.message);
+        break;
+
+      /* The browser's continuous byte count.
+       *
+       * Deliberately replaces one line rather than appending, which is the whole
+       * difference between a progress read-out and an unusable page. The SDK
+       * reports `downloading` many times a second, and appending would fill the
+       * 40-line log with thousands of "Downloading - 1.2 MB of 8.0 MB" and push
+       * out the phase transitions the user actually needs. One element in
+       * `aria-live="off"` keeps it out of the screen reader's queue too, since a
+       * count that changes faster than speech is noise. */
+      case 'live':
+        live.hidden = false;
+        live.textContent = clamp(data.message);
+        break;
+
+      case 'chunk':
+        // Counts are distinct retrieved chunks and their bytes. Deliberately
+        // *not* a percentage: self-encryption padding means they are never a
+        // fraction of the file, and a bar that stalls at 99% is a lie.
+        if (typeof data.chunks === 'number' && typeof data.total_bytes === 'number') {
+          counts.hidden = false;
+          /* `expected_bytes` is the size the DataMap promised, which only the
+           * browser stream knows. Without it \u2014 the ant CLI, whose diagnostics
+           * are chunk counts and not a fraction of the file \u2014 this degrades to
+           * the bytes so far, which is the honest thing to show. */
+          var of = (typeof data.expected_bytes === 'number' && data.expected_bytes > 0)
+            ? ' of ' + humanBytes(data.expected_bytes)
+            : '';
+          counts.textContent = data.chunks + (data.chunks === 1 ? ' chunk' : ' chunks')
+            + ' · ' + humanBytes(data.total_bytes) + of;
+        }
+        if (data.retried) addLine('Chunk ' + clamp(data.index) + ' arrived after a retry.');
+        break;
+
+      case 'done':
+        phaseText.textContent = 'Ready.';
+        spin.hidden = true;
+        counts.hidden = true;
+        live.hidden = true;
+        sub.textContent = 'Opening the file…';
+        break;
+
+      case 'error':
+        main.className = 'failed';
+        phaseText.textContent = 'That file could not be fetched.';
+        spin.hidden = true;
+        addLine(data.message);
+        break;
+    }
+  });
+
+  /* Announce that the listener is installed, and only now.
+   *
+   * The page could not receive anything sent before this line executed, and the
+   * opener cannot tell the difference between "not loaded yet" and "loaded and
+   * idle" — so it waits for this before sending the first event. Without it, a
+   * fast fetch can complete entirely before this page has parsed and the tab
+   * would sit on its opening line until it is replaced.
+   *
+   * Sent to `location.origin` explicitly, so this only ever reaches the
+   * anta-vista page that opened it. */
+  try {
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage({ type: 'ready' }, window.location.origin);
+    }
+  } catch (_) {
+    /* No opener, or it is gone. The page still renders whatever it is sent; it
+     * just cannot be handed off to. */
+  }
+})();
+</script>
+</body>
+</html>
+"##;

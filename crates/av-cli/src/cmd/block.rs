@@ -213,6 +213,21 @@ pub fn block_subject(
     let blocked = blocks::add(conn, kind, &subject_id, reason, now, source)
         .map_err(|e| CliError::Database(e.to_string()))?;
 
+    // Before the delete, and unconditionally: the location is written down in
+    // exactly one place, and that place is the `resources` row this branch is
+    // about to drop. A fetch route is handed an `autonomi://` address and cannot
+    // derive a content hash from it, so without this record the block is
+    // invisible to every fetch guard and `av block` appears to do nothing at all
+    // once the local copy is gone — which is the default.
+    //
+    // Unconditional for `--keep-local` too. That resource can be purged later, at
+    // which point the join fallback goes with it, and a block that quietly stops
+    // applying once the file is cleaned up is not a block.
+    if kind == BlockKind::Resource {
+        blocks::record_blocked_locations(conn, &subject_id)
+            .map_err(|e| CliError::Database(e.to_string()))?;
+    }
+
     // Only a resource can have a local row to remove. A name block leaves the
     // record in place and merely hidden, because deleting it would also drop
     // the record the operator may want to un-hide; an agent block has no local
@@ -279,6 +294,15 @@ pub fn unblock_subject(
                 kind.as_str()
             )));
         }
+        // Cleared before the block row is removed, and only for resources: the
+        // recorded locations are keyed by this id and are the only thing a
+        // location-based fetch guard can consult once the resource row is gone.
+        // Leaving them behind would refuse fetches for a block the user has
+        // explicitly lifted.
+        if kind == BlockKind::Resource {
+            blocks::forget_blocked_locations(conn, &id)
+                .map_err(|e| CliError::Database(e.to_string()))?;
+        }
         let removed =
             blocks::remove(conn, kind, &id).map_err(|e| CliError::Database(e.to_string()))?;
         let x0x_applied = if x0x && kind == BlockKind::Agent {
@@ -296,6 +320,20 @@ pub fn unblock_subject(
         });
     }
 
+    // Every recorded location goes with `--all`, and with a `--kind` clear the
+    // recorded locations of that kind. The table has no `subject_kind` of its own,
+    // so this is filtered by joining the id against the block rows being cleared.
+    if clear_all {
+        blocks::forget_all_blocked_locations(conn)
+            .map_err(|e| CliError::Database(e.to_string()))?;
+    } else if kind == BlockKind::Resource {
+        let recorded = blocks::resource_ids_with_blocked_locations(conn)
+            .map_err(|e| CliError::Database(e.to_string()))?;
+        for id in recorded {
+            blocks::forget_blocked_locations(conn, &id)
+                .map_err(|e| CliError::Database(e.to_string()))?;
+        }
+    }
     let removed = blocks::clear(conn, if clear_all { None } else { Some(kind) })
         .map_err(|e| CliError::Database(e.to_string()))?;
     Ok(UnblockOutcome {

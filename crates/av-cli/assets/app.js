@@ -180,11 +180,26 @@ const postPlan = (uri, mimeType, blob) =>
  * in some browsers before it has started reading. */
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
+  downloadUrl(url, filename);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+/* Save something the browser is being sent as an attachment.
+ *
+ * A plain link click rather than `window.open`, because the point is that the tab
+ * should *not* navigate: the server sends `Content-Disposition: attachment` for a
+ * type it cannot display, and navigating to it leaves a tab sitting on the progress
+ * page while the file lands in the downloads folder.
+ *
+ * Kept separate from `downloadBlob` because the two sources are genuinely
+ * different: the browser path already holds the bytes and can hand them over
+ * directly, while the daemon path has only a viewer URL. The `download` attribute
+ * is honoured for same-origin URLs, which this is. */
+function downloadUrl(url, filename) {
   const link = document.createElement('a');
   link.href = url;
   link.download = filename;
   link.click();
-  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 const AUTONOMI_SCHEME = /^autonomi:\/\//i;
@@ -250,15 +265,34 @@ async function autonomiCapability() {
   return { available: true };
 }
 
+/* Every label is phrased as something the user is *waiting for*, never as
+ * something that has happened. The headline already guarantees this structurally
+ * by prefixing "Fetching from Autonomi", so these only need to avoid contradicting
+ * it: "Downloading done" read as finished while the transfer was still running,
+ * and "Preparing the download" put the word *download* in the user's mouth at a
+ * point where nothing had been downloaded at all.
+ *
+ * There is deliberately **no `complete` and no `failed`** here. The SDK's `complete`
+ * marks an *operation boundary*, not the user's download: `#openReader` reports it
+ * the instant the reader object exists — `report(\`Opened ...\`, { phase: "complete" })`
+ * before returning, with not one byte yet moved. Rendering that said "Fetch complete"
+ * for the whole of a large transfer, which is exactly backwards. Whether the bytes
+ * are here is ours to say: the stream below counts them, and `done`/`error` are the
+ * only terminal states the page will show. */
 const PHASE_LABELS = {
-  initializing: 'Starting the Autonomi library',
-  connecting: 'Connecting to Autonomi nodes',
+  initializing: 'Loading the Autonomi library',
+  connecting: 'Connecting to nodes',
   lookup: 'Finding the nodes holding this file',
-  preparing: 'Preparing the download',
-  downloading: 'Downloading',
-  complete: 'Downloading done',
-  failed: 'Downloading failed',
+  preparing: 'Preparing to fetch',
+  downloading: 'Transferring the file',
 };
+
+/* How much plaintext to pull per read when streaming a record.
+ *
+ * The SDK's own default is 1 MiB and its hard cap is 4 MiB, so this only has to be
+ * valid, not clever. Larger reads mean fewer round trips and a smoother count;
+ * each read is a network request, so an 8 MiB ask would be rejected outright. */
+const READ_CHUNK_BYTES = 1024 * 1024;
 
 const formatBytes = (n) => {
   if (!Number.isFinite(n)) return '';
@@ -270,25 +304,247 @@ const formatBytes = (n) => {
 /* Progress events arrive from both calls below, so the handler is shared: a
  * phase with no byte counts gets a plain label, and one with them gets
  * `n of total`. An event missing `phase` must still produce text, because a
- * blank status line reads as a hung page. */
+ * blank status line reads as a hung page.
+ *
+ * `event.message` is the SDK's own wording and is built from what the network
+ * answered, so it is worth preferring when present — it distinguishes "waiting on
+ * node 3 of 7" from "waiting on node 1 of 7" — but it is never the only thing
+ * shown, because a peer that chose to say nothing would otherwise leave the line
+ * blank. The phase label is the floor, not the ceiling. */
 function progressLine(event) {
-  const label = PHASE_LABELS[event.phase] || event.phase || 'Working';
-  if (event.phase === 'downloading' && Number(event.total) > 0) {
-    return `${label} \u2014 ${formatBytes(Number(event.completed || 0))} of ${formatBytes(
-      Number(event.total)
-    )}`;
+  /* Our own label, or a neutral fallback — **never the SDK's `message`**.
+   *
+   * The SDK narrates itself in words built from what the network answered, which
+   * includes names that mean nothing to a user: opening a record reports
+   * "opened public-file-3f9a2c71", because the SDK always synthesises that filename
+   * and we already refuse to trust it for anything (see the download-name policy).
+   * Surfacing it next to our own counts read as though the app had picked a file
+   * off the network. A phase we have a word for is ours; anything else is just
+   * "Fetching…". */
+  const label = PHASE_LABELS[event.phase] || 'Fetching…';
+  const completed = Number(event.completed);
+  const total = Number(event.total);
+  if (Number.isFinite(completed) && Number.isFinite(total) && total > 0) {
+    return `${label} \u2014 ${formatBytes(completed)} of ${formatBytes(total)}`;
   }
   return label;
 }
 
+function reportSdkProgress(tab, statusEl, event) {
+  /* The SDK's progress drives the *headline* only.
+   *
+   * Its byte counts are deliberately dropped: we already have authoritative ones
+   * from the stream we are consuming — chunks read and bytes against the size the
+   * DataMap promised. Sending both to the same read-out made the line flicker
+   * between "Downloading — 1.2 MB of 8.0 MB" and "12 chunks · 1.4 MB of 8.0 MB"
+   * as each fired, which reads as a broken counter rather than a progress one. One
+   * source of truth, so the numbers move in one direction only. */
+  /* `complete` / `failed` are boundaries of an SDK *operation*, not of the
+   * download the user is waiting for — see `PHASE_LABELS`. Letting one through
+   * would report "the file is here" while the stream is still pulling it. Our own
+   * `onStep` announces the transfer starting, and `done`/`error` end it. */
+  if (event.phase === 'complete' || event.phase === 'failed') return;
+  const message = progressLine(event);
+  setStatus(statusEl, message, '');
+  toTab(tab, { type: 'phase', message });
+}
+
+function openProgressTab() {
+  const tab = window.open('/view/progress', '_blank');
+  if (!tab) return tab;
+
+  /* Updates are **queued and flushed**, not awaited.
+   *
+   * Holding a promise and having `toTab` await it before posting has one failure
+   * mode and it is total: if the page's `ready` message never arrives — a lost
+   * post, a browser that dropped it, a script that threw before posting — every
+   * single update is awaited forever and silently discarded. The tab then shows
+   * its opening sentence for the whole fetch with no error anywhere, which is
+   * indistinguishable from a fetch that reports nothing.
+   *
+   * So nothing is ever awaited. Updates queue, the page flushes them the moment it
+   * says it is listening, and a timer flushes them anyway if it never says. Order
+   * is preserved either way, and a late page loses at most the events sent before
+   * it was listening rather than all of them.
+   */
+  tab.__avQueue = [];
+  tab.__avListening = false;
+  const flush = () => {
+    if (tab.__avListening) return;
+    tab.__avListening = true;
+    for (const queued of tab.__avQueue.splice(0)) {
+      tab.postMessage(queued, window.location.origin);
+    }
+  };
+  tab.addEventListener('message', (event) => {
+    if (event.origin !== window.location.origin) return;
+    if (event.data && event.data.type === 'ready') flush();
+  });
+  // The failsafe. A page that never answers must not leave the queue growing.
+  setTimeout(flush, PROGRESS_HANDSHAKE_MS);
+  return tab;
+}
+
+/* How long to wait for the page to say it is listening before giving up on it.
+ *
+ * Generous enough for a cold parse of the page on a slow machine, short enough
+ * that a broken channel degrades into "updates are dropped" rather than "the
+ * fetch looks hung". */
+const PROGRESS_HANDSHAKE_MS = 1500;
+
+/* Sever the opener relationship, before peer-supplied content can reach it.
+ *
+ * `window.open`'s `noopener` feature cannot be used for this, because it makes
+ * the call return null and the handle is what the finished file is loaded into.
+ * Cross-origin means the fetched document cannot *read* the app, but it can
+ * *navigate* it — and peer-supplied HTML is exactly that untrusted input. */
+function cutOpener(tab) {
+  if (tab) tab.opener = null;
+}
+
+function toTab(tab, message) {
+  if (!tab) return;
+  try {
+    if (tab.__avListening) {
+      tab.postMessage(message, window.location.origin);
+      return;
+    }
+    /* Bounded: a fetch that reports faster than a page can be expected to load
+     * must not grow this without limit. The oldest are dropped, because the
+     * newest are the ones that describe where the transfer has got to. */
+    tab.__avQueue.push(message);
+    if (tab.__avQueue.length > PROGRESS_QUEUE_MAX) tab.__avQueue.shift();
+  } catch (_) {
+    /* The tab was closed, or navigated away. The fetch still finishes; there is
+     * simply nowhere left to report to. */
+  }
+}
+
+/* How many updates may wait for a page that has not said it is listening. */
+const PROGRESS_QUEUE_MAX = 64;
+
+/* ------------------------------------------------------------ daemon fetch -- */
+
+/* Have the server fetch a location, reporting progress while it runs.
+ *
+ * Two requests, not one: a POST that starts the fetch and returns a job id, then
+ * polls for events. The obvious alternative is a single streamed response, and it
+ * cannot work against this server — tiny_http copies a response body through a
+ * chunked encoder that buffers 8 KB and never flushes, so every event would
+ * arrive in one burst when the fetch ended. That is the blank tab again, with a
+ * streaming header on it. `fetchjob` carries the argument.
+ *
+ * The POST is what inherits the server's cross-site guard, and it is also where
+ * every refusal happens: a blocked location and a missing backend are both
+ * answered before a thread starts, so they arrive as a status and a code rather
+ * than as a progress log that later turns into an error. That is why a non-2xx
+ * here means "the server will not do this", which the caller turns into a
+ * `DaemonFallback` rather than an error it has to display.
+ *
+ * `onEvent` sees every event, and the tab is written to alongside it. */
+async function fetchViaDaemon(uri, { tab, onEvent } = {}) {
+  let started;
+  try {
+    started = await api('/api/view/fetch', {
+      method: 'POST',
+      headers: { 'X-Anta-Uri': uri },
+    });
+  } catch (err) {
+    const code = err.code || 'fetch_failed';
+    const detail = (err.body && err.body.detail) || err.message;
+    // 503 and 403 are refusals rather than failures: the server is there and has
+    // declined. Worth handing back as a routing decision so the caller can offer
+    // something else.
+    if (code === 'no_download_backend' || code === 'blocked') {
+      throw new DaemonFallback(detail);
+    }
+    throw err;
+  }
+
+  const statusPath = started.status || `/api/view/fetch/${started.job}`;
+  let since = 0;
+  let last = null;
+
+  for (;;) {
+    let update;
+    try {
+      update = await api(`${statusPath}?since=${since}`);
+    } catch (err) {
+      // A job that has aged out of the server's window, or a poll that raced a
+      // restart. Either way there is no progress to show and no result to open.
+      throw new DaemonFallback(`the local server stopped reporting progress (${err.message})`);
+    }
+
+    for (const event of update.events || []) {
+      last = event;
+      handleFetchEvent(event, { tab, onEvent });
+      // A `done` or an `error` is the end of the log; the loop stops on the
+      // server's `done` flag below rather than on the event, so an event type
+      // added later cannot be missed by this loop.
+      if (event.type === 'done' || event.type === 'error') break;
+    }
+
+    // The server's cursor, not a count of what arrived: the two agree only while
+    // nothing has been trimmed off the front of the log, and they stop agreeing
+    // on exactly the long fetches where the tab most needs to keep up.
+    if (typeof update.next === 'number') since = update.next;
+
+    if (update.done) break;
+    /* Short enough that the first phase appears as the network announces it, long
+     * enough that an idle loop costs nothing measurable over loopback. */
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  if (!last || last.type !== 'done') {
+    throw new DaemonFallback('the local daemon did not finish the fetch');
+  }
+  return last;
+}
+
+/* Turn one server event into a tab update and a caller callback.
+ *
+ * `type` is checked against known values and every field is coerced before use.
+ * The data comes from a loopback server that is not this page, so it gets the
+ * same distrust as anything else off the wire. */
+function handleFetchEvent(event, { tab, onEvent } = {}) {
+  if (!event || typeof event !== 'object') return event;
+  if (onEvent) onEvent(event);
+
+  switch (event.type) {
+    case 'phase':
+      toTab(tab, event);
+      break;
+    case 'status':
+      toTab(tab, { type: 'status', message: String(event.message || '') });
+      break;
+    case 'chunk':
+      toTab(tab, {
+        type: 'chunk',
+        index: Number(event.index) || 0,
+        bytes: Number(event.bytes) || 0,
+        chunks: Number(event.chunks) || 0,
+        total_bytes: Number(event.total_bytes) || 0,
+        retried: event.retried === true,
+      });
+      break;
+    case 'done':
+      toTab(tab, event);
+      break;
+    case 'error':
+      toTab(tab, { type: 'error', message: String(event.message || 'the fetch failed') });
+      break;
+  }
+  return event;
+}
+
 /* Fetch one Autonomi file over WebRTC, reporting progress as it goes.
  *
- * Both the connect and the download call get an `onProgress`, and that is not
- * redundancy: `download()` only emits `downloading`/`complete`, while the phases
- * a user actually watches — connecting, looking up which nodes hold the file —
- * are emitted during `connect()`. Subscribing to the download alone leaves the
- * status line blank for the ~6s a lookup takes regardless of file size, which is
- * exactly when a user decides it is broken.
+ * Both the connect and the open call get an `onProgress`, and that is not
+ * redundancy: the phases a user actually watches — connecting, looking up which
+ * nodes hold the file — are emitted during `connect()`, while the byte and chunk
+ * counts come from the stream we consume afterwards. Subscribing to either one
+ * alone leaves a gap: the reader alone is silent for the ~6s a lookup takes, which
+ * is exactly when a user decides it is broken.
  *
  * Throws `DownloadCancelled` when the user stops it, so callers can say nothing
  * rather than reporting a failure the user asked for. */
@@ -299,7 +555,18 @@ class DownloadCancelled extends Error {
   }
 }
 
-async function fetchAutonomi(address, { onProgress, signal } = {}) {
+async function fetchAutonomi(address, { onProgress, onStep, onChunk, signal } = {}) {
+  /* Announce the library load ourselves, because it is the longest silent stretch
+   * in the entire fetch and it is *not* the SDK's to report.
+   *
+   * `loadSdk()` is a dynamic `import()` of a package carrying 5.4 MB of WASM, and
+   * the SDK's first progress event does not fire until after `getNetworkDefaults`
+   * has compiled and instantiated it — which happens inside `connect`, before the
+   * reporter is even constructed. So without this line the progress tab sits on
+   * its opening sentence for the whole load and the dial, which is most of what
+   * the user is waiting for, and a slow connection looks exactly like a hang.
+   */
+  if (onStep) onStep('Loading the Autonomi library (about 5 MB, once)');
   const { mod, error } = await loadSdk();
   if (error) throw new Error(error);
   if (signal && signal.aborted) throw new DownloadCancelled();
@@ -307,13 +574,73 @@ async function fetchAutonomi(address, { onProgress, signal } = {}) {
   const progress = (event) => {
     if (event && onProgress) onProgress(event);
   };
-  const client = await mod.AutonomiClient.connect({ onProgress: progress }, { signal });
-  const out = await client.download(address, { onProgress: progress, signal });
-  if (!out || !out.blob) throw new Error('the Autonomi library returned no file data');
+  if (onStep) onStep('Looking for the nodes holding this file');
+
+  /* **One** argument, and that is load-bearing.
+   *
+   * `AutonomiClient.connect(bootstrap, options)` reads a plain object in the first
+   * argument as a network profile and takes its settings from a rest-spread of
+   * that object — the second argument is only consulted for the string form (one
+   * explicit WebRTC multiaddress). Passing `{ onProgress }` first and `{ signal }`
+   * second therefore silently *drops the abort signal*: `connect` succeeds, and
+   * Stop cannot cancel it. Everything goes in the first argument.
+   */
+  const client = await mod.AutonomiClient.connect({ onProgress: progress, signal });
+
+  /* **Open and stream, do not `download()`.**
+   *
+   * `download()` is the wrong call for a progress display, and not because of
+   * anything in this project. It waits for the whole file and reports once at the
+   * end with `phase: "complete"` and the final byte total — so during the part the
+   * user is actually waiting for it says nothing at all. The reference app at
+   * try.autonomi.com shows per-chunk progress for exactly this reason: it opens a
+   * reader and consumes a stream, so it can count arrivals as they happen.
+   *
+   * `openFile()` gives us two things `download()` never exposes: `reader.size`,
+   * known from the DataMap *before* any chunk moves, and a `stream()` that yields
+   * the plaintext a chunk at a time. With both, a live "N chunks · X of Y" is
+   * arithmetic rather than a guess.
+   *
+   * The parts are accumulated because the caller still needs the whole file to
+   * hand to the server, so this is the same peak memory as `download()`'s blob —
+   * the gain is observability, not a smaller footprint. */
+  const reader = await client.openFile(address, { onProgress: progress, signal });
+
+  /* The SDK reports `phase: "complete"` the moment this reader exists, which is
+   * before a single byte has moved — see `PHASE_LABELS`. So the line under
+   * "Fetching from Autonomi…" is set here, by us, and only now is it true. */
+  if (onStep) onStep(PHASE_LABELS.downloading);
+
+  const totalBytes = Number(reader.size) || 0;
+  if (!totalBytes) throw new Error('the Autonomi library did not report a file size');
+
+  const parts = [];
+  let received = 0;
+  let chunks = 0;
+  const handle = reader.stream({ chunkSize: READ_CHUNK_BYTES, signal }).getReader();
+  for (;;) {
+    const { done, value } = await handle.read();
+    if (done) break;
+    if (!value || !value.byteLength) continue;
+    parts.push(value);
+    received += value.byteLength;
+    chunks += 1;
+    if (onChunk) onChunk({ chunks, bytes: received, totalBytes });
+  }
+
+  if (received !== totalBytes) {
+    throw new Error(
+      `the Autonomi library returned ${received} of ${totalBytes} bytes`
+    );
+  }
 
   /* Nonfatal seed churn is expected: the SDK retries and, when it succeeds,
    * logs nothing to report. Only a settled failure reaches here. */
-  return { blob: out.blob };
+  return {
+    blob: new Blob(parts, {
+      type: reader.contentType || 'application/octet-stream',
+    }),
+  };
 }
 
 /* Wire Open and Save for one Autonomi result row. */
@@ -344,7 +671,11 @@ function wireFetch(node, result, statusEl) {
    * dropped, so it can outlive the fetch it came from. */
   let cached = null;
 
-  const obtain = async (statusEl) => {
+  /* Fetch over WebRTC into a Blob, sharing one fetch between the two buttons.
+   *
+   * `tab` is optional: Open passes the window it is driving so the progress goes
+   * there, Save passes nothing and keeps the detail in the row. */
+  const obtain = async (statusEl, tab = null) => {
     if (cached) return cached;
     controller = new AbortController();
     setBusy(true);
@@ -355,7 +686,35 @@ function wireFetch(node, result, statusEl) {
     );
     try {
       const { blob } = await fetchAutonomi(address, {
-        onProgress: (event) => setStatus(statusEl, progressLine(event), ''),
+        onProgress: (event) => reportSdkProgress(tab, statusEl, event),
+        // The steps the SDK does not report for itself — chiefly the WASM load.
+        onStep: (message) => {
+          setStatus(statusEl, message, '');
+          toTab(tab, { type: 'phase', message });
+        },
+        // A count per chunk read, which is the live part of the download.
+        onChunk: ({ chunks, bytes, totalBytes }) => {
+          /* The same `chunk` channel the ant CLI diagnostics use, so one element
+           * renders both transports identically instead of each having its own
+           * read-out. `expected_bytes` is ours alone \u2014 the CLI reports distinct
+           * retrieved chunks and their bytes, which is deliberately not a fraction
+           * of the file because self-encryption padding means it never can be. */
+          setStatus(
+            statusEl,
+            `${chunks} chunk${chunks === 1 ? '' : 's'} received \u00b7 ${formatBytes(
+              bytes
+            )} of ${formatBytes(totalBytes)}`,
+            ''
+          );
+          toTab(tab, {
+            type: 'chunk',
+            index: chunks,
+            chunks,
+            total_bytes: bytes,
+            expected_bytes: totalBytes,
+            retried: false,
+          });
+        },
         signal: controller.signal,
       });
       cached = blob;
@@ -368,21 +727,15 @@ function wireFetch(node, result, statusEl) {
 
   /* Fetch, then hand the bytes to the server to serve on its own origin.
    *
-   * `window.open` is the first statement, and both the Open button and a click
+   * `openProgressTab` is the first statement, and both the Open button and a click
    * on the location call this directly from their handler, so the popup has a
    * user gesture behind it. A `window.open` after an await is a popup with no
    * gesture and browsers block it — so the tab has to exist before the download
-   * starts, and be pointed at the result once it arrives. */
+   * starts, and be pointed at the result once it arrives. It opens *onto* the
+   * progress page rather than onto `about:blank`, because a tab that says what
+   * it is doing is the entire difference between a slow fetch and a broken link. */
   const openView = async (statusEl) => {
-    const tab = window.open('', '_blank');
-    /* Sever the opener relationship immediately. `window.open`'s `noopener`
-     * feature cannot be used for this, because it makes the call return null
-     * and the handle is what the finished file is loaded into. Cross-origin
-     * means the fetched document cannot *read* the app, but it can *navigate*
-     * it, which is enough to replace this page with something convincing. The
-     * tab is still blank scriptless about:blank at this point, so there is no
-     * window to exploit between the open and this line. */
-    if (tab) tab.opener = null;
+    const tab = openProgressTab();
     if (!tab) {
       setStatus(
         statusEl,
@@ -391,39 +744,98 @@ function wireFetch(node, result, statusEl) {
       );
     }
     try {
-      const blob = await obtain(statusEl);
+      /* Fetched in the browser when it can be, which is the default and needs
+       * nothing installed. `obtain` may decline — no WebRTC, no capability, a
+       * failed transfer, or a file too large to hand back to the server — and
+       * those are all routing decisions rather than failures, so they fall
+       * through to the daemon instead of ending the open. */
+      let view;
+      let bytes = 0;
+      let via = 'browser';
+      try {
+        const blob = await obtain(statusEl, tab);
 
-      /* Decide before uploading. Both reasons used to be discovered by POSTing
-       * the file and being refused: a 64 MB record was fetched successfully and
-       * then failed with "request body is larger than the 33554432 byte limit",
-       * and an unrenderable type was served `inline` and shown as an empty
-       * window. We are already holding the bytes in both cases, so neither needs
-       * the round-trip — ask for the name and the verdict, then act. Only the
-       * leading prefix goes up, so this stays cheap for a 64 MB record. */
-      const plan = await postPlan(result.location, blob.type, blob);
+        /* Decide before uploading. Both reasons used to be discovered by POSTing
+         * the file and being refused: a 64 MB record was fetched successfully and
+         * then failed with "request body is larger than the 33554432 byte limit",
+         * and an unrenderable type was served `inline` and shown as an empty
+         * window. We are already holding the bytes in both cases, so neither needs
+         * the round-trip — ask for the name and the verdict, then act. Only the
+         * leading prefix goes up, so this stays cheap for a 64 MB record. */
+        const plan = await postPlan(result.location, blob.type, blob);
+        bytes = blob.size;
 
-      if (!plan.renderable || blob.size > MAX_UPLOAD) {
-        /* Both reasons are stated when both apply. A large binary hits both, and
-         * naming only the type would leave the size — the thing that actually
-         * made this slow — unmentioned. */
-        const why = [
-          !plan.renderable && 'this file type cannot be shown in a browser',
-          blob.size > MAX_UPLOAD &&
-            `it is ${formatBytes(blob.size)}, over the ${formatBytes(MAX_UPLOAD)} viewer limit`,
-        ]
-          .filter(Boolean)
-          .join(', and ');
-        downloadBlob(blob, plan.filename);
-        if (tab) tab.close();
-        setStatus(statusEl, `Downloaded as ${plan.filename} \u2014 ${why}.`, 'ok');
-        return;
+        if (!plan.renderable || blob.size > MAX_UPLOAD) {
+          /* Both reasons are stated when both apply. A large binary hits both, and
+           * naming only the type would leave the size — the thing that actually
+           * made this slow — unmentioned. */
+          const why = [
+            !plan.renderable && 'this file type cannot be shown in a browser',
+            blob.size > MAX_UPLOAD &&
+              `it is ${formatBytes(blob.size)}, over the ${formatBytes(MAX_UPLOAD)} viewer limit`,
+          ]
+            .filter(Boolean)
+            .join(', and ');
+          toTab(tab, { type: 'phase', message: 'Saving the file.' });
+          downloadBlob(blob, plan.filename);
+          if (tab) tab.close();
+          setStatus(statusEl, `Downloaded as ${plan.filename} \u2014 ${why}.`, 'ok');
+          return;
+        }
+
+        setStatus(statusEl, 'Opening\u2026', '');
+        view = await postBlob('/api/view/blob', result.location, blob);
+      } catch (err) {
+        if (err.name === 'DownloadCancelled') throw err;
+        /* The daemon fetches and serves the record itself, so the oversize case
+         * that just fell through to a download above can instead be opened —
+         * which is the point of having it. The tab keeps showing progress
+         * throughout, and reports whichever transport actually ran it. */
+        view = await fetchViaDaemon(result.location, {
+          tab,
+          onEvent: (event) => {
+            if (event.type === 'status') {
+              setStatus(statusEl, event.message, '');
+            }
+          },
+        });
+        via = 'daemon';
+        bytes = Number(view.bytes) || 0;
+
+        /* The same decision the browser path makes with `postPlan`, and for the
+         * same reason. Without it the tab is pointed at a viewer URL that serves
+         * `Content-Disposition: attachment`: the browser downloads the file and
+         * leaves the tab sitting there claiming it is opening it. Which is the
+         * confusing case the progress page's own wording cannot fix — the page has
+         * to be told the file is going to be saved rather than shown.
+         *
+         * `renderable` is the same `is_browser_renderable` verdict `/api/view/plan`
+         * gives the browser path, from the same place in `av-ingest`, so the two
+         * transports cannot disagree about whether this file will be shown. */
+        if (view.renderable === false) {
+          toTab(tab, { type: 'phase', message: 'Saving the file.' });
+          downloadUrl(view.url, view.filename);
+          if (tab) tab.close();
+          setStatus(
+            statusEl,
+            `Downloaded as ${view.filename} \u2014 this file type cannot be shown in a browser.`,
+            'ok'
+          );
+          return;
+        }
       }
 
-      setStatus(statusEl, 'Opening\u2026', '');
-      const view = await postBlob('/api/view/blob', result.location, blob);
+      setStatus(
+        statusEl,
+        `Opened ${view.filename} \u2014 ${formatBytes(bytes)} via your ${via}.`,
+        'ok'
+      );
       if (tab) {
-        /* replace, not assign: the blank tab should not sit in history with a
-         * dead address behind it. */
+        /* Sever the opener *before* the peer-supplied document is loaded, and not
+         * at the open: see `openProgressTab` for why the ordering is the
+         * security property. `replace`, not `assign`, so the progress tab does not
+         * sit in history with a dead address behind it. */
+        cutOpener(tab);
         tab.location.replace(view.url);
       } else {
         setStatus(
@@ -440,9 +852,18 @@ function wireFetch(node, result, statusEl) {
         if (tab) tab.close();
         setStatus(statusEl, 'Stopped.', '');
       } else {
-        const failedEarly = !cached;
+        toTab(tab, { type: 'error', message: err.message });
         if (tab) {
-          tab.location.replace(`/view/error?code=${failedEarly ? 'fetch_failed' : 'viewer_failed'}`);
+          /* The error page is our own origin and reflects nothing, so this is
+           * hygiene rather than a fix — but the tab is being navigated away from
+           * the progress page for good, and the "cut the opener at the handoff"
+           * rule should not have a carve-out that only the happy path happens to
+           * satisfy. Keeping it here means no future edit to this page can
+           * reintroduce the exposure by accident. */
+          cutOpener(tab);
+          tab.location.replace(
+            '/view/error?code=' + (cached ? 'viewer_failed' : 'fetch_failed')
+          );
         }
         setStatus(statusEl, `Could not fetch that file: ${err.message}`, 'bad');
       }
@@ -465,6 +886,23 @@ function wireFetch(node, result, statusEl) {
     loc.setAttribute('role', 'button');
     loc.setAttribute('tabindex', '0');
     loc.title = 'Open this file from the Autonomi network';
+    /* Warm the library while the user is still deciding.
+     *
+     * The first `loadSdk()` compiles and instantiates 5.4 MB of WASM, and that
+     * compile is the single longest stretch of a first fetch — long enough to read
+     * as "broken" if it is triggered by the click. Hovering or tabbing onto the
+     * location is free intent that arrives before the click, so start it there and
+     * the wait overlaps with the user's decision instead of following it.
+     *
+     * `loadSdk()` caches its promise *including its failure*, so this costs nothing
+     * if the click never comes and duplicates nothing if it does — the click awaits
+     * the same in-flight promise. A pointerenter is not fired by touch, so the
+     * focus case is what covers a phone. */
+    const warm = () => {
+      loadSdk().catch(() => {});
+    };
+    loc.addEventListener('pointerenter', warm, { once: true });
+    loc.addEventListener('focus', warm, { once: true });
     loc.addEventListener('click', () => openView(statusEl));
     loc.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' || event.key === ' ') {
@@ -477,7 +915,28 @@ function wireFetch(node, result, statusEl) {
 
   saveBtn.addEventListener('click', async () => {
     try {
-      const blob = await obtain(statusEl);
+      /* No tab here: Save writes a file rather than opening one, so there is
+       * nothing for a progress window to be. The row's own status line carries
+       * the detail instead. */
+      let blob;
+      try {
+        blob = await obtain(statusEl);
+      } catch (err) {
+        if (err.name === 'DownloadCancelled') throw err;
+        /* The server can fetch it even when this browser cannot — or when the
+         * bytes never made it here at all. It serves them on its own throwaway
+         * origin, so the Save is the same download-by-link as before. */
+        setStatus(statusEl, 'Fetching via your local daemon\u2026', '');
+        const view = await fetchViaDaemon(result.location, {
+          onEvent: (event) => {
+            if (event.type === 'status') setStatus(statusEl, event.message, '');
+          },
+        });
+        downloadBlob(view.url, view.filename);
+        setStatus(statusEl, `Saved as ${view.filename} \u2014 via your daemon.`, 'ok');
+        return;
+      }
+
       /* Ask the server for the name rather than using the SDK's: it reports
        * `public-file-<8hex>.bin` for every file, so a save here would put
        * everything on disk under the same name.
@@ -502,15 +961,22 @@ function wireFetch(node, result, statusEl) {
     if (controller) controller.abort();
   });
 
-  /* Gate the buttons on what this browser can actually do, once, so the reason
-   * is stated where the button is rather than as a failure afterwards. */
+  /* Gate the buttons on what this browser can do, and only on that.
+   *
+   * This used to disable both buttons outright when WebRTC was unavailable,
+   * which was true once and stopped being true: the daemon can fetch a record on
+   * the browser's behalf, so an Autonomi link is openable with nothing installed.
+   * Disabling it here would tell the user a file cannot be opened when it can.
+   *
+   * The title still says *why* the browser is not the transport, because the
+   * daemon fetch is slower and it is useful to know which one is about to run.
+   * It is set only when this browser genuinely cannot, so it never claims a
+   * reason that does not apply. */
   autonomiCapability().then((cap) => {
     if (cap.available) return;
-    openBtn.disabled = true;
-    saveBtn.disabled = true;
-    openBtn.title = `Cannot fetch from Autonomi here: ${cap.reason}`;
-    saveBtn.title = openBtn.title;
-    setStatus(statusEl, cap.reason, 'warn');
+    const hint = `Opening it through your local daemon instead: ${cap.reason}`;
+    openBtn.title = hint;
+    saveBtn.title = hint;
   });
 }
 

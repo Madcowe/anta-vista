@@ -37,6 +37,14 @@ const MAX_BODY: usize = 32 * 1024 * 1024;
 const PLAN_PREFIX_CAP: usize = 16 * 1024;
 
 /// tiny_http buffers string bodies in a `Cursor`; one alias keeps signatures short.
+///
+/// Not boxed. A `Response<R>` can be handed any reader, which looks like a way to
+/// stream a response — and it is not one, here. tiny_http writes the body with
+/// `io::copy` through `chunked_transfer::Encoder`, which buffers 8 KB and never
+/// flushes between reads, so nothing reaches the socket until the reader is
+/// exhausted. `/api/view/fetch` would have answered with a single trailing
+/// burst, exactly like the buffered reply it replaced. Progress therefore travels
+/// by polling; see `fetch_jobs`.
 pub type WebResponse = Response<Cursor<Vec<u8>>>;
 
 /// Bind the server, spawn the worker pool, and block until shutdown.
@@ -157,16 +165,42 @@ fn route(
         (Method::Get, "/api/deps") => Ok(handlers::deps(state)),
         (Method::Get, "/api/search") => Ok(handlers::search(state, query)),
         (Method::Get, "/api/download") => Ok(handlers::download(state, query)),
+        // One segment of a path, matched by a prefix arm rather than a literal,
+        // because the job id is not known ahead of time and tiny_http gives no
+        // capture groups. The handler rejects anything that is not a job id
+        // shape, so this cannot be widened into a prefix match by accident.
+        (Method::Get, p) if p.starts_with("/api/view/fetch/") => Ok(handlers::view_fetch_status(
+            p.trim_start_matches("/api/view/fetch/"),
+            query,
+        )),
         (Method::Get, "/api/blocks") => Ok(handlers::blocks_list(state)),
         // Stands alone on its own origin: no app.js, no API access, and the only
         // input is an enum, so an SDK error string can never be reflected here.
         (Method::Get, "/view/error") => Ok(render::view_error_page(query)),
+        // Also standalone and app-origin, unlike `/view/error`: this page is
+        // navigated to by the tab we opened and then written to by `postMessage`,
+        // and it holds no peer bytes — those stay on the viewer port, so a second
+        // origin still separates them from `/api/*`.
+        (Method::Get, "/view/progress") => Ok(render::view_progress_page()),
 
         (Method::Post, p) => {
             // Binary bodies are dispatched *before* the UTF-8 read below, which
             // would reject them outright. These two carry an uploaded file, so
             // there is nothing to parse as JSON.
             match p {
+                // No request body at all, and that is the point: the server does
+                // the fetching, so a record larger than `MAX_UPLOAD` is no longer
+                // reachable only by browsers that can carry it. It has to be
+                // matched before the arms that read a body, because there is
+                // nothing here to read.
+                //
+                // Answers immediately with a job id. The fetch runs on its own
+                // thread and the page polls for events, because tiny_http cannot
+                // stream a response — see `fetchjob`.
+                "/api/view/fetch" => {
+                    let uri = header(request, URI_HEADER).unwrap_or_default();
+                    Ok(handlers::view_fetch(state, &uri))
+                }
                 "/api/index/bytes" => {
                     // Metadata rides in headers because the body is the file.
                     let uri = header(request, URI_HEADER).unwrap_or_default();
@@ -460,6 +494,21 @@ pub fn text_response(status: u16, mime: &str, body: &str) -> WebResponse {
         .with_header(content_type(mime))
 }
 
+/// A text response with extra headers of its own.
+///
+/// For the one page that wants a policy [`text_response`] does not express: a
+/// `Content-Security-Policy` that forbids this page from making any request of
+/// its own. Everything it shows arrives by `postMessage`.
+pub fn text_response_with(status: u16, mime: &str, body: &str, headers: &[Header]) -> WebResponse {
+    let mut response = Response::from_string(body.to_string())
+        .with_status_code(StatusCode(status))
+        .with_header(content_type(mime));
+    for header in headers {
+        response = response.with_header(header.clone());
+    }
+    response
+}
+
 /// A response carrying raw bytes rather than text.
 ///
 /// Used for the vendored WASM — a browser refuses to stream-compile it unless
@@ -474,6 +523,6 @@ pub fn binary_response(status: u16, mime: &str, body: Vec<u8>) -> WebResponse {
         )
 }
 
-fn content_type(mime: &str) -> Header {
+pub(crate) fn content_type(mime: &str) -> Header {
     Header::from_bytes("Content-Type", mime).expect("static content type is a valid header")
 }

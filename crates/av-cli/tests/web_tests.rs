@@ -2604,3 +2604,923 @@ fn css_rule_lookup_finds_a_rule_and_ignores_prose() {
     );
     assert_eq!(css_rule(css, ".nope"), None);
 }
+
+/* ------------------------------------------------------ daemon fetch progress -- */
+
+/// Serve one body, slowly, so a fetch against it stays in flight long enough to
+/// observe that progress is reported *while* it runs.
+///
+/// Returns the port. The delay is between the headers and the body, which is
+/// what `download_content` blocks on — so a status event must be readable while
+/// this is still sleeping.
+fn slow_body_server(body: &'static [u8], delay: Duration) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        // Read the request line so the client is not still writing when we reply.
+        let mut seen = [0u8; 1024];
+        let _ = stream.read(&mut seen);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.flush();
+        std::thread::sleep(delay);
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+    });
+    port
+}
+
+/// Start a daemon fetch and return its job id, or panic with the server's answer.
+fn start_fetch(s: &TestServer, uri: &str) -> String {
+    let res = s.post_binary("/api/view/fetch", b"", &[("X-Anta-Uri", uri)]);
+    assert_eq!(res.status, 200, "start failed: {}", res.body);
+    res.json()["job"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no job id in {}", res.body))
+        .to_string()
+}
+
+/// Read a job until it is done, collecting every event it reports.
+///
+/// Mirrors what the page does, so this exercises the same route the page polls.
+fn poll_until_done(s: &TestServer, job: &str) -> (Vec<Value>, Duration) {
+    let started = Instant::now();
+    let mut seen = Vec::new();
+    let mut since = 0usize;
+    for _ in 0..2000 {
+        let res = s.get(&format!("/api/view/fetch/{job}?since={since}"));
+        assert_eq!(res.status, 200, "poll failed: {}", res.body);
+        let body = res.json();
+        for event in body["events"].as_array().cloned().unwrap_or_default() {
+            since += 1;
+            seen.push(event);
+        }
+        if body["done"] == serde_json::Value::Bool(true) {
+            return (seen, started.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("fetch job {job} never finished");
+}
+
+#[test]
+fn a_daemon_fetch_reports_progress_before_it_finishes() {
+    let s = server();
+    let port = slow_body_server(b"a small file body", Duration::from_secs(3));
+    let uri = format!("http://127.0.0.1:{port}/record.bin");
+
+    let job = start_fetch(&s, &uri);
+
+    // The fetch is against a server that will not answer for three seconds, so
+    // anything readable now is genuinely progress and not the finished result.
+    let early = s.get(&format!("/api/view/fetch/{job}?since=0"));
+    assert_eq!(early.status, 200, "{}", early.body);
+    let early = early.json();
+    assert!(
+        !early["events"].as_array().unwrap().is_empty(),
+        "the fetch had not started reporting: {}",
+        early
+    );
+    assert_eq!(
+        early["done"], false,
+        "it must not claim to be finished while the body is still in flight"
+    );
+
+    let (events, _) = poll_until_done(&s, &job);
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "status" || e["type"] == "chunk"),
+        "no progress was ever reported: {events:?}"
+    );
+    let done = events.last().expect("at least one event");
+    assert_eq!(done["type"], "done", "{events:?}");
+    assert_eq!(done["transport"], "daemon");
+    assert!(done["url"].as_str().unwrap().contains("/v/"), "{done}");
+}
+
+#[test]
+fn a_poll_returns_each_event_once_and_resumes_from_a_cursor() {
+    // The page's cursor is the only thing keeping a resumed poll from re-showing
+    // events the user has already read, so it is worth pinning directly.
+    let port = slow_body_server(b"cursor body", Duration::from_millis(300));
+    let uri = format!("http://127.0.0.1:{port}/cursor.bin");
+    let job = start_fetch(server(), &uri);
+
+    let first = server()
+        .get(&format!("/api/view/fetch/{job}?since=0"))
+        .json();
+    let count = first["events"].as_array().unwrap().len();
+    assert!(count > 0, "no events to resume from");
+
+    let resumed = server()
+        .get(&format!("/api/view/fetch/{job}?since={count}"))
+        .json();
+    let rest = resumed["events"].as_array().unwrap();
+    // Only the tail is new, and nothing from the first page is repeated.
+    for event in rest {
+        assert!(
+            !first["events"].as_array().unwrap().contains(event),
+            "an event was delivered twice: {event}"
+        );
+    }
+}
+
+#[test]
+fn a_job_that_was_never_started_is_not_a_404_with_a_list() {
+    // An absent job and an empty one look the same from outside, so this is one
+    // refusal rather than a way to probe which fetches are in flight.
+    let res = server().get("/api/view/fetch/deadbeefdeadbeef?since=0");
+    assert_eq!(res.status, 404);
+    assert_eq!(res.json()["error"], "not_found");
+
+    // And a shape that is not a job id is refused without being looked up.
+    for bad in ["", "..", "x", &"z".repeat(200)] {
+        let res = server().get(&format!("/api/view/fetch/{bad}"));
+        assert!(
+            res.status == 404 || res.status == 400,
+            "{bad:?} should not be a job: {}",
+            res.body
+        );
+    }
+}
+
+#[test]
+fn a_daemon_fetch_serves_the_record_under_the_same_name_and_type_as_an_upload() {
+    // The two routes must agree, or the same record is called one thing when the
+    // browser fetches it and another when the daemon does.
+    let port = slow_body_server(b"%PDF-1.7\nsmall pdf body\n", Duration::from_millis(200));
+    let uri = format!("http://127.0.0.1:{port}/report.pdf");
+    let job = start_fetch(server(), &uri);
+    let (events, _) = poll_until_done(server(), &job);
+    let done = events
+        .iter()
+        .find(|e| e["type"] == "done")
+        .unwrap_or_else(|| panic!("no done event: {events:?}"));
+
+    assert_eq!(done["filename"], "report.pdf");
+    assert_eq!(done["mime_type"], "application/pdf");
+
+    // And the bytes it published are actually servable.
+    let (viewer_port, path) = split_viewer_url(done["url"].as_str().unwrap());
+    let mut stream = TcpStream::connect(("127.0.0.1", viewer_port)).expect("connect viewer");
+    // `Connection: close`, because the viewer deliberately keeps its port open for
+    // 120 s. Without this the read below blocks until that lapses, which turns a
+    // test about filenames and bytes into a minute-long test.
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("write");
+    let mut out = Vec::new();
+    stream.read_to_end(&mut out).expect("read");
+    assert!(
+        out.windows(8).any(|w| w == b"%PDF-1.7"),
+        "the viewer did not serve the fetched bytes"
+    );
+}
+
+#[test]
+fn a_failed_daemon_fetch_reports_the_error_and_stops_the_page_polling() {
+    // A fetch that fails has to end the job. A job left un-finished would leave
+    // the tab's progress line spinning forever.
+    // Port 1 is reserved and nothing listens on it, so the connection is
+    // refused straight away — a fetch that fails immediately still has to end
+    // its job.
+    let job = start_fetch(server(), "http://127.0.0.1:1/never.bin");
+    let (events, elapsed) = poll_until_done(server(), &job);
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "a refused connection should not take this long: {elapsed:?}"
+    );
+    let last = events.last().expect("at least one event");
+    assert_eq!(last["type"], "error", "{events:?}");
+    assert!(last["message"].as_str().unwrap().len() > 3, "{last}");
+}
+
+#[test]
+fn a_blocked_location_is_refused_before_any_route_reaches_the_network() {
+    let s = server();
+    let uri = test_address("blocked-fetch");
+    let indexed = s.post_binary(
+        "/api/index/bytes",
+        b"a record that is about to be blocked",
+        &[("X-Anta-Uri", uri.as_str())],
+    );
+    assert_eq!(indexed.status, 200, "{}", indexed.body);
+    let id = indexed.json()["resource_id"]
+        .as_str()
+        .expect("resource_id")
+        .to_string();
+
+    // Nothing is blocked yet, so the guard must not be what answers. On a host
+    // with no autonomi backend this is 503, and either way it is not 403 — which
+    // is what makes this assertion hold whatever ant and antd are installed.
+    let before = s.post_binary("/api/view/fetch", b"", &[("X-Anta-Uri", uri.as_str())]);
+    assert_ne!(
+        before.status, 403,
+        "nothing is blocked yet, so 403 is the guard misfiring: {}",
+        before.body
+    );
+
+    let blocked = s.post(
+        "/api/block",
+        &format!(r#"{{"subject_kind":"resource","subject_id":"{id}"}}"#),
+    );
+    assert_eq!(blocked.status, 200, "{}", blocked.body);
+
+    // Both routes that fetch on the user's behalf. `/api/download` had no check at
+    // all until now, which is why this is one test rather than two.
+    let fetch = s.post_binary("/api/view/fetch", b"", &[("X-Anta-Uri", uri.as_str())]);
+    assert_eq!(fetch.status, 403, "view/fetch: {}", fetch.body);
+    assert_eq!(fetch.json()["error"], "blocked");
+
+    let download_path = format!("/api/download?location={}", urlencode(&uri));
+    let download = s.get(&download_path);
+    assert_eq!(download.status, 403, "download: {}", download.body);
+    assert_eq!(download.json()["error"], "blocked");
+
+    // Unblocking lifts it, so the guard is not just refusing everything.
+    let unblocked = s.post(
+        "/api/unblock",
+        &format!(r#"{{"subject_kind":"resource","subject_id":"{id}"}}"#),
+    );
+    assert_eq!(unblocked.status, 200);
+    assert_ne!(
+        s.post_binary("/api/view/fetch", b"", &[("X-Anta-Uri", uri.as_str())])
+            .status,
+        403,
+        "the block outlived the unblock"
+    );
+}
+
+/// Percent-encode a location for a query string.
+fn urlencode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+/* -------------------------------------------------------- progress reporting -- */
+
+#[test]
+fn the_progress_tab_updates_one_line_for_byte_counts_and_appends_for_phases() {
+    // The two kinds of SDK event are not the same kind of thing, and treating them
+    // alike makes the page useless exactly when it is needed.
+    //
+    // The SDK emits `downloading` many times a second. Appended, those fill the
+    // 40-line log with "1.2 MB of 8.0 MB" long before the file arrives and push
+    // out the phase transitions — "finding the nodes holding this file" — which
+    // are the lines that tell the user the thing is still working. So a byte count
+    // replaces a single element and a phase goes to the headline.
+    let page = server().get("/view/progress").body;
+    assert!(
+        page.contains(r#"case 'live':"#),
+        "the page has no channel for a continuous count"
+    );
+
+    // And it replaces rather than appends: no `addLine` on that path, which is the
+    // half that actually causes the flooding.
+    let live_case = page
+        .split("case 'live':")
+        .nth(1)
+        .and_then(|rest| rest.split("break;").next())
+        .expect("no live case");
+    assert!(
+        !live_case.contains("addLine("),
+        "a byte count must replace its line, not append: {live_case}"
+    );
+    assert!(
+        live_case.contains("live.textContent"),
+        "the live line must be the element that changes: {live_case}"
+    );
+
+    // The element has to exist and have a `[hidden]` rule of its own, for the same
+    // reason `.counts` does: `hidden` is defeated by any author `display`, and the
+    // UA `[hidden]` rule lives in a different origin's stylesheet.
+    assert!(page.contains(r#"id="live""#), "no live element to write to");
+    assert!(
+        page.contains(".live[hidden]"),
+        "the live line would show before the first event arrives"
+    );
+}
+
+#[test]
+fn sdk_progress_drives_the_detail_line_and_never_the_counter() {
+    // This used to require the SDK's byte counts to go to the `live` channel. That is
+    // now deliberately wrong, and the reason is worth keeping: we count chunks read
+    // against `reader.size` ourselves, so the SDK's counts are a *second* source for
+    // the same read-out. Both arriving made the line alternate between
+    // "Downloading — 1.2 MB of 8.0 MB" and "12 chunks · 1.4 MB of 8.0 MB" as each
+    // fired, which reads as a broken counter rather than a progress one.
+    //
+    // So the SDK drives the detail line only, and nothing sends its progress as
+    // `status` either — that appends, and it is what floods the log.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let body = js
+        .split("function reportSdkProgress")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("reportSdkProgress is gone");
+
+    assert!(
+        body.contains("type: 'phase'"),
+        "a phase belongs in the detail line: {body}"
+    );
+    assert!(
+        !body.contains("type: 'live'"),
+        "the SDK must not share the counter we already own: {body}"
+    );
+    assert!(
+        !body.contains("type: 'status'"),
+        "sending SDK progress as `status` is what floods the log: {body}"
+    );
+    // The label still has to be derived from the event, including the numbers, so
+    // the headline reads honestly rather than as a bare phase name.
+    assert!(
+        body.contains("progressLine(event)"),
+        "the phase has to reach the page somehow: {body}"
+    );
+}
+
+#[test]
+fn the_daemon_client_polls_a_job_rather_than_reading_a_stream() {
+    // tiny_http cannot stream (see `web::fetchjob`), so a reader-based client is
+    // not a style choice — it receives every event in one burst at the end, which
+    // is the blank tab with a streaming header. The server's own module carries the
+    // argument; this pins the client to match.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let body = js
+        .split("async function fetchViaDaemon")
+        .nth(1)
+        .and_then(|rest| rest.split("\nasync function").next())
+        .expect("fetchViaDaemon is gone");
+
+    assert!(
+        !body.contains("getReader("),
+        "reading a response body as a stream cannot work against this server: {body}"
+    );
+    assert!(
+        body.contains("/api/view/fetch"),
+        "the daemon route is missing: {body}"
+    );
+    // The cursor must come from the server. Counting delivered events is equal to
+    // the cursor only while nothing has been trimmed, which stops being true on
+    // exactly the long fetches the progress page exists for.
+    assert!(
+        body.contains("update.next"),
+        "the page must resume from the server's cursor: {body}"
+    );
+    assert!(
+        !body.contains("since += 1"),
+        "counting delivered events silently stalls the tab once the log is trimmed: {body}"
+    );
+}
+
+#[test]
+fn the_tab_is_told_the_library_load_before_the_sdk_can_report_it() {
+    // Regression, from a real report: the progress tab sat on "Starting…" for the
+    // entire fetch.
+    //
+    // The cause is not in this project's code at all. `loadSdk()` is a dynamic
+    // `import()` of a package carrying 5.4 MB of WASM, and the SDK's first progress
+    // event does not fire until after `getNetworkDefaults` has compiled and
+    // instantiated it — inside `connect`, before its reporter is even built. So
+    // the longest silent stretch in the whole fetch produced no events, and the
+    // page's opening sentence was all the user saw for most of the wait.
+    //
+    // The opener knows what it is doing at the instant it starts, so it says so,
+    // without waiting for a third-party callback that cannot report yet.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let body = js
+        .split("async function fetchAutonomi")
+        .nth(1)
+        .and_then(|rest| rest.split("\n/* Wire Open and Save").next())
+        .expect("fetchAutonomi is gone");
+
+    let step_at = body
+        .find("onStep")
+        .expect("fetchAutonomi never announces the library load");
+    let load_at = body.find("await loadSdk()").expect("loadSdk is gone");
+    assert!(
+        step_at < load_at,
+        "the load must be announced before it starts, not after: {body}"
+    );
+}
+
+#[test]
+fn connect_receives_its_abort_signal() {
+    // `AutonomiClient.connect(bootstrap, options)` treats a plain object in the
+    // first argument as a network profile and takes its settings from a rest-spread
+    // of *that object*; the second argument is only read for the string form (one
+    // explicit WebRTC multiaddress).
+    //
+    // So `connect({ onProgress }, { signal })` looks right and silently discards
+    // the signal: connect succeeds and Stop cannot cancel it. Both belong in the
+    // first argument.
+    let js = js_code(&server().get("/assets/app.js").body);
+    assert!(
+        js.contains("AutonomiClient.connect({ onProgress: progress, signal })"),
+        "connect must take one object carrying both: {js}"
+    );
+    assert!(
+        !js.contains("connect({ onProgress: progress }, { signal })"),
+        "this drops the abort signal, because the second argument is not read"
+    );
+}
+
+#[test]
+fn the_progress_tab_neither_promises_a_display_nor_explains_where_progress_will_be() {
+    // Two things this page must not say:
+    //
+    // "This tab will show the file" promises a display the tab cannot guarantee for
+    // any type the server serves as an attachment, and it cannot know that beforehand.
+    //
+    // "Progress appears here as it goes" is true and useless — the tab *is* where
+    // progress appears, and telling the reader so spends its most prominent line on
+    // navigation instead of on the fetch they are waiting for.
+    let page = server().get("/view/progress").body;
+    assert!(
+        !page.contains("This tab will show the file"),
+        "the opening line promises a display the tab cannot guarantee: {page}"
+    );
+    assert!(
+        !page.contains("Progress appears here"),
+        "an explainer about the page is not progress: {page}"
+    );
+    // What replaces it states what the user is waiting for, rather than narrating
+    // the layout back at them.
+    assert!(
+        page.contains("Fetching from Autonomi\u{2026}"),
+        "the headline no longer says what is being waited for: {page}"
+    );
+}
+
+#[test]
+fn the_progress_headline_is_waited_for_progress_and_never_a_finished_state() {
+    // From the user's side they are waiting for a fetch. So the headline states
+    // that, always, and the *step* moves underneath it — which makes it structurally
+    // impossible for the big line to end up reading like something already
+    // completed while the transfer is still running.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let page = server().get("/view/progress").body;
+
+    // Steps land on the detail line.
+    assert!(
+        page.contains("sub.textContent = clamp(data.message)"),
+        "a step must go beneath the headline: {page}"
+    );
+    assert!(
+        !page.contains("phaseText.textContent = clamp(data.message)"),
+        "a step overwriting the headline is how a wait reads as done: {page}"
+    );
+    // And the headline only changes when there is nothing left to wait for.
+    assert!(
+        page.contains("phaseText.textContent = 'Ready.'"),
+        "a completed fetch must stop reading as in progress: {page}"
+    );
+    assert!(
+        page.matches("phaseText.textContent =").count() == 2,
+        "only the terminal states may rewrite the headline: {page}"
+    );
+
+    // The labels the page may show beneath it are all phrased as the wait itself.
+    // "Downloading done" said the download was finished while it was not, which is
+    // the specific confusion this pins.
+    let labels = js
+        .split("const PHASE_LABELS = {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n};").next())
+        .expect("PHASE_LABELS is gone");
+    for forbidden in ["downloaded", "done", "failed "] {
+        assert!(
+            !labels.contains(forbidden),
+            "`{forbidden}` in a label reads as a finished state: {labels}"
+        );
+    }
+}
+
+#[test]
+fn a_daemon_fetch_that_cannot_be_displayed_is_saved_rather_than_opened() {
+    // The browser path asks `/api/view/plan` and, on "not renderable", saves and
+    // closes the tab. The daemon path skipped that entirely and navigated the tab
+    // to a viewer URL serving `Content-Disposition: attachment` — so the browser
+    // downloaded the file and left the tab claiming it was opening it.
+    //
+    // Both verdicts come from `av_ingest::mime::is_browser_renderable`, so the two
+    // transports cannot disagree about the same file.
+    let s = server();
+    let body = js_code(&s.get("/assets/app.js").body);
+    let daemon = body
+        .split("view = await fetchViaDaemon")
+        .nth(1)
+        .and_then(|rest| rest.split("\n      } catch (err)").next())
+        .expect("daemon branch moved");
+    assert!(
+        daemon.contains("view.renderable === false"),
+        "the daemon path must ask whether the file can be displayed: {daemon}"
+    );
+    assert!(
+        daemon.contains("downloadUrl(view.url"),
+        "an undisplayable file must be saved, not navigated to: {daemon}"
+    );
+
+    // And the server sends the verdict at all.
+    let done = format!(
+        "{}",
+        serde_json::to_string(&av_cli::web::fetchjob::FetchEvent::Done {
+            url: "/v/t".into(),
+            mime_type: "application/octet-stream".into(),
+            filename: "blob.bin".into(),
+            bytes: 3,
+            expires_in: 120,
+            transport: "daemon".into(),
+            renderable: false,
+        })
+        .expect("serialize")
+    );
+    assert!(
+        done.contains(r#""renderable":false"#),
+        "the page cannot choose without it: {done}"
+    );
+}
+
+#[test]
+fn a_record_is_streamed_rather_than_downloaded_so_chunks_can_be_counted() {
+    // `download()` waits for the whole file and reports once, at the end, with
+    // `phase: "complete"` and the final byte total. It therefore says nothing for
+    // the entire duration of the transfer — which is the whole point of the
+    // progress tab.
+    //
+    // try.autonomi.com shows per-chunk progress because it does *not* call
+    // `download()`: it opens a reader and consumes a stream. A reader also knows
+    // `size` from the DataMap before any chunk moves, so "N chunks, X of Y" is
+    // counted rather than guessed.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let body = js
+        .split("async function fetchAutonomi")
+        .nth(1)
+        .and_then(|rest| rest.split("\n/* Wire Open and Save").next())
+        .expect("fetchAutonomi is gone");
+
+    assert!(
+        !body.contains(".download("),
+        "download() cannot report progress while it runs: {body}"
+    );
+    assert!(
+        body.contains("client.openFile("),
+        "the reader is what knows the size up front: {body}"
+    );
+    assert!(
+        body.contains(".stream(") && body.contains("getReader()"),
+        "the file must be consumed chunk by chunk: {body}"
+    );
+    // Counted as they arrive, and checked against the size the DataMap promised,
+    // so a short stream is an error rather than a silently truncated file.
+    assert!(
+        body.contains("chunks += 1"),
+        "chunks are never counted: {body}"
+    );
+    assert!(
+        body.contains("received !== totalBytes"),
+        "a short stream must not pass for a complete file: {body}"
+    );
+}
+
+#[test]
+fn byte_progress_is_recognised_by_its_counts_not_by_its_phase() {
+    // The SDK's reporter holds one `current` object and does `current = details`
+    // on every report that carries details. A byte update passing
+    // `{ completed, total }` without repeating `phase` therefore **erases** the
+    // phase — so gating on `phase === 'downloading'` drops the numbers from
+    // precisely the events that have them, and the transfer shows nothing until
+    // it is over.
+    let js = js_code(&server().get("/assets/app.js").body);
+
+    let line = js
+        .split("function progressLine")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("progressLine is gone");
+    assert!(
+        !line.contains("event.phase === 'downloading'"),
+        "the phase cannot be trusted to identify a byte event: {line}"
+    );
+    assert!(
+        line.contains("event.completed") && line.contains("event.total"),
+        "the counts themselves are the reliable signal: {line}"
+    );
+
+    // And the routing decision has to use the same test, or the numbers reach the
+    // page but land on the wrong channel.
+    let report = js
+        .split("function reportSdkProgress")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("reportSdkProgress is gone");
+    assert!(
+        !report.contains("event.phase === 'downloading'"),
+        "routing on the phase drops byte counts: {report}"
+    );
+}
+
+#[test]
+fn a_progress_update_is_queued_rather_than_awaited_so_a_lost_handshake_cannot_silence_it() {
+    // The failure this pins is total and silent: `toTab` used to `await` a promise
+    // resolved by the page's `ready` message, so a `ready` that never arrived left
+    // every update pending forever. No error, no log, no event handler firing — the
+    // tab just sat on its opening sentence for the whole fetch. That is
+    // indistinguishable from a fetch that reports nothing at all, which is exactly
+    // the confusion it caused.
+    let js = js_code(&server().get("/assets/app.js").body);
+
+    let to_tab = js
+        .split("function toTab(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("toTab is gone");
+    assert!(
+        !to_tab.contains("await"),
+        "an awaited handshake can discard every update silently: {to_tab}"
+    );
+    assert!(
+        to_tab.contains("__avQueue.push(message)"),
+        "an update sent before the page is listening must be held, not dropped: {to_tab}"
+    );
+
+    // Bounded, because the download reports faster than a page can be expected to
+    // load, and an unbounded queue is just a slower leak.
+    assert!(
+        js.contains("PROGRESS_QUEUE_MAX"),
+        "the queue has no ceiling: {js}"
+    );
+
+    // And there is a failsafe, so a page that never answers costs the pre-ready
+    // events rather than all of them.
+    let opener = js
+        .split("function openProgressTab(")
+        .nth(1)
+        .and_then(|rest| rest.split("/* Sever the opener").next())
+        .expect("openProgressTab is gone");
+    assert!(
+        opener.contains("setTimeout(flush, PROGRESS_HANDSHAKE_MS)"),
+        "a lost `ready` leaves the queue growing forever: {opener}"
+    );
+    // Order is the thing a progress log is made of, so a flush drains in order.
+    assert!(
+        opener.contains("tab.__avQueue.splice(0)"),
+        "the flush must drain in arrival order: {opener}"
+    );
+}
+
+#[test]
+fn a_quiet_progress_page_says_it_is_connected_rather_than_looking_frozen() {
+    // "Nothing to report yet" and "the opener is not talking to me" look the same
+    // on a progress page, and telling them apart is the only thing that makes a
+    // broken channel diagnosable instead of mysterious.
+    let page = server().get("/view/progress").body;
+    assert!(
+        page.contains("Waiting for the first update"),
+        "an idle page never distinguishes itself from a dead channel: {page}"
+    );
+    assert!(
+        page.contains("if (!heard)"),
+        "the idle notice is unconditional, so it would claim to be waiting while it is fed: {page}"
+    );
+}
+
+#[test]
+fn the_vendored_sdk_is_cacheable_because_its_url_carries_the_version() {
+    // 5.4 MB of the ~5.6 MB vendored SDK is `ant_core_bg.wasm`, and a browser caches
+    // *compiled* WASM per URL. With no `Cache-Control`, the compile is redone on
+    // every load: the first stretch of every first fetch spent tens of seconds
+    // compiling, and two tabs opening at once competed for the same CPU doing it
+    // twice. The version is in the path, so nothing here can change meaning in
+    // place and a year-long immutable cache is safe.
+    let sdk = server().get("/assets/vendor/autonomi-sdk/0.1.1/wasm/ant_core_bg.wasm");
+    assert_eq!(sdk.status, 200);
+    assert!(
+        sdk.headers.contains("immutable"),
+        "the wasm will be recompiled on every load: {}",
+        sdk.headers
+    );
+
+    // The deliberately opposite half of the split. `app.js` is the code being
+    // actively edited, and a stale one is a *silent* wrong-UI bug rather than a
+    // slow load — a whole class of confusing reports. So it keeps `no-store`.
+    let app = server().get("/assets/app.js");
+    assert!(
+        app.headers.contains("cache-control: no-store"),
+        "a cached app.js is what made this look like a progress bug: {}",
+        app.headers
+    );
+}
+
+#[test]
+fn hovering_an_autonomi_location_starts_the_wasm_compile_before_the_click() {
+    // Compiling and instantiating 5.4 MB of WASM is the longest single stretch of a
+    // first fetch. Triggered by the click it reads as "broken"; triggered by hover it
+    // overlaps the user's decision. `loadSdk()` caches its promise including failure,
+    // so warming it is free when the click never comes and duplicates nothing when
+    // it does. Touch fires no pointerenter, which is why focus is wired too.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let warm = js
+        .split("const warm = () => {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    loc.addEventListener('click'").next())
+        .expect("the warm handler is gone");
+    assert!(
+        warm.contains("loadSdk()"),
+        "warming must reuse the cached promise rather than import again: {warm}"
+    );
+    assert!(
+        js.contains("loc.addEventListener('pointerenter', warm, { once: true })"),
+        "pointer intent is not wired: {js}"
+    );
+    assert!(
+        js.contains("loc.addEventListener('focus', warm, { once: true })"),
+        "touch devices fire no pointerenter, so focus must be wired too: {js}"
+    );
+}
+
+#[test]
+fn the_sdk_never_names_the_record_at_the_user() {
+    // The SDK narrates itself in words built from what the network answered, which
+    // includes `opened public-file-3f9a2c71`. That filename is *always* synthetic —
+    // the app refuses to trust it for anything, including naming a download — so
+    // showing it beside our own counts read as though the app had picked a file off
+    // the network. A phase we have a word for is ours; anything else is "Fetching…".
+    let js = js_code(&server().get("/assets/app.js").body);
+    let line = js
+        .split("function progressLine")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("progressLine is gone");
+    assert!(
+        !line.contains("event.message"),
+        "the SDK's own wording is back in the headline: {line}"
+    );
+    assert!(
+        line.contains("PHASE_LABELS[event.phase] || 'Fetching\u{2026}'"),
+        "an unknown phase must degrade to our own neutral wording: {line}"
+    );
+}
+
+#[test]
+fn one_counter_shows_progress_because_two_sources_would_flicker() {
+    // The SDK reports byte counts, and we independently count chunks read against
+    // the size the DataMap promised. Sending both to the same read-out made the line
+    // alternate "Downloading — 1.2 MB of 8.0 MB" and "12 chunks · 1.4 MB of 8.0 MB"
+    // as each fired, which reads as a broken counter. The SDK's counts now drive the
+    // headline only.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let report = js
+        .split("function reportSdkProgress")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("reportSdkProgress is gone");
+    assert!(
+        !report.contains("type: 'live'"),
+        "the SDK's byte counts must not share our counter: {report}"
+    );
+    assert!(
+        report.contains("type: 'phase'"),
+        "the SDK drives the headline: {report}"
+    );
+
+    // And our own counts go on the channel the ant CLI already uses, so both
+    // transports render through one element instead of each having its own.
+    let chunk = js
+        .split("onChunk: ({ chunks, bytes, totalBytes })")
+        .nth(1)
+        .and_then(|rest| rest.split("\n        },").next())
+        .expect("onChunk is gone");
+    assert!(
+        chunk.contains("type: 'chunk'"),
+        "the browser path needs its own read-out, which is the flicker: {chunk}"
+    );
+    assert!(
+        chunk.contains("expected_bytes: totalBytes"),
+        "the size is known up front from the DataMap and should be shown: {chunk}"
+    );
+}
+
+#[test]
+fn a_fetch_shows_a_spinner_that_a_failed_fetch_stops() {
+    // The wait for a ~6s seed lookup reads as "broken" when nothing moves, which is
+    // what the spinner is for. Decorative, so `aria-hidden` with the headline
+    // carrying the meaning.
+    let page = server().get("/view/progress").body;
+    assert!(
+        page.contains("class=\"spin\" id=\"spin\" aria-hidden=\"true\""),
+        "the spinner must be decorative: {page}"
+    );
+    assert!(
+        page.contains("@keyframes spin"),
+        "the spinner does not animate: {page}"
+    );
+    // It must stop. `.spin` sets `display`, and the user-agent's `[hidden]` rule
+    // lives in a different origin's stylesheet, so any author `display` rule
+    // silently outranks it — `!important` is what actually hides it.
+    assert!(
+        page.contains(".spin[hidden] { display: none !important; }"),
+        "a failed fetch would leave a spinner turning forever: {page}"
+    );
+    assert!(
+        page.contains("[hidden] { display: none !important; }"),
+        "the blanket guard the other panels rely on is gone: {page}"
+    );
+    // And it is stopped on both outcomes, not just hidden by the stylesheet alone.
+    assert_eq!(
+        page.matches("spin.hidden = true").count(),
+        2,
+        "both done and error must stop the spinner: {page}"
+    );
+}
+
+#[test]
+fn an_sdk_operation_boundary_is_not_reported_as_the_users_download_finishing() {
+    // `#openReader` reports `phase: "complete"` the instant the reader object exists:
+    //
+    //     report(`Opened ${reader.name}`, { phase: "complete" });
+    //     return reader;
+    //
+    // — before a *single* byte has moved. That is an operation boundary, not the
+    // file arriving. Rendering it verbatim said "Fetch complete" for the whole of a
+    // large transfer, which is exactly backwards for someone waiting for the resource
+    // to appear, and it also surfaced for a moment on small ones.
+    let js = js_code(&server().get("/assets/app.js").body);
+
+    // No terminal label of our own: whether the bytes are here is ours to decide.
+    let labels = js
+        .split("const PHASE_LABELS = {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n};").next())
+        .expect("PHASE_LABELS is gone");
+    assert!(
+        !labels.contains("complete"),
+        "a `complete` label renders the SDK's operation boundary: {labels}"
+    );
+    assert!(
+        !labels.contains("failed"),
+        "the SDK's failure boundary is not our terminal state either: {labels}"
+    );
+
+    // And it cannot sneak through the handler by another route.
+    let report = js
+        .split("function reportSdkProgress")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("reportSdkProgress is gone");
+    assert!(
+        report.contains("event.phase === 'complete'"),
+        "the operation boundary must be filtered, not merely unlabelled: {report}"
+    );
+    assert!(
+        report.find("event.phase === 'complete'") < report.find("type: 'phase'"),
+        "the filter has to run before anything is sent: {report}"
+    );
+
+    // What replaces it: *we* say the transfer started, at the moment it does, and
+    // only then is the line true.
+    let fetch = js
+        .split("const reader = await client.openFile")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("\n")
+                .take(6)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .split("const totalBytes")
+                .next()
+                .map(str::to_string)
+        })
+        .expect("openFile call is gone");
+    assert!(
+        fetch.contains("onStep(PHASE_LABELS.downloading)"),
+        "the transfer is never announced by us: {fetch}"
+    );
+
+    // Terminal states remain the page's own two, so a user still knows when the
+    // wait ends — the headline says so and the detail line names what happens next.
+    let page = server().get("/view/progress").body;
+    assert!(
+        page.contains("phaseText.textContent = 'Ready.'")
+            && page.contains("sub.textContent = 'Opening the file"),
+        "the hand-off must be announced: {page}"
+    );
+}

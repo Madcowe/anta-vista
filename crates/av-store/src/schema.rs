@@ -191,6 +191,49 @@ ALTER TABLE name_records ADD COLUMN origin_agent_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_name_records_origin ON name_records(origin_agent_id);
 ";
 
+/// The locations a blocked resource was held under.
+///
+/// A resource block is keyed by content hash, which is exactly what makes it
+/// useless for the one question a *fetch* route has to answer: "is this location
+/// blocked?" The hash is only known once the bytes are in hand, so it cannot be
+/// derived from an `autonomi://` address — and the join that would resolve one to
+/// the other stops working the moment the block lands, because `av block` deletes
+/// the local copy by default. The row the guard needed is the row the block
+/// removed.
+///
+/// So the location is recorded here at block time, before the delete, and this
+/// table is what the fetch routes read. It is keyed by the location itself rather
+/// than by `resources.id`, which is what lets the row outlive the resource it
+/// names.
+///
+/// Both spellings are stored, because a record indexed under two paths is two rows
+/// sharing one canonical address, and refusing one while allowing the other would
+/// be a block with a hole in it exactly where a user would find it.
+///
+/// The resource id is kept alongside the location for the same reason the row
+/// exists at all: the resource it names is deleted. Without it, `av unblock`
+/// would have to re-read `resources` to find which locations to clear, and would
+/// find nothing — leaving a block the user cannot lift through the API, which is a
+/// worse failure than the one this table prevents. So the id is carried here
+/// rather than looked up.
+///
+/// Note this is a *fetch-level* deny list, not a statement about the address. A
+/// location stays refused until it is explicitly unblocked, even if different
+/// content later turns up at that address, because a fetch by address has no
+/// content to compare against and refusing is the safe direction to be wrong in.
+/// Unblocking is the user's way to say the address is fine again.
+///
+/// Not cleared by `av purge --all`, for the same reason `blocks` is not: this is
+/// policy, not cache. `av unblock` removes the rows alongside the block.
+pub const MIGRATION_007_BLOCKED_LOCATIONS: &str = "
+CREATE TABLE IF NOT EXISTS blocked_locations (
+    resource_id TEXT NOT NULL,
+    location    TEXT NOT NULL,
+    PRIMARY KEY (resource_id, location)
+);
+CREATE INDEX IF NOT EXISTS idx_blocked_locations_location ON blocked_locations(location);
+";
+
 /// Every migration, in the order they must be applied.
 ///
 /// Single source of truth: `db::migrate` walks this, and the on-disk test counts
@@ -203,4 +246,5 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("004_canonical_scheme", MIGRATION_004_CANONICAL_SCHEME),
     ("005_blocks", MIGRATION_005_BLOCKS),
     ("006_name_origin", MIGRATION_006_NAME_ORIGIN),
+    ("007_blocked_locations", MIGRATION_007_BLOCKED_LOCATIONS),
 ];
