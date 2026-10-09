@@ -76,6 +76,10 @@ impl TestServer {
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_STATE_HOME", dir.join("state"))
             .env("HOME", dir.join("home"))
+            // The UI starts x0x on boot; a test run must not spawn the
+            // developer's real daemon. `ensure_services` respects this and
+            // returns without touching the network.
+            .env("ANTA_VISTA_NO_AUTOSTART", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -532,9 +536,13 @@ fn deps_include_literal_install_commands() {
     // The dialog shows these verbatim, so they must be real, non-empty commands.
     assert!(!x0x.trim().is_empty());
     assert!(!ant.trim().is_empty());
+    // The banner is install-only, so `needs_install` tracks the binary, not
+    // whether a daemon is running. The test host may or may not have x0x, so
+    // assert the relationship rather than a host-dependent value.
     assert_eq!(
-        s["needs_setup"], true,
-        "no x0x in tests, so setup is needed"
+        s["needs_install"],
+        !deps["x0x_installed"].as_bool().unwrap_or(false),
+        "needs_install must follow the x0x binary being absent, not the daemon being down"
     );
 }
 
@@ -1562,6 +1570,122 @@ fn listener_stop_is_safe_when_idle() {
     let body = res.json();
     assert_eq!(body["ok"], true);
     assert!(body["count"].is_number());
+}
+
+#[test]
+fn ensure_services_reports_the_services_it_looked_at() {
+    // The harness disables automatic startup, so this must not touch the
+    // network; it should still report the shape the drawer and search read.
+    let res = server().post("/api/services/ensure", "{}");
+    assert_eq!(res.status, 200);
+    let body = res.json();
+    for key in [
+        "ok",
+        "x0x_running",
+        "x0x_started",
+        "listener_running",
+        "listener_started",
+        "detail",
+    ] {
+        assert!(
+            body.get(key).is_some(),
+            "ensure response is missing {key}: {body}"
+        );
+    }
+    assert_eq!(body["x0x_started"], false, "autostart is disabled in tests");
+    assert_eq!(
+        body["listener_started"], false,
+        "autostart is disabled in tests"
+    );
+}
+
+#[test]
+fn stopping_x0x_is_safe_when_it_is_not_running() {
+    // Never stop the developer's own daemon from a test.
+    let running = server().get("/api/deps").json()["deps"]["x0x_running"]
+        .as_bool()
+        .unwrap_or(false);
+    if running {
+        return;
+    }
+    let res = server().post("/api/deps/x0x/stop", "{}");
+    assert_eq!(res.status, 200);
+    let body = res.json();
+    assert_eq!(
+        body["ok"], true,
+        "stopping an absent daemon is a no-op success: {body}"
+    );
+    assert_eq!(body["running"], false);
+}
+
+#[test]
+fn the_drawer_has_start_and_stop_for_both_services() {
+    // Per-service controls, because Stop is momentary and the user needs to be
+    // able to bring each one back without a whole `av web` restart.
+    let body = server().get("/").body;
+    for id in ["x0x-start", "x0x-stop", "listener-start", "listener-stop"] {
+        assert!(
+            body.contains(&format!("id=\"{id}\"")),
+            "the status drawer should offer {id}: {body}"
+        );
+    }
+    assert!(
+        !body.contains("id=\"stop-listener\""),
+        "the lone stop-listener button was replaced by per-service controls"
+    );
+}
+
+#[test]
+fn the_setup_banner_is_for_installs_only() {
+    // A service that is merely stopped is started automatically, so the banner
+    // must key on a missing binary and never on a daemon being down.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let start = js
+        .find("async function refreshDeps(")
+        .expect("refreshDeps should still exist");
+    let end = js
+        .find("async function ensureServices(")
+        .expect("ensureServices should exist");
+    let deps = &js[start..end];
+    assert!(
+        deps.contains("data.needs_install"),
+        "the banner must key on the binary being absent: {deps}"
+    );
+    assert!(
+        !deps.contains("x0x_running"),
+        "a stopped daemon must not re-raise the banner: {deps}"
+    );
+    assert!(
+        !deps.contains("av_listener_running"),
+        "a stopped listener must not re-raise the banner: {deps}"
+    );
+    assert!(
+        !deps.contains("toast("),
+        "the removed start branch also removed the undefined toast() calls: {deps}"
+    );
+}
+
+#[test]
+fn search_and_index_ensure_the_services_first() {
+    let js = js_code(&server().get("/assets/app.js").body);
+    assert!(
+        js.contains("/api/services/ensure"),
+        "the page must call the ensure endpoint"
+    );
+    let search = js
+        .find("ui.form.addEventListener('submit'")
+        .expect("search handler");
+    let add = js
+        .find("ui.addForm.addEventListener('submit'")
+        .expect("add handler");
+    assert!(
+        js[search..add].contains("await ensureServices("),
+        "search must bring the services up before it queries the network"
+    );
+    assert!(
+        js[add..].contains("await ensureServices("),
+        "index must bring the services up before it queries the network"
+    );
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use av_embed::MiniLmProvider;
@@ -7,7 +7,7 @@ use av_net_x0x::X0xConfig;
 use rusqlite::Connection;
 
 use crate::Cli;
-use crate::startup::{StartupState, ping_antd, ping_x0x_daemon};
+use crate::startup::{ServiceReport, StartupState, ping_antd, ping_x0x_daemon};
 
 /// Lazily-loaded embedding model, shared by every worker thread.
 ///
@@ -64,6 +64,10 @@ pub struct AppState {
     pub bound_port: u16,
     pub bound_host: String,
     pub started_at: u64,
+    /// Serialises [`AppState::ensure_services`] so a boot-time start, a search
+    /// and a drawer click cannot all spawn `x0x start` at once. The loser waits,
+    /// then finds the services already up and returns immediately.
+    pub services_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -93,6 +97,18 @@ impl AppState {
             startup.x0x_config = x0x_config;
             startup.antd_running = antd_running;
         }
+    }
+
+    /// Bring x0x and the background listener up on demand, then refresh the
+    /// network snapshot so the very next search fans out.
+    ///
+    /// Serialised by `services_lock`: the first caller does the work, everyone
+    /// else waits and then finds the services already running.
+    pub fn ensure_services(&self) -> ServiceReport {
+        let _guard = self.services_lock.lock();
+        let report = crate::startup::ensure_services();
+        self.refresh_network_deps();
+        report
     }
 }
 

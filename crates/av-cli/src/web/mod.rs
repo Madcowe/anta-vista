@@ -6,7 +6,7 @@
 //! keeping with the rest of the workspace — there is no async runtime.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cmd::{CliError, CliResult};
 use crate::startup::StartupState;
@@ -101,6 +101,7 @@ pub fn run(
         bound_port,
         bound_host: host.to_string(),
         started_at: state::now_secs(),
+        services_lock: Mutex::new(()),
     });
 
     println!("anta-vista web interface: {url}");
@@ -115,6 +116,15 @@ pub fn run(
     if options.open_browser {
         open_browser(&url);
     }
+
+    // Bring the network services up in the background: binding must not wait on
+    // an ~8s x0x start, and opening the UI should be enough to become a peer.
+    // This never installs anything; a missing x0x just leaves the banner up.
+    let boot_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let report = boot_state.ensure_services();
+        tracing::debug!("boot service ensure: {}", report.detail);
+    });
 
     // `server` is moved into the worker pool; from here on the process blocks.
     server::serve(state, server, options.run_for)

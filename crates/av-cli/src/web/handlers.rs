@@ -154,8 +154,10 @@ pub fn deps(_state: &Arc<AppState>) -> WebResponse {
         json!({
             "ok": true,
             "deps": deps,
-            // True when the network features are unavailable.
-            "needs_setup": !deps.x0x_running || !deps.av_listener_running,
+            // The banner is for *installs only*: a service that is merely
+            // stopped is started automatically (boot, search/index, or the
+            // drawer), so it never needs a banner. Only a missing binary does.
+            "needs_install": !deps.x0x_installed,
         })
         .to_string(),
     )
@@ -1041,6 +1043,47 @@ pub fn start_x0x(state: &Arc<AppState>) -> WebResponse {
                 "x0x daemon started."
             } else {
                 "Could not start the x0x daemon. Install it first, then try again."
+            },
+        })
+        .to_string(),
+    )
+}
+
+/// `POST /api/services/ensure` — start x0x and the listener on demand.
+///
+/// Blocking: it returns only once the services are up (or known not to be
+/// startable), so a search that called it can fan out on its next line. Safe to
+/// call when everything is already running.
+pub fn ensure_services(state: &Arc<AppState>) -> WebResponse {
+    let report = state.ensure_services();
+    json_response(
+        json!({
+            "ok": report.x0x_running,
+            "x0x_running": report.x0x_running,
+            "x0x_started": report.x0x_started,
+            "listener_running": report.listener_running,
+            "listener_started": report.listener_started,
+            "detail": report.detail,
+        })
+        .to_string(),
+    )
+}
+
+/// `POST /api/deps/x0x/stop` — stop the default x0x daemon.
+///
+/// Momentary by design: the next search/index will start it again.
+pub fn stop_x0x(state: &Arc<AppState>) -> WebResponse {
+    let stopped = crate::startup::stop_x0x_daemon();
+    state.refresh_network_deps();
+    json_response(
+        json!({
+            "ok": stopped,
+            "dependency": "x0x",
+            "running": !stopped,
+            "detail": if stopped {
+                "x0x daemon stopped."
+            } else {
+                "Could not stop the x0x daemon."
             },
         })
         .to_string(),

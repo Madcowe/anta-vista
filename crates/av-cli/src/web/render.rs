@@ -105,8 +105,19 @@ const PAGE: &str = r##"<!doctype html>
     <button type="button" id="close-status" class="btn btn-quiet" aria-label="Close status">&times;</button>
   </div>
   <div id="status-body" class="drawer-body"></div>
+  <!-- Service control. Stop is momentary: the next search or index starts the
+       service again, which is why this is a pair of buttons and not a setting. -->
   <div class="drawer-foot">
-    <button type="button" id="stop-listener" class="btn btn-quiet">Stop background listener</button>
+    <div class="service-row" role="group" aria-label="x0x daemon">
+      <span class="service-name">x0x</span>
+      <button type="button" id="x0x-start" class="btn btn-quiet">Start</button>
+      <button type="button" id="x0x-stop" class="btn btn-quiet">Stop</button>
+    </div>
+    <div class="service-row" role="group" aria-label="Background listener">
+      <span class="service-name">Listener</span>
+      <button type="button" id="listener-start" class="btn btn-quiet">Start</button>
+      <button type="button" id="listener-stop" class="btn btn-quiet">Stop</button>
+    </div>
   </div>
 </aside>
 

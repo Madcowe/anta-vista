@@ -565,6 +565,144 @@ fn enforce_dependencies(cli: &crate::Cli, state: &mut StartupState) -> CliResult
     Ok(())
 }
 
+/// Environment opt-out from automatic service startup.
+///
+/// Set to `1`/`true`/`yes` to make [`ensure_services`] a no-op. The web test
+/// harness sets it so no test spawns a real daemon, and it is a genuine escape
+/// hatch for anyone whose x0x is managed elsewhere.
+pub const NO_AUTOSTART_ENV: &str = "ANTA_VISTA_NO_AUTOSTART";
+
+pub fn autostart_disabled() -> bool {
+    matches!(
+        std::env::var(NO_AUTOSTART_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+/// Whether the default x0x daemon currently answers its health endpoint.
+pub fn x0x_running() -> bool {
+    X0xConfig::from_data_dir()
+        .ok()
+        .map(|cfg| ping_x0x_daemon(&cfg))
+        .unwrap_or(false)
+}
+
+/// What [`ensure_services`] found and what it had to start.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServiceReport {
+    pub x0x_running: bool,
+    pub x0x_started: bool,
+    pub listener_running: bool,
+    pub listener_started: bool,
+    /// Short human sentence for a UI toast or a log line.
+    pub detail: String,
+}
+
+/// Start x0x (when it is installed but not answering) and then the background
+/// listener, as one unit.
+///
+/// This is the web UI's on-demand start path: called on boot, before every
+/// search/index, and from the drawer's Start buttons. It is blocking by design —
+/// the caller asked for the services to be up before it proceeds — but it only
+/// spends time when something is actually down; a running x0x costs one local
+/// health ping.
+///
+/// The listener is started only once x0x answers, because a listener with no
+/// x0x cannot reach anyone. That is the same gate `run_startup_checks` applies.
+pub fn ensure_services() -> ServiceReport {
+    if autostart_disabled() {
+        return ServiceReport {
+            x0x_running: x0x_running(),
+            x0x_started: false,
+            listener_running: crate::listener::is_running(),
+            listener_started: false,
+            detail: "automatic service startup is disabled".to_string(),
+        };
+    }
+
+    let x0x_was = x0x_running();
+    let x0x_started = if x0x_was {
+        false
+    } else if x0x_binary_available() {
+        start_x0x_daemon()
+    } else {
+        false
+    };
+    // Re-probe rather than trust the start helper's return value alone: x0x may
+    // have been started by someone else between the ping and our attempt.
+    let x0x_running = x0x_was || x0x_started || x0x_running();
+
+    let listener_was = crate::listener::is_running();
+    let listener_running = if x0x_running {
+        crate::listener::ensure_running()
+    } else {
+        listener_was
+    };
+    let listener_started = listener_running && !listener_was;
+
+    let mut parts = Vec::new();
+    if x0x_started {
+        parts.push("started x0x");
+    }
+    if listener_started {
+        parts.push("started the background listener");
+    }
+    let detail = if !parts.is_empty() {
+        parts.join("; ")
+    } else if x0x_running {
+        "network services already running".to_string()
+    } else {
+        "x0x is not installed or could not be started".to_string()
+    };
+
+    ServiceReport {
+        x0x_running,
+        x0x_started,
+        listener_running,
+        listener_started,
+        detail,
+    }
+}
+
+/// Stop the default x0x daemon, then wait briefly for it to stop answering.
+///
+/// Returns `true` once the daemon is not running (including when it already
+/// was). The UI's Stop button is deliberately momentary — the next search or
+/// index will start it again — so this only has to bring the process down, not
+/// remember the decision.
+pub fn stop_x0x_daemon() -> bool {
+    if !x0x_running() {
+        return true;
+    }
+
+    let run_stop = |bin: &str| -> bool {
+        matches!(
+            std::process::Command::new(bin).arg("stop").status(),
+            Ok(s) if s.success()
+        )
+    };
+
+    let invoked = run_stop("x0x")
+        || directories::BaseDirs::new()
+            .map(|d| d.home_dir().join(".local/bin/x0x"))
+            .filter(|p| p.exists())
+            .map(|p| run_stop(p.to_str().unwrap_or("x0x")))
+            .unwrap_or(false);
+    if !invoked {
+        return !x0x_running();
+    }
+
+    // `x0x stop` can acknowledge before the daemon has finished exiting.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if !x0x_running() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    !x0x_running()
+}
+
 pub fn start_x0x_daemon() -> bool {
     let retry_until = std::time::Instant::now() + Duration::from_secs(8);
 

@@ -242,6 +242,8 @@ fn route(
                         "/api/listener/stop" => handlers::listener_stop(state),
                         "/api/listener/start" => handlers::listener_start(state),
                         "/api/deps/x0x/start" => handlers::start_x0x(state),
+                        "/api/deps/x0x/stop" => handlers::stop_x0x(state),
+                        "/api/services/ensure" => handlers::ensure_services(state),
                         "/api/deps/antd/start" => handlers::start_antd(state),
                         "/api/deps/x0x/install" => handlers::install_x0x(state),
                         "/api/deps/ant/install" => handlers::install_ant(state),

@@ -37,7 +37,10 @@ const ui = {
   statusDrawer: el('status-drawer'),
   statusBody: el('status-body'),
   closeStatus: el('close-status'),
-  stopListener: el('stop-listener'),
+  x0xStart: el('x0x-start'),
+  x0xStop: el('x0x-stop'),
+  listenerStart: el('listener-start'),
+  listenerStop: el('listener-stop'),
   overlay: el('overlay'),
   banner: el('setup-banner'),
   form: el('search-form'),
@@ -996,6 +999,8 @@ ui.form.addEventListener('submit', async (event) => {
   ui.resultsSection.hidden = false;
   ui.resultsEmpty.hidden = true;
   setCount('Searching\u2026');
+  await ensureServices(() => setCount('Starting x0x\u2026'));
+  setCount('Searching\u2026');
 
   try {
     const data = await api(
@@ -1592,6 +1597,8 @@ ui.addForm.addEventListener('submit', async (event) => {
   const tags = el('tags').value.trim();
   ui.addStatus.hidden = false;
 
+  await ensureServices(() => setStatus(ui.addStatus, 'Starting x0x\u2026', ''));
+
   /* Two routes, in order of preference: the browser fetches when the location is
    * an Autonomi address and this browser can do it, and the local daemon does
    * everything else. The status line names the route that ran, because "indexed"
@@ -1797,25 +1804,45 @@ function statusList(s) {
   return dl;
 }
 
-ui.stopListener.addEventListener('click', async () => {
-  ui.stopListener.disabled = true;
+/* One control routine for the four service buttons. Stop is momentary — the
+ * next search/index brings the service back — so neither button is a setting. */
+async function runService(button, endpoint, verb, doneText) {
+  button.disabled = true;
   try {
-    const data = await postJSON('/api/listener/stop', {});
-    const n = data.count;
+    const data = await postJSON(endpoint, {});
+    const ok = data.ok !== false;
     setStatus(
       ui.statusBody,
-      n ? `Stopped ${n} listener process${n === 1 ? '' : 'es'}.` : 'No listener was running.',
-      'ok'
+      ok ? data.detail || doneText : data.detail || `Could not ${verb}.`,
+      ok ? 'ok' : 'bad'
     );
-    refreshStatus();
+    await refreshStatus();
+    await refreshDeps();
   } catch (err) {
-    ui.statusBody.textContent = `Could not stop the listener: ${err.message}`;
+    setStatus(ui.statusBody, `Could not ${verb}: ${err.message}`, 'bad');
   } finally {
-    ui.stopListener.disabled = false;
+    button.disabled = false;
   }
-});
+}
+
+ui.x0xStart.addEventListener('click', () =>
+  runService(ui.x0xStart, '/api/services/ensure', 'start x0x', 'x0x is running.')
+);
+ui.x0xStop.addEventListener('click', () =>
+  runService(ui.x0xStop, '/api/deps/x0x/stop', 'stop x0x', 'x0x stopped.')
+);
+ui.listenerStart.addEventListener('click', () =>
+  runService(ui.listenerStart, '/api/listener/start', 'start the listener', 'Listener is running.')
+);
+ui.listenerStop.addEventListener('click', () =>
+  runService(ui.listenerStop, '/api/listener/stop', 'stop the listener', 'Listener stopped.')
+);
 
 /* ---------------------------------------------------------- setup banner -- */
+
+/* The most recent /api/deps payload. `ensureServices` reads it to decide
+ * whether a start is needed without a round-trip on the happy path. */
+let lastDeps = null;
 
 async function refreshDeps() {
   let data;
@@ -1825,82 +1852,56 @@ async function refreshDeps() {
     return;
   }
   const d = data.deps || {};
+  lastDeps = d;
 
-  const missing = [];
-  if (!d.x0x_running) {
-    missing.push({
-      key: 'x0x',
-      label: d.x0x_installed ? 'Start x0x' : 'Install x0x',
-      start: d.x0x_installed,
-      endpoint: '/api/deps/x0x/start',
-      command: d.x0x_install_cmd,
-      title: 'x0x daemon',
-      blurb: d.x0x_installed
-        ? 'The x0x binary is installed but the daemon is not answering. Start it to search the network.'
-        : 'x0x provides the gossip network Anta-Vista uses to find and share resources.',
-    });
-  }
-  if (!d.av_listener_running) {
-    missing.push({
-      key: 'listener',
-      label: 'Start background listener',
-      start: true,
-      endpoint: '/api/listener/start',
-      command: null,
-      title: 'Background listener',
-      blurb:
-        'The listener answers queries from other agents, so the resources you rate become visible to the network.',
-    });
-  }
-
+  /* Install-only. A service that is merely stopped is started automatically —
+   * at boot, before every search/index, or from the drawer — so a crash or a
+   * manual Stop must not re-raise the banner on the next 15s poll. */
   ui.banner.replaceChildren();
-  if (missing.length === 0) {
+  if (!data.needs_install) {
     ui.banner.hidden = true;
     return;
   }
 
   const text = document.createElement('span');
-  text.textContent =
-    missing.length === 1
-      ? `Setup needed: ${missing[0].title}.`
-      : `Setup needed: ${missing.map((m) => m.title).join(' and ')}.`;
+  text.textContent = 'Setup needed: x0x daemon.';
   ui.banner.append(text);
 
-  for (const m of missing) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'btn';
-    button.textContent = m.label;
-    button.addEventListener('click', () => {
-      /* An installed-but-stopped dependency is started, not reinstalled. Only
-       * offer the installer when the binary is genuinely missing, so that the
-       * user always sees the least destructive action that can work. */
-      if (m.start) {
-        button.disabled = true;
-        button.textContent = 'Starting\u2026';
-        postJSON(m.endpoint, {})
-          .then((res) => {
-            if (res && res.ok === false) {
-              button.disabled = false;
-              button.textContent = m.label;
-              toast(res.detail || 'Could not start ' + m.title + '.', 'err');
-              return;
-            }
-            toast((res && res.detail) || m.title + ' is running.');
-            setTimeout(refreshDeps, 1200);
-          })
-          .catch((err) => {
-            button.disabled = false;
-            button.textContent = m.label;
-            toast(err.message, 'err');
-          });
-        return;
-      }
-      openInstall(m.key, m.title, m.blurb, m.command);
-    });
-    ui.banner.append(button);
-  }
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn';
+  button.textContent = 'Install x0x';
+  button.addEventListener('click', () =>
+    openInstall(
+      'x0x',
+      'x0x daemon',
+      'x0x provides the gossip network Anta-Vista uses to find and share resources.',
+      d.x0x_install_cmd
+    )
+  );
+  ui.banner.append(button);
   ui.banner.hidden = false;
+}
+
+/* Make sure the network services are up before a request that needs them.
+ *
+ * The cached deps say whether x0x is down; if so we say "Starting x0x…" in the
+ * caller's status line and wait for the server to bring it up, so a search does
+ * not look frozen for the ~8s a cold start takes. A service that died seconds
+ * ago (the cache is up to 15s stale) is restarted with no message, which is
+ * fine: this is a start, not a health check. */
+async function ensureServices(show) {
+  if (lastDeps && lastDeps.x0x_running) return;
+  if (lastDeps && show) show();
+  try {
+    const res = await postJSON('/api/services/ensure', {});
+    lastDeps = Object.assign({}, lastDeps, {
+      x0x_running: res.x0x_running,
+      av_listener_running: res.listener_running,
+    });
+  } catch (err) {
+    /* Best effort: the request that follows reports the real failure. */
+  }
 }
 
 /* ------------------------------------------------------ install dialog -- */
