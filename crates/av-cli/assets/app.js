@@ -1027,9 +1027,40 @@ function wireFetch(node, result, statusEl) {
 
 /* --------------------------------------------------------------- search -- */
 
-/* Run one search. Shared by the form's submit and the "Autonomi only"
- * toggle's re-run, so the epoch bump and the results-area reset cannot
- * drift between the two entry points. */
+/* The scheme of a location, derived the way the server derives it
+ * (`analyze_location`): a bare 64-hex address is autonomi, `ant://` is the
+ * old spelling of `autonomi://`, an `X://` location carries X, and anything
+ * else is undecidable — which the filter treats as "not autonomi", failing
+ * closed like the server does. */
+function locationScheme(location) {
+  const loc = location || '';
+  if (!loc.includes('://')) {
+    const head = loc.split(/[/?#]/)[0];
+    if (/^[0-9a-fA-F]{64}$/.test(head)) return 'autonomi';
+    return null;
+  }
+  const scheme = loc.slice(0, loc.indexOf('://')).toLowerCase();
+  return scheme === 'ant' ? 'autonomi' : scheme;
+}
+
+/* Show or hide result rows to match the "Autonomi only" checkbox, without
+ * asking the server. The rows already carry their locations, and a fresh
+ * search sends `scheme=autonomi` anyway — this exists so flipping the
+ * toggle does not cost a full re-query to repaint the same rows.
+ *
+ * The "just indexed" row is exempt: it reports an action the user just took,
+ * not a search result, and hiding it because of a search filter would read
+ * as the index having failed. */
+function applySchemeFilter() {
+  const only = ui.autonomiOnly.checked;
+  for (const row of ui.results.children) {
+    if (row.dataset.fromIndex) continue;
+    row.hidden = only && locationScheme(row.dataset.location) !== 'autonomi';
+  }
+}
+
+/* Run one search. Shared by the form's submit, so the epoch bump and the
+ * results-area reset cannot drift between entry points. */
 async function runSearch(query) {
   lastQuery = query;
   resultsEpoch += 1;
@@ -1074,14 +1105,27 @@ ui.form.addEventListener('submit', (event) => {
 /* Restore the saved filter before the first search. */
 ui.autonomiOnly.checked = schemeOnly();
 
-/* Flipping the toggle re-runs the query already on screen, so the results
- * never contradict the control. With no query yet it just takes effect on
- * the next search. */
+/* Flipping the toggle filters the rows already on screen — no re-query: the
+ * rows carry their locations, so the answer is computable here, and a re-query
+ * would also lose rows the user has since removed. When the last search ran
+ * with the filter *on*, the server never sent the http results, so unchecking
+ * reveals only what is on screen; the next search fetches the wider set. With
+ * no results showing the filter just takes effect on the next search. */
 ui.autonomiOnly.addEventListener('change', () => {
   setSchemeOnly(ui.autonomiOnly.checked);
-  if (lastQuery && !ui.resultsSection.hidden) {
-    runSearch(lastQuery);
-  }
+  /* Only when there are rows to filter: during an in-flight search the list
+   * is empty and the count says "Searching…", which a recount would clobber
+   * with "Nothing left". The arriving rows apply the checkbox themselves
+   * (see renderResults). */
+  if (ui.results.children.length === 0) return;
+  applySchemeFilter();
+  /* The "just indexed" row keeps its own count ("Just indexed — 1 item");
+   * it is not one of lastQuery's results, so recounting it would put a
+   * search phrasing under a row that says it is not a search result. */
+  const indexedRow = Array.from(ui.results.children).some(
+    (row) => row.dataset.fromIndex
+  );
+  if (!indexedRow) recountResults();
 });
 
 function setCount(text) {
@@ -1098,15 +1142,24 @@ function setResultsNote(message, tone) {
   ui.resultsNote.dataset.tone = tone || '';
 }
 
-/* Recount what is left on the page after rows have been taken off it. */
+/* Recount what is left on the page after rows have been taken off it or
+ * hidden by the scheme filter. Hidden rows are still children, so this counts
+ * the *visible* ones — the count has to match what the user can see. */
 function recountResults() {
-  const left = ui.results.children.length;
+  const rows = Array.from(ui.results.children);
+  const left = rows.filter((row) => !row.hidden).length;
   ui.resultsEmpty.hidden = left > 0;
-  setCount(
-    left === 0
-      ? `Nothing left for \u201c${lastQuery}\u201d`
-      : `${left} result${left === 1 ? '' : 's'} for \u201c${lastQuery}\u201d`
-  );
+  if (left === 0) {
+    /* "Nothing left" implies the user removed the rows; if they are merely
+     * filtered out, none of them *match* — a different sentence. */
+    setCount(
+      rows.length > 0
+        ? `No results for \u201c${lastQuery}\u201d`
+        : `Nothing left for \u201c${lastQuery}\u201d`
+    );
+    return;
+  }
+  setCount(`${left} result${left === 1 ? '' : 's'} for \u201c${lastQuery}\u201d`);
 }
 
 /* Take a result off the page and keep the count honest, without re-running the
@@ -1151,11 +1204,15 @@ function renderResults(results) {
     setCount(`No results for \u201c${lastQuery}\u201d`);
     return;
   }
-  setCount(`${results.length} result${results.length === 1 ? '' : 's'} for \u201c${lastQuery}\u201d`);
 
   for (const result of results) {
     ui.results.appendChild(renderResult(result));
   }
+  /* Applied here, not only on toggle: the request carries the checkbox state
+   * at submit time, so a toggle flipped while the search was in flight
+   * arrives to rows fetched under the old state. */
+  applySchemeFilter();
+  recountResults();
 }
 
 function renderResult(result) {
@@ -1169,8 +1226,11 @@ function renderResult(result) {
 
   /* On the row as well as the badge, so a later action can decide what this
    * result is without re-reading the badge, and so `dropResultsFromAgent` can
-   * tell a network row from a local one. */
+   * tell a network row from a local one. The location rides along for the
+   * same reason: `applySchemeFilter` decides a row's fate from it without
+   * re-parsing the rendered heading. */
   node.dataset.source = source;
+  node.dataset.location = result.location || '';
   node.dataset.agentIds = (Array.isArray(result.agent_ids) ? result.agent_ids : [])
     .filter(Boolean)
     .join(',');
@@ -1703,15 +1763,19 @@ function renderIndexedResult(outcome) {
   ui.resultsSection.hidden = false;
   ui.resultsEmpty.hidden = true;
   setResultsNote('', '');
-  ui.results.replaceChildren(
-    renderResult({
-      source: 'local',
-      resource_id: outcome.resource_id,
-      location: outcome.location,
-      mime_type: outcome.mime_type,
-      description: outcome.description,
-    })
-  );
+  const row = renderResult({
+    source: 'local',
+    resource_id: outcome.resource_id,
+    location: outcome.location,
+    mime_type: outcome.mime_type,
+    description: outcome.description,
+  });
+  /* Not a search result: the user just asked for this row to exist, so the
+   * "Autonomi only" filter must not take it away again (an http index with
+   * the filter on would otherwise show an empty screen). `applySchemeFilter`
+   * skips rows carrying this marker. */
+  row.dataset.fromIndex = '1';
+  ui.results.replaceChildren(row);
   setCount('Just indexed \u2014 1 item');
   setResultsNote('This is the resource you just indexed, not a search result.');
 }

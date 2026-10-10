@@ -1046,6 +1046,60 @@ fn the_search_form_offers_the_autonomi_only_filter() {
 }
 
 #[test]
+fn flipping_the_autonomi_toggle_filters_the_shown_rows_without_a_new_search() {
+    // A re-query to repaint the same rows is slow and second-chances removed
+    // results: the rows already carry their locations, so the decision is
+    // computable in the page. The fresh-search path still sends
+    // `scheme=autonomi`; only the toggle changed.
+    let js = js_code(&server().get("/assets/app.js").body);
+
+    // The change handler filters in place; it must not call runSearch.
+    let change = js
+        .find("ui.autonomiOnly.addEventListener('change'")
+        .expect("the toggle must have a change handler");
+    let change_end = js[change..]
+        .find("function setCount(")
+        .map(|i| change + i)
+        .expect("setCount follows the handler");
+    let handler = &js[change..change_end];
+    assert!(
+        handler.contains("applySchemeFilter()"),
+        "the toggle must filter the rows in place: {handler}"
+    );
+    assert!(
+        !handler.contains("runSearch("),
+        "flipping the toggle must not re-query the network: {handler}"
+    );
+
+    // Rows carry the location the filter decides on.
+    assert!(
+        js.contains("node.dataset.location = result.location"),
+        "result rows must carry their location for the filter"
+    );
+
+    // The scheme is derived the way the server derives it, and an undecidable
+    // one fails closed.
+    assert!(
+        js.contains("scheme === 'ant' ? 'autonomi' : scheme"),
+        "the client must normalise the ant alias like the server"
+    );
+
+    // The "just indexed" row is feedback, not a search result: the filter
+    // spares it, or indexing an http link with the filter on would show an
+    // empty screen.
+    assert!(
+        js.contains("if (row.dataset.fromIndex) continue;"),
+        "the filter must not hide the just-indexed row"
+    );
+
+    // The count follows the visible rows, not the DOM children.
+    assert!(
+        js.contains(".filter((row) => !row.hidden).length"),
+        "the result count must count visible rows"
+    );
+}
+
+#[test]
 fn an_octet_stream_typed_record_is_served_inline_when_its_bytes_say_otherwise() {
     // The server half of the fix. The viewer already sniffed full bytes, so this
     // did not change; it is pinned because the *client* used to decide against
