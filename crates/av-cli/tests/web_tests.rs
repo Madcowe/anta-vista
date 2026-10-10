@@ -1689,6 +1689,233 @@ fn search_and_index_ensure_the_services_first() {
 }
 
 #[test]
+fn the_index_dialog_is_the_only_index_output() {
+    // The one-line `#add-status` paragraph was too easy to miss; the dialog is
+    // the sole output now, so nothing else may still write status text.
+    let body = server().get("/").body;
+    assert!(
+        body.contains(r#"id="index-progress-dialog""#),
+        "the index dialog must exist: {body}"
+    );
+    assert!(
+        !body.contains("add-status"),
+        "the old status line is gone from the markup"
+    );
+    let js = js_code(&server().get("/assets/app.js").body);
+    assert!(
+        !js.contains("addStatus"),
+        "app.js must not keep writing to the removed status line"
+    );
+}
+
+#[test]
+fn byte_progress_replaces_one_line_and_stages_append() {
+    // The SDK reports many times a second; appending every event would fill the
+    // log and push the stages above it out of view.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let helpers = js
+        .find("function setIndexProgressLive")
+        .expect("setIndexProgressLive helper");
+    let after = js[helpers..]
+        .find("\nfunction ")
+        .unwrap_or(js.len() - helpers);
+    let body = &js[helpers..helpers + after];
+    // The live helper pops the previous line rather than growing the log.
+    assert!(
+        body.contains("lines.pop()"),
+        "byte progress must replace the previous line, not append: {body}"
+    );
+    // The buffer always ends with '\n', so `split` leaves a trailing '' — pop it
+    // *before* popping the live line, or each update is glued onto the last one
+    // and the log reads "Fetching…Fetching…Fetching…".
+    assert!(
+        body.contains("if (lines[lines.length - 1] === '') lines.pop();"),
+        "the trailing newline must be dropped before the live line: {body}"
+    );
+    assert!(
+        body.contains("lines.join('\\n') + '\\n'"),
+        "the rebuilt buffer must end with exactly one newline: {body}"
+    );
+    // A stage line goes in on top and marks the next update as a new append.
+    assert!(
+        js.contains("function indexProgressLine"),
+        "stage lines still append"
+    );
+}
+
+#[test]
+fn showModal_is_guarded_so_a_dialog_cannot_be_opened_twice() {
+    // showModal() on an already-open dialog throws InvalidStateError, which is
+    // how the browser route broke when the submit handler also opened it.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let opens = js.matches("ui.indexProgress.showModal()").count();
+    assert_eq!(opens, 1, "exactly one showModal call site");
+    assert!(
+        js.contains("if (!ui.indexProgress.open) ui.indexProgress.showModal()"),
+        "that single call site must be guarded by the open state"
+    );
+}
+
+#[test]
+fn closing_the_index_dialog_shows_the_indexed_resource() {
+    let js = js_code(&server().get("/assets/app.js").body);
+    assert!(
+        js.contains("ui.indexProgress.addEventListener('close', flushPendingIndex)"),
+        "the dialog's close event must reveal the indexed row"
+    );
+    let render = js
+        .find("function renderIndexedResult")
+        .expect("renderIndexedResult");
+    let after = js[render..]
+        .find("\nfunction ")
+        .unwrap_or(js.len() - render);
+    let body = &js[render..render + after];
+    for needle in [
+        "ui.results.replaceChildren(",
+        "renderResult({",
+        "Just indexed",
+        "resource_id: outcome.resource_id",
+    ] {
+        assert!(
+            body.contains(needle),
+            "the indexed row must be built from the outcome: {body}"
+        );
+    }
+    // A fresh index has no score; the row hides the element rather than lying.
+    assert!(
+        js.contains("scoreEl.hidden = true"),
+        "an unscored row must hide its score element"
+    );
+}
+
+#[test]
+fn the_index_dialog_ends_on_a_short_line_naming_the_resource() {
+    // The description can be 800 characters of the document's own text, and the
+    // log is scrolled to the bottom — so the success line was a wall of text you
+    // had to scroll up from. The last line must be short and name the location.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let added = js
+        .find("data.embedding_dim} dimensions")
+        .expect("the added line should still report the embedding size");
+    let closing = js
+        .find("has been indexed.")
+        .expect("the dialog must end on a closing line");
+    let finish = js[added..]
+        .find("finishIndex(data)")
+        .map(|i| added + i)
+        .expect("finishIndex call");
+    assert!(
+        added < closing && closing < finish,
+        "the closing line must come after the added line and before the flush: added={added} closing={closing} finish={finish}"
+    );
+    let line = &js[closing - 60..closing + 20];
+    assert!(
+        line.contains("Resource: ${data.location}"),
+        "the closing line must name the location, not the description: {line}"
+    );
+    // A blank line separates it from the Added line above, so it does not read
+    // as the tail of that paragraph.
+    let blank = js[added..closing]
+        .find("indexProgressLine('')")
+        .expect("a blank line before the closing line");
+    assert!(
+        blank < closing - added,
+        "the blank line must sit between the added line and the closing line"
+    );
+}
+
+#[test]
+fn a_search_that_lands_during_an_index_keeps_its_results() {
+    // The index request can outlive its dialog (Esc-dismissed, or closed while
+    // a search is in flight); its late flush must not replace the search's
+    // results with the indexed row and a note claiming the screen shows it.
+    let js = js_code(&server().get("/assets/app.js").body);
+
+    // The search bumps the epoch on submit and again when it renders.
+    let search = js
+        .find("ui.form.addEventListener('submit'")
+        .expect("search handler");
+    let add = js
+        .find("ui.addForm.addEventListener('submit'")
+        .expect("add handler");
+    let search_body = &js[search..add];
+    assert!(
+        search_body.contains("resultsEpoch += 1"),
+        "a submitted search must take over the results epoch: {search_body}"
+    );
+    // The rows go away on submit, and the note is written *about* those rows —
+    // it must go with them, or "This is the resource you just indexed" sits
+    // under "Searching…" for the whole wait (renderResults only runs on resolve).
+    let note_at = search_body
+        .find("setResultsNote('', '')")
+        .expect("a fresh search must clear the results note on submit");
+    let count_at = search_body
+        .find("setCount('Searching")
+        .expect("the search must still announce itself");
+    assert!(
+        note_at < count_at,
+        "the stale note must be cleared before \u{201c}Searching\u{2026}\u{201d} appears"
+    );
+    let render = js.find("function renderResults(").expect("renderResults");
+    let render_end = js[render..]
+        .find("\nfunction ")
+        .map(|i| render + i)
+        .unwrap_or(js.len());
+    assert!(
+        js[render..render_end].contains("resultsEpoch += 1"),
+        "a rendered search must take over the results epoch"
+    );
+
+    // The index records the epoch it started under...
+    assert!(
+        js[add..].contains("indexEpoch = resultsEpoch"),
+        "the index must record which epoch it belongs to"
+    );
+    // ...and the flush only fires while that epoch still holds.
+    let flush = js
+        .find("function flushPendingIndex(")
+        .expect("flushPendingIndex");
+    let flush_end = js[flush..]
+        .find("\nfunction ")
+        .map(|i| flush + i)
+        .unwrap_or(js.len());
+    let flush_body = &js[flush..flush_end];
+    assert!(
+        flush_body.contains("if (resultsEpoch !== indexEpoch) return"),
+        "a late flush must yield the screen to the search: {flush_body}"
+    );
+    assert!(
+        flush_body.contains("renderIndexedResult(outcome)"),
+        "the uncontested flush still renders the row: {flush_body}"
+    );
+}
+
+#[test]
+fn the_retro_progress_terminal_is_theme_scoped() {
+    // retro.css loads after modern.css, so an unscoped rule there would win in
+    // the modern theme too.
+    let css = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/retro.css"),
+    )
+    .expect("retro.css");
+    assert_eq!(
+        css_rule(&css, "[data-theme=\"retro\"] .progress-output").as_deref(),
+        Some(
+            "[data-theme=\"retro\"] .progress-output {\n  margin: 6px 0;\n  padding: 6px 8px;\n  \
+             background: #000;\n  color: #00ff00;\n  border: 2px inset #c0c0c0;\n  max-height: \
+             240px;\n  overflow-y: auto;\n  font-family: var(--mono, monospace);\n  font-size: \
+             11px;\n  white-space: pre-wrap;\n  word-break: break-word; }"
+        ),
+        "the retro terminal style must be scoped to the retro theme"
+    );
+    // And the unscoped selector must not exist — it would beat modern.css.
+    assert!(
+        css_rule(&css, ".progress-output").is_none(),
+        "retro.css must not carry an unscoped .progress-output rule"
+    );
+}
+
+#[test]
 fn api_responses_are_not_cacheable() {
     let res = server().get("/api/status");
     assert!(

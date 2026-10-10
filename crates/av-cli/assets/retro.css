@@ -193,8 +193,7 @@
 [data-theme="retro"] .rid,
 [data-theme="retro"] .mime,
 [data-theme="retro"] .score,
-[data-theme="retro"] .hint,
-[data-theme="retro"] .status-line {
+[data-theme="retro"] .hint {
   font-family: var(--mono);
   font-size: 13px;
 }
@@ -352,4 +351,21 @@
   gap: 8px;
   align-items: center;
   flex-wrap: wrap;
+}
+
+/* The index log is a terminal in both themes; retro gets the chunky inset
+   border. Scoped, because retro.css loads after modern.css and an unscoped
+   rule would win in the modern theme too. */
+[data-theme="retro"] .progress-output {
+  margin: 6px 0;
+  padding: 6px 8px;
+  background: #000;
+  color: #00ff00;
+  border: 2px inset #c0c0c0;
+  max-height: 240px;
+  overflow-y: auto;
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }

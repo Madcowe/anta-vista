@@ -51,7 +51,6 @@ const ui = {
   resultsEmpty: el('results-empty'),
   resultsNote: el('results-note'),
   addForm: el('add-form'),
-  addStatus: el('add-status'),
   template: el('result-template'),
   dialog: el('install-dialog'),
   dialogTitle: el('install-title'),
@@ -63,6 +62,9 @@ const ui = {
   blockDelete: el('block-dialog').querySelector('[data-role="block-delete"]'),
   blockTitle: el('block-title'),
   blockBlurb: el('block-blurb'),
+  indexProgress: el('index-progress-dialog'),
+  indexProgressBody: el('index-progress-body'),
+  indexProgressTitle: el('index-progress-title'),
   recommendDialog: el('recommend-dialog'),
   peerBlockDialog: el('peer-block-dialog'),
   peerBlockBlurb: el('peer-block-blurb'),
@@ -75,6 +77,16 @@ const ui = {
 /* The query the current results belong to. Ratings are boosted per exact
  * query, so this has to travel with the result. */
 let lastQuery = '';
+
+/* Bumped whenever a search outcome takes over the results area.
+ *
+ * An index runs concurrently with searching, and its dialog may be dismissed
+ * while the request is still in flight; `finishIndex` then flushes the row as
+ * soon as the request lands. Without a way to tell whose screen it is, that
+ * late flush replaces search results the user is reading with one row and the
+ * "not a search result" note. The pending row records the epoch it was started
+ * under and may only replace the screen while that epoch still holds. */
+let resultsEpoch = 0;
 
 /* ---------------------------------------------------------------- theme -- */
 
@@ -994,10 +1006,16 @@ ui.form.addEventListener('submit', async (event) => {
   const query = ui.q.value.trim();
   if (!query) return;
   lastQuery = query;
+  resultsEpoch += 1;
 
   ui.results.replaceChildren();
   ui.resultsSection.hidden = false;
   ui.resultsEmpty.hidden = true;
+  /* The note belongs to the rows it was written about — a fresh query takes
+   * those rows away, so the note goes with them. `renderResults` only runs
+   * when the search *resolves*, which left "This is the resource you just
+   * indexed" sitting under "Searching\u2026" for the whole wait. */
+  setResultsNote('', '');
   setCount('Searching\u2026');
   await ensureServices(() => setCount('Starting x0x\u2026'));
   setCount('Searching\u2026');
@@ -1009,6 +1027,7 @@ ui.form.addEventListener('submit', async (event) => {
     renderResults(data.results || []);
   } catch (err) {
     ui.results.replaceChildren();
+    setResultsNote('', '');
     ui.resultsEmpty.hidden = false;
     ui.resultsEmpty.textContent = `Search failed: ${err.message}`;
     setCount('');
@@ -1073,6 +1092,7 @@ function dropResultsFromAgent(agent) {
 }
 
 function renderResults(results) {
+  resultsEpoch += 1;
   ui.results.replaceChildren();
   ui.resultsEmpty.hidden = results.length > 0;
   setResultsNote('', '');
@@ -1161,14 +1181,20 @@ function renderResult(result) {
   pick('desc').textContent = detail && detail !== heading ? detail : '';
 
   const breakdown = result.score_breakdown;
-  const score = Number(result.score || 0);
   const scoreEl = pick('score');
-  scoreEl.textContent = `score ${score.toFixed(3)}`;
-  if (breakdown) {
-    /* Tooltip shows why the score is what it is, rather than a vague number. */
-    scoreEl.title = Object.entries(breakdown)
-      .map(([k, v]) => `${k}: ${Number(v).toFixed(3)}`)
-      .join('\n');
+  /* A just-indexed row carries no score and has never been ranked; showing
+   * "score 0.000" for it would be a lie, so the element goes instead. Search
+   * results always have a score, so they are unaffected. */
+  if (result.score == null) {
+    scoreEl.hidden = true;
+  } else {
+    scoreEl.textContent = `score ${Number(result.score).toFixed(3)}`;
+    if (breakdown) {
+      /* Tooltip shows why the score is what it is, rather than a vague number. */
+      scoreEl.title = Object.entries(breakdown)
+        .map(([k, v]) => `${k}: ${Number(v).toFixed(3)}`)
+        .join('\n');
+    }
   }
 
   pick('rid').textContent = `id ${(result.resource_id || '').slice(0, 16)}`;
@@ -1551,6 +1577,95 @@ class DaemonFallback extends Error {
   }
 }
 
+/* ------------------------------------------------------- index dialog -- */
+
+/* The index dialog is the only output of "Add a Link".
+ *
+ * Stages append a line; byte progress updates a *single* line in place, because
+ * the SDK reports many times a second and appending those would fill the log and
+ * push the stages out of it — the same reason the progress tab has a dedicated
+ * `#live` line. The dialog waits to be dismissed, so the sequence can actually
+ * be read, and closing it reveals the resource that was just indexed. */
+let indexLiveLine = false;
+let pendingIndexedResult = null;
+/* The `resultsEpoch` this index started under. The pending row may only take
+ * the screen while it still matches — see `resultsEpoch`. */
+let indexEpoch = 0;
+
+function openIndexProgress() {
+  indexLiveLine = false;
+  ui.indexProgressBody.textContent = '';
+  /* `showModal` on an already-open dialog throws `InvalidStateError`, so this
+   * is the one place it may be called. */
+  if (!ui.indexProgress.open) ui.indexProgress.showModal();
+}
+
+function indexProgressLine(text) {
+  ui.indexProgressBody.textContent += text + '\n';
+  indexLiveLine = false;
+  ui.indexProgressBody.scrollTop = ui.indexProgressBody.scrollHeight;
+}
+
+function setIndexProgressLive(text) {
+  /* The buffer always ends with '\n', so `split` leaves a trailing '' — drop it
+   * before touching lines, or the newline we re-append lands on top of it. The
+   * live line, when there is one, is the line before that empty tail. */
+  const lines = ui.indexProgressBody.textContent.split('\n');
+  if (lines[lines.length - 1] === '') lines.pop();
+  if (indexLiveLine) lines.pop();
+  lines.push(text);
+  ui.indexProgressBody.textContent = lines.join('\n') + '\n';
+  indexLiveLine = true;
+  ui.indexProgressBody.scrollTop = ui.indexProgressBody.scrollHeight;
+}
+
+/* Stash the outcome for the moment the dialog closes.
+ *
+ * The row is not rendered while the dialog is open — it is in the way — and
+ * dismissal is when the user is looking at the screen again. An early dismiss
+ * (Esc mid-fetch) still renders on completion: the result must not depend on
+ * the user's patience. */
+function finishIndex(outcome) {
+  pendingIndexedResult = outcome;
+  if (!ui.indexProgress.open) flushPendingIndex();
+}
+
+function flushPendingIndex() {
+  if (!pendingIndexedResult) return;
+  const outcome = pendingIndexedResult;
+  pendingIndexedResult = null;
+  /* A search outcome landed while this index was running: the results area is
+   * the search's now, and replacing it with one row plus a note claiming the
+   * screen shows the indexed resource would be false. The dialog already
+   * reported the index itself. */
+  if (resultsEpoch !== indexEpoch) return;
+  renderIndexedResult(outcome);
+}
+
+ui.indexProgress.addEventListener('close', flushPendingIndex);
+
+/* Replace the results list with the resource that was just indexed.
+ *
+ * A fresh index has no query behind it and no score, so the count line says
+ * what happened rather than inventing a search, and the row's score element is
+ * hidden by `renderResult` — "score 0.000" would be a lie. */
+function renderIndexedResult(outcome) {
+  ui.resultsSection.hidden = false;
+  ui.resultsEmpty.hidden = true;
+  setResultsNote('', '');
+  ui.results.replaceChildren(
+    renderResult({
+      source: 'local',
+      resource_id: outcome.resource_id,
+      location: outcome.location,
+      mime_type: outcome.mime_type,
+      description: outcome.description,
+    })
+  );
+  setCount('Just indexed \u2014 1 item');
+  setResultsNote('This is the resource you just indexed, not a search result.');
+}
+
 /* Index an Autonomi location using the browser as the fetcher.
  *
  * Returns null when the location is not an Autonomi address — that is a decline,
@@ -1563,16 +1678,17 @@ async function indexAutonomiInBrowser(uri, tags) {
   const cap = await autonomiCapability();
   if (!cap.available) throw new DaemonFallback(cap.reason);
 
-  setStatus(ui.addStatus, 'Looking for the nodes holding this file\u2026', '');
+  indexProgressLine('Looking for the nodes holding this file');
   let blob;
   try {
     ({ blob } = await fetchAutonomi(address, {
-      onProgress: (event) => setStatus(ui.addStatus, progressLine(event), ''),
+      onProgress: (event) => setIndexProgressLive(progressLine(event)),
     }));
   } catch (err) {
     /* The SDK's failures are worth trying the daemon on: a WebRTC path that
      * cannot form a data channel here may work fine through a local daemon, and
      * the daemon path is what worked before any of this existed. */
+    indexProgressLine('ERROR: ' + err.message);
     throw new DaemonFallback(`the browser could not fetch it (${err.message})`);
   }
 
@@ -1580,12 +1696,12 @@ async function indexAutonomiInBrowser(uri, tags) {
    * rather than truncating it, so the bytes are already here and the size is
    * known. Sending them anyway would waste the transfer to learn nothing. */
   if (blob.size > MAX_UPLOAD) {
-    throw new DaemonFallback(
-      `it is ${formatBytes(blob.size)}, and this page holds at most ${formatBytes(MAX_UPLOAD)}`
-    );
+    const msg = `it is ${formatBytes(blob.size)}, and this page holds at most ${formatBytes(MAX_UPLOAD)}`;
+    indexProgressLine('ERROR: ' + msg);
+    throw new DaemonFallback(msg);
   }
 
-  setStatus(ui.addStatus, 'Indexing\u2026', '');
+  indexProgressLine('Indexing\u2026');
   return postBlob('/api/index/bytes', uri, blob, tags ? { 'X-Anta-Tags': tags } : {});
 }
 
@@ -1595,17 +1711,27 @@ ui.addForm.addEventListener('submit', async (event) => {
   if (!uri) return;
 
   const tags = el('tags').value.trim();
-  ui.addStatus.hidden = false;
 
-  await ensureServices(() => setStatus(ui.addStatus, 'Starting x0x\u2026', ''));
+  /* Whose screen the results area is when this index finishes is decided here:
+   * any search submitted from now on takes it over (see `resultsEpoch`). */
+  indexEpoch = resultsEpoch;
+
+  /* Opened unconditionally, at the top: the daemon route never opens it itself,
+   * and opening it from two places throws when both fire. */
+  openIndexProgress();
+
+  await ensureServices(() => indexProgressLine('Starting x0x\u2026'));
 
   /* Two routes, in order of preference: the browser fetches when the location is
    * an Autonomi address and this browser can do it, and the local daemon does
-   * everything else. The status line names the route that ran, because "indexed"
+   * everything else. The dialog names the route that ran, because "indexed"
    * meaning two different transports would otherwise be invisible. */
   const routes = [
     { via: 'your browser', start: 'Fetching in your browser\u2026', run: () => indexAutonomiInBrowser(uri, tags) },
-    { via: 'the local daemon', start: 'Fetching and indexing\u2026', run: () => postJSON('/api/index', { uri, tags }) },
+    { via: 'the local daemon', start: 'Fetching and indexing\u2026', run: () => {
+      indexProgressLine('Fetching and indexing via the local daemon\u2026');
+      return postJSON('/api/index', { uri, tags });
+    }},
   ];
 
   let data = null;
@@ -1613,7 +1739,7 @@ ui.addForm.addEventListener('submit', async (event) => {
   let fellBack = null;
   try {
     for (const route of routes) {
-      setStatus(ui.addStatus, route.start, '');
+      indexProgressLine(route.start);
       try {
         const result = await route.run();
         if (result === null) continue;
@@ -1625,23 +1751,27 @@ ui.addForm.addEventListener('submit', async (event) => {
          * error is a real failure the user needs to see. */
         if (!(err instanceof DaemonFallback)) throw err;
         fellBack = err.message;
-        setStatus(ui.addStatus, `Using the local daemon: ${fellBack}.`, '');
+        indexProgressLine(`Using the local daemon: ${fellBack}.`);
       }
     }
     if (data === null) throw new Error('no route could index that location');
 
     if (data.duplicate) {
-      setStatus(
-        ui.addStatus,
-        `Already indexed (same ${data.duplicate_by === 'content' ? 'content' : 'URL'}). Use force to re-index.`,
-        'warn'
+      indexProgressLine(
+        `Already indexed (same ${data.duplicate_by === 'content' ? 'content' : 'URL'}). Use force to re-index.`
       );
     } else {
-      setStatus(
-        ui.addStatus,
-        `Added \u201c${data.description || data.location}\u201d (${data.embedding_dim} dimensions) via ${usedVia}.`,
-        'ok'
+      indexProgressLine(
+        `Added \u201c${data.description || data.location}\u201d (${data.embedding_dim} dimensions) via ${usedVia}.`
       );
+      /* The description can be 800 characters of the document's own text, and
+       * the log sits scrolled to the bottom — so that wall of text used to be
+       * the last thing on screen. End on a short line that names the resource
+       * instead; the eye lands there without scrolling up. A blank line before
+       * it keeps it from reading as the tail of the paragraph above. */
+      indexProgressLine('');
+      indexProgressLine(`Resource: ${data.location} has been indexed.`);
+      finishIndex(data);
     }
     el('uri').value = '';
     el('tags').value = '';
@@ -1650,7 +1780,10 @@ ui.addForm.addEventListener('submit', async (event) => {
      * fix rather than dumping a stack trace. The server sends the exact
      * command for this platform, so we never invent one here. */
     if (err.code === 'no_download_backend') {
-      setStatus(ui.addStatus, 'Autonomi support needs the ant CLI or antd daemon.', 'bad');
+      indexProgressLine('ERROR: Autonomi support needs the ant CLI or antd daemon.');
+      /* Two dialogs at once is confusing; the install dialog says what to do
+       * about it, so the progress log steps aside rather than nesting. */
+      ui.indexProgress.close();
       openInstall(
         'ant',
         'Install ant CLI',
@@ -1658,7 +1791,7 @@ ui.addForm.addEventListener('submit', async (event) => {
         (err.body && err.body.command) || ''
       );
     } else {
-      setStatus(ui.addStatus, `Could not add that link: ${err.message}`, 'bad');
+      indexProgressLine(`ERROR: Could not add that link: ${err.message}`);
     }
   }
 });

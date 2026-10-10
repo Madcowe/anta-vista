@@ -158,11 +158,6 @@ input[type="text"] {
   align-items: center;
 }
 
-.status-line {
-  margin: 8px 0 0;
-  font-size: 0.85rem;
-}
-
 .results-heading {
   margin: 0 0 10px;
 }
@@ -486,7 +481,6 @@ input[type="text"] {
 
 [data-theme="modern"] .rid,
 [data-theme="modern"] .hint,
-[data-theme="modern"] .status-line,
 [data-theme="modern"] .command {
   font-family: var(--mono);
 }
@@ -648,4 +642,19 @@ input[type="text"] {
   white-space: nowrap;
   max-width: 100%;
   flex: 1 1 8rem;
+}
+
+.progress-output {
+  margin: 8px 0;
+  padding: 8px 10px;
+  background: #111;
+  color: #0f0;
+  border: 1px solid #333;
+  border-radius: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }

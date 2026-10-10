@@ -84,7 +84,6 @@ const PAGE: &str = r##"<!doctype html>
              placeholder="tags, comma separated">
       <button type="submit" class="btn">Add</button>
     </form>
-    <p id="add-status" class="status-line" role="status" hidden></p>
   </section>
 
   <section id="results-section" class="results" aria-labelledby="results-heading" hidden>
@@ -138,6 +137,20 @@ const PAGE: &str = r##"<!doctype html>
     <menu>
       <button value="cancel" class="btn btn-quiet">Cancel</button>
       <button value="run" id="install-run" class="btn btn-primary" disabled>Run installer</button>
+    </menu>
+  </form>
+</dialog>
+
+
+<!-- The index dialog is the only output of "Add a Link": stages append, byte
+     progress updates one line, and the dialog waits to be dismissed so the
+     sequence can actually be read. Closing it reveals the indexed row. -->
+<dialog id="index-progress-dialog" class="dialog">
+  <form method="dialog">
+    <h2 id="index-progress-title">Indexing</h2>
+    <pre id="index-progress-body" class="progress-output" aria-live="polite"></pre>
+    <menu>
+      <button value="close" class="btn btn-primary">Close</button>
     </menu>
   </form>
 </dialog>
