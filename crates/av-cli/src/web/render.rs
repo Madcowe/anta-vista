@@ -65,12 +65,21 @@ const PAGE: &str = r##"<!doctype html>
 <div id="setup-banner" class="banner" hidden role="status"></div>
 
 <main id="main">
-  <form id="search-form" class="search" role="search">
-    <label class="visually-hidden" for="q">Search the index</label>
-    <input id="q" name="q" type="search" autocomplete="off" spellcheck="false"
-           placeholder="Search the index&hellip;" required>
-    <button type="submit" class="btn btn-primary">Search</button>
-  </form>
+  <div class="search-block">
+    <form id="search-form" class="search" role="search">
+      <label class="visually-hidden" for="q">Search the index</label>
+      <input id="q" name="q" type="search" autocomplete="off" spellcheck="false"
+             placeholder="Search the index&hellip;" required>
+      <button type="submit" class="btn btn-primary">Search</button>
+    </form>
+    <!-- Restricts the search to autonomi:// results. The scheme filter also
+         travels on the wire (allowed_schemes), but that is advisory — the
+         server re-filters network responses on receipt regardless. -->
+    <label class="check">
+      <input type="checkbox" id="autonomi-only">
+      <span>Autonomi only</span>
+    </label>
+  </div>
 
   <section class="panel" aria-labelledby="addlink-heading">
     <h2 id="addlink-heading">Add a Link</h2>

@@ -124,6 +124,19 @@ input[type="text"] {
   flex: 1;
 }
 
+/* The form and the "Autonomi only" toggle below it. Structural, unscoped:
+ * retro.css recolours but does not lay out, so this has to live here. */
+.search-block {
+  display: grid;
+  gap: 10px;
+}
+
+/* `.check` carries margin-top for the install dialog's vertical rhythm; the
+ * grid gap already separates it here. */
+.search-block .check {
+  margin-top: 0;
+}
+
 .row {
   display: flex;
   gap: 8px;

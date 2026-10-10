@@ -10,6 +10,31 @@ const THEME_KEY = 'anta-vista-theme';
 /* Warnings the user has told us to stop repeating. Kept in localStorage so the
  * choice survives a reload, alongside the theme. */
 const MUTE_KEY = 'anta-vista-muted-warnings';
+/* The "Autonomi only" search filter, also surviving a reload. */
+const SCHEME_KEY = 'anta-vista-autonomi-only';
+
+/* Whether the search filter is on. Kept in localStorage so the choice
+ * survives a reload, like the theme; an unavailable store simply means the
+ * filter starts off. */
+function schemeOnly() {
+  try {
+    return localStorage.getItem(SCHEME_KEY) === '1';
+  } catch (e) {
+    return false;
+  }
+}
+
+function setSchemeOnly(on) {
+  try {
+    if (on) {
+      localStorage.setItem(SCHEME_KEY, '1');
+    } else {
+      localStorage.removeItem(SCHEME_KEY);
+    }
+  } catch (e) {
+    /* storage unavailable: the filter simply resets on reload */
+  }
+}
 
 function mutedWarnings() {
   try {
@@ -45,6 +70,7 @@ const ui = {
   banner: el('setup-banner'),
   form: el('search-form'),
   q: el('q'),
+  autonomiOnly: el('autonomi-only'),
   results: el('results'),
   resultsSection: el('results-section'),
   resultsCount: el('results-count'),
@@ -1001,10 +1027,10 @@ function wireFetch(node, result, statusEl) {
 
 /* --------------------------------------------------------------- search -- */
 
-ui.form.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const query = ui.q.value.trim();
-  if (!query) return;
+/* Run one search. Shared by the form's submit and the "Autonomi only"
+ * toggle's re-run, so the epoch bump and the results-area reset cannot
+ * drift between the two entry points. */
+async function runSearch(query) {
   lastQuery = query;
   resultsEpoch += 1;
 
@@ -1021,8 +1047,12 @@ ui.form.addEventListener('submit', async (event) => {
   setCount('Searching\u2026');
 
   try {
+    /* The scheme filter: `allowed_schemes` on the wire asks peers to filter
+     * early, and the server re-filters network responses on receipt, so this
+     * one parameter is the whole control. */
+    const scheme = ui.autonomiOnly.checked ? '&scheme=autonomi' : '';
     const data = await api(
-      `/api/search?q=${encodeURIComponent(query)}&limit=10`
+      `/api/search?q=${encodeURIComponent(query)}&limit=10${scheme}`
     );
     renderResults(data.results || []);
   } catch (err) {
@@ -1031,6 +1061,26 @@ ui.form.addEventListener('submit', async (event) => {
     ui.resultsEmpty.hidden = false;
     ui.resultsEmpty.textContent = `Search failed: ${err.message}`;
     setCount('');
+  }
+}
+
+ui.form.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const query = ui.q.value.trim();
+  if (!query) return;
+  runSearch(query);
+});
+
+/* Restore the saved filter before the first search. */
+ui.autonomiOnly.checked = schemeOnly();
+
+/* Flipping the toggle re-runs the query already on screen, so the results
+ * never contradict the control. With no query yet it just takes effect on
+ * the next search. */
+ui.autonomiOnly.addEventListener('change', () => {
+  setSchemeOnly(ui.autonomiOnly.checked);
+  if (lastQuery && !ui.resultsSection.hidden) {
+    runSearch(lastQuery);
   }
 });
 

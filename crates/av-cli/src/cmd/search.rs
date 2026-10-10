@@ -59,6 +59,13 @@ pub fn collect_results(
         limit,
         ..
     } = opts.clone();
+    // Normalise once, here, so every consumer agrees on the canonical spelling:
+    // `av search --scheme ant`, `?scheme=ant` from the browser, the local
+    // `SchemeFilter`, the name filter, and the `allowed_schemes` the wire
+    // payload carries must all match `location_scheme` as *stored* — which is
+    // canonical `autonomi`, per `normalize_uri`. Filtering on the raw alias
+    // matched nothing at all.
+    let scheme = scheme.map(|s| av_core::types::normalize_scheme(&s));
     let name_scheme_filter = scheme
         .clone()
         .map(|s| av_index::filter::SchemeFilter::new(vec![s]));

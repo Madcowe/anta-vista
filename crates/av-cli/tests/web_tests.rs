@@ -949,7 +949,7 @@ fn a_seeded_autonomi_record_is_searchable_and_gets_the_open_and_save_actions() {
     let server = server();
     let id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     let uri = test_address("seeded-record");
-    seed_searchable_resource(&server.db, id, &uri, "text/html");
+    seed_searchable_resource(&server.db, id, &uri, "autonomi", "text/html");
 
     let found = server.json("/api/search?q=quokka%20telemetry");
     let hit = found["results"]
@@ -960,6 +960,89 @@ fn a_seeded_autonomi_record_is_searchable_and_gets_the_open_and_save_actions() {
         .unwrap_or_else(|| panic!("the seeded record was not searchable: {found}"));
     assert_eq!(hit["location"], uri.as_str());
     assert_eq!(hit["source"], "local", "it is held locally: {hit}");
+}
+
+#[test]
+fn the_scheme_filter_separates_autonomi_from_http_results() {
+    // The web toggle's whole contract: with no `scheme` param both seeded
+    // records come back; with `scheme=autonomi` only the Autonomi one does.
+    // The local index applies the filter via `location_scheme`, so this
+    // exercises the path the checkbox drives.
+    let server = server();
+    let auto_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let http_id = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    let auto_uri = test_address("scheme-filter-auto");
+    seed_searchable_resource(&server.db, auto_id, &auto_uri, "autonomi", "text/html");
+    seed_searchable_resource(
+        &server.db,
+        http_id,
+        "https://example.com/quokka-telemetry",
+        "https",
+        "text/html",
+    );
+
+    let both = server.json("/api/search?q=quokka%20telemetry");
+    let ids = |found: &serde_json::Value| -> Vec<String> {
+        found["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .filter(|r| r["resource_id"] == auto_id || r["resource_id"] == http_id)
+            .map(|r| r["resource_id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let mut unfiltered = ids(&both);
+    unfiltered.sort();
+    assert_eq!(
+        unfiltered,
+        vec![auto_id.to_string(), http_id.to_string()],
+        "without a scheme filter both records are visible: {both}"
+    );
+
+    let filtered = server.json("/api/search?q=quokka%20telemetry&scheme=autonomi");
+    let mut only = ids(&filtered);
+    only.sort();
+    assert_eq!(
+        only,
+        vec![auto_id.to_string()],
+        "with scheme=autonomi only the Autonomi record is visible: {filtered}"
+    );
+
+    // The alias has to work too: `ant` is what a user (or an old client) may
+    // still type, and stored `location_scheme` is canonical `autonomi`.
+    let aliased = server.json("/api/search?q=quokka%20telemetry&scheme=ant");
+    let mut only = ids(&aliased);
+    only.sort();
+    assert_eq!(
+        only,
+        vec![auto_id.to_string()],
+        "scheme=ant must behave as scheme=autonomi: {aliased}"
+    );
+}
+
+#[test]
+fn the_search_form_offers_the_autonomi_only_filter() {
+    // The control the API filter above is driven from. The checkbox lives
+    // beside the form, and the page wires it before any search runs.
+    let page = server().get("/").body;
+    assert!(
+        page.contains(r#"<input type="checkbox" id="autonomi-only">"#),
+        "the page is missing the Autonomi-only checkbox"
+    );
+    assert!(
+        page.contains("<span>Autonomi only</span>"),
+        "the checkbox has no label"
+    );
+
+    let js = js_code(&server().get("/assets/app.js").body);
+    assert!(
+        js.contains("&scheme=autonomi"),
+        "the search request never carries the scheme filter"
+    );
+    assert!(
+        js.contains("'anta-vista-autonomi-only'"),
+        "the filter is not persisted across reloads"
+    );
 }
 
 #[test]
@@ -1672,9 +1755,7 @@ fn search_and_index_ensure_the_services_first() {
         js.contains("/api/services/ensure"),
         "the page must call the ensure endpoint"
     );
-    let search = js
-        .find("ui.form.addEventListener('submit'")
-        .expect("search handler");
+    let search = js.find("async function runSearch(").expect("search body");
     let add = js
         .find("ui.addForm.addEventListener('submit'")
         .expect("add handler");
@@ -1831,10 +1912,10 @@ fn a_search_that_lands_during_an_index_keeps_its_results() {
     // results with the indexed row and a note claiming the screen shows it.
     let js = js_code(&server().get("/assets/app.js").body);
 
-    // The search bumps the epoch on submit and again when it renders.
-    let search = js
-        .find("ui.form.addEventListener('submit'")
-        .expect("search handler");
+    // The search bumps the epoch on submit and again when it renders. The
+    // body lives in `runSearch`, shared by the form's submit and the
+    // "Autonomi only" toggle's re-run, so both entry points take the epoch.
+    let search = js.find("async function runSearch(").expect("search body");
     let add = js
         .find("ui.addForm.addEventListener('submit'")
         .expect("add handler");
@@ -2424,7 +2505,13 @@ fn seed_resource(db: &std::path::Path, id: &str, location: &str) {
 /// in this file under `cargo test`; with assertions compiled out it would be
 /// worse, since `iter().zip()` would silently score against a truncated vector.
 /// A one-hot vector is unit-length by construction.
-fn seed_searchable_resource(db: &std::path::Path, id: &str, location: &str, mime: &str) {
+fn seed_searchable_resource(
+    db: &std::path::Path,
+    id: &str,
+    location: &str,
+    scheme: &str,
+    mime: &str,
+) {
     use av_core::types::{ResourceDescriptor, ResourceKind};
 
     const PROFILE: &str = "all-MiniLM-L6-v2:v1";
@@ -2437,7 +2524,7 @@ fn seed_searchable_resource(db: &std::path::Path, id: &str, location: &str, mime
             id: id.to_string(),
             kind: ResourceKind::Text,
             location: location.to_string(),
-            location_scheme: Some("autonomi".to_string()),
+            location_scheme: Some(scheme.to_string()),
             location_canonical: Some(location.to_string()),
             mime_type: mime.to_string(),
             filename: None,

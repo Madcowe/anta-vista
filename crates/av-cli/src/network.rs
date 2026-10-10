@@ -38,6 +38,22 @@ fn accept_from(agent_id: &str, blocked: &HashSet<String>) -> bool {
     !blocked.contains(agent_id)
 }
 
+/// Whether a network response result's location satisfies `filter`.
+///
+/// The scheme is derived from `location` itself via `analyze_location` — the
+/// same normalisation local ingest uses (bare 64-hex becomes `autonomi://`,
+/// `ant://` becomes `autonomi://`) — rather than trusting `ResourceResult
+/// .location_scheme`, which is self-reported by the peer. An undecidable
+/// scheme fails closed: `SchemeFilter::allows(None)` is false when the filter
+/// is non-empty, so a peer cannot smuggle a requested-out scheme past the
+/// filter by omitting the field or lying about it. The `allowed_schemes` on
+/// the wire are advisory — they ask the peer to filter early — this is the
+/// local enforcement.
+fn result_matches_scheme(location: &str, filter: &av_index::filter::SchemeFilter) -> bool {
+    let scheme = av_ingest::location::analyze_location(location).scheme;
+    filter.allows(scheme.as_deref())
+}
+
 #[allow(dead_code)]
 pub struct ResolveResultWrapper {
     pub local_results: Vec<av_index::naming::NameResult>,
@@ -189,7 +205,7 @@ pub fn execute_search(
             // Check direct channel
             if let Ok(Ok(msg)) = direct_rx.recv_timeout(Duration::from_millis(10)) {
                 if msg.envelope.kind == MessageKind::Response {
-                    if let Ok(resp) =
+                    if let Ok(mut resp) =
                         serde_json::from_value::<ResponsePayload>(msg.envelope.payload.clone())
                     {
                         if query_ids.contains(&resp.query_id) {
@@ -203,6 +219,15 @@ pub fn execute_search(
                                 );
                                 continue;
                             }
+                            // Local enforcement of the scheme filter: the
+                            // `allowed_schemes` we sent are advisory — an old
+                            // or hostile peer may ignore them — so anything
+                            // that fails the filter is dropped here, before
+                            // the push, for the same reason the agent check
+                            // is: `--stream` prints inside this loop.
+                            resp.results.retain(|r| {
+                                result_matches_scheme(&r.location, &query_filter.scheme)
+                            });
                             network_results.push((msg.sender.clone(), resp.clone()));
                             let _ =
                                 peers::upsert(conn, &msg.sender, serde_json::json!({}), now_secs());
@@ -217,7 +242,7 @@ pub fn execute_search(
             // Check gossip channel
             if let Ok(Ok(event)) = gossip_rx.recv_timeout(Duration::from_millis(10)) {
                 if event.envelope.kind == MessageKind::Response {
-                    if let Ok(resp) =
+                    if let Ok(mut resp) =
                         serde_json::from_value::<ResponsePayload>(event.envelope.payload.clone())
                     {
                         if query_ids.contains(&resp.query_id) {
@@ -228,6 +253,10 @@ pub fn execute_search(
                                 );
                                 continue;
                             }
+                            // Same local enforcement as the direct arm above.
+                            resp.results.retain(|r| {
+                                result_matches_scheme(&r.location, &query_filter.scheme)
+                            });
                             network_results.push((event.origin.clone(), resp.clone()));
                             let _ = peers::upsert(
                                 conn,
@@ -452,5 +481,42 @@ fn print_progressive_name_results(sender: &str, results: &[NameRecord]) {
             rec.target,
             rec.ttl_secs
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::result_matches_scheme;
+    use av_index::filter::SchemeFilter;
+
+    const HEX64: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn an_autonomi_filter_accepts_every_spelling_of_an_autonomi_location() {
+        let f = SchemeFilter::new(vec!["autonomi"]);
+        assert!(result_matches_scheme(&format!("autonomi://{HEX64}"), &f));
+        assert!(result_matches_scheme(&format!("ant://{HEX64}"), &f));
+        assert!(result_matches_scheme(HEX64, &f), "bare 64-hex is autonomi");
+    }
+
+    #[test]
+    fn an_autonomi_filter_rejects_other_schemes() {
+        let f = SchemeFilter::new(vec!["autonomi"]);
+        assert!(!result_matches_scheme("https://example.com/page", &f));
+        assert!(!result_matches_scheme("file:///etc/passwd", &f));
+    }
+
+    #[test]
+    fn an_undecidable_scheme_fails_closed() {
+        let f = SchemeFilter::new(vec!["autonomi"]);
+        // Not hex, no scheme: nothing to compare, so the filter refuses.
+        assert!(!result_matches_scheme("just-a-word", &f));
+    }
+
+    #[test]
+    fn an_empty_filter_allows_everything() {
+        let f = SchemeFilter::default();
+        assert!(result_matches_scheme("https://example.com", &f));
+        assert!(result_matches_scheme("just-a-word", &f));
     }
 }
