@@ -54,6 +54,9 @@ body {
   padding: 12px 20px;
 }
 
+/* The wordmark is two logo images, one per theme, and the text of this rule
+ * now styles only the `<img>`'s alt text — which appears exactly when an
+ * image fails to load, so the header degrades to the name it was before. */
 .wordmark {
   margin: 0;
   font-size: 1.1rem;
@@ -61,8 +64,23 @@ body {
   letter-spacing: -0.01em;
 }
 
-.wordmark .dot {
-  opacity: 0.5;
+/* One shared width for both themes, and one number is the size knob. The
+ * text this replaced was ~6rem across; this is 4× that — the logo is the
+ * masthead now. `height: auto` keeps each image's own aspect ratio (the
+ * markup carries its real pixels, so the ratio needs no stylesheet). */
+.wordmark img {
+  display: block;
+  width: 26rem;
+  height: auto;
+}
+
+/* Modern's copy shows by default; retro.css re-shows the badge under
+ * [data-theme="retro"] with enough specificity to win regardless of the
+ * order these two sheets load in. Picking the logo in CSS (not app.js) is
+ * what keeps the right one on screen from the first paint: the boot script
+ * has already set data-theme in <head> before this markup exists. */
+.wordmark img.wordmark-retro {
+  display: none;
 }
 
 .bar-actions {

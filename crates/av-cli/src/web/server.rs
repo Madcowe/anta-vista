@@ -160,6 +160,10 @@ fn route(
         (_, "/assets/modern.css") => Ok(render::modern_css()),
         (_, "/assets/app.js") => Ok(render::app_js()),
         (_, "/assets/retro.js") => Ok(render::retro_js()),
+        // The header logo, one per theme; the page references both and CSS
+        // shows the one matching <html data-theme>.
+        (_, "/assets/wordmark-retro.jpeg") => Ok(render::wordmark_retro()),
+        (_, "/assets/wordmark-modern.jpeg") => Ok(render::wordmark_modern()),
 
         (Method::Get, "/api/status") => Ok(handlers::status(state)),
         (Method::Get, "/api/deps") => Ok(handlers::deps(state)),

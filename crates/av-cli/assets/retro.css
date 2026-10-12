@@ -57,6 +57,23 @@
   text-shadow: 1px 1px 0 rgba(0, 0, 0, 0.6);
 }
 
+/* The theme's own logo, in both directions: modern.css hides the badge for
+ * everyone, and this rule outranks it ([data-theme] adds specificity, so the
+ * order the two sheets load in never decides it). The modern strip gets the
+ * same treatment in reverse — otherwise the retro bar would show both.
+ *
+ * The badge also scales to ~80% of modern.css's shared width: the same
+ * `width` beats the shared `.wordmark img` rule on specificity, and the
+ * image's own ratio decides the height, so one number is still the knob. */
+[data-theme="retro"] .wordmark img.wordmark-retro {
+  display: block;
+  width: 21rem;
+}
+
+[data-theme="retro"] .wordmark img.wordmark-modern {
+  display: none;
+}
+
 /* The classic 3D bevel, drawn with borders rather than images. */
 [data-theme="retro"] .btn {
   font-family: var(--sans);

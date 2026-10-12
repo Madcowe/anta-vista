@@ -50,7 +50,21 @@ const PAGE: &str = r##"<!doctype html>
 <a class="skip" href="#main">Skip to search</a>
 
 <header class="bar">
-  <h1 class="wordmark">Anta<span class="dot">&middot;</span>Vista</h1>
+  <h1 class="wordmark">
+    <!-- One image per theme, picked by CSS from the <html data-theme> the boot
+         script sets in <head>: both stylesheets are already loaded by the time
+         this paints, so the right logo shows with no script of ours and no
+         flash of the wrong one. The text alternative is the h1's accessible
+         name either way — display:none takes the other copy out of the
+         accessibility tree, so screen readers announce it once. The width and
+         height are the images' real pixels: with `height: auto` in the CSS
+         they preserve each logo's aspect ratio, and no stylesheet is needed
+         to know it. -->
+    <img class="wordmark-retro" src="/assets/wordmark-retro.jpeg"
+         alt="Anta-Vista" width="1038" height="440">
+    <img class="wordmark-modern" src="/assets/wordmark-modern.jpeg"
+         alt="Anta-Vista" width="1104" height="274">
+  </h1>
   <nav class="bar-actions">
     <button type="button" id="theme-toggle" class="btn btn-quiet" aria-live="polite">
       I don&rsquo;t like the 90&rsquo;s
@@ -318,6 +332,30 @@ pub fn retro_js() -> WebResponse {
     ))
 }
 
+/// The header logo for the retro theme: the 90s badge, embedded at build time.
+///
+/// Both wordmark images are [`own_asset`]s like the stylesheets — the bytes
+/// ship in the binary, so a swap is a rebuild, not a file on disk. The type
+/// is stated rather than sniffed, same as every other asset here: a server
+/// that lets the browser guess is one refactor away from serving a logo as
+/// `text/html`.
+pub fn wordmark_retro() -> WebResponse {
+    own_asset(binary_response(
+        200,
+        JPEG_MIME,
+        include_bytes!("../../assets/wordmark-retro.jpeg").to_vec(),
+    ))
+}
+
+/// The header logo for the modern theme. See [`wordmark_retro`].
+pub fn wordmark_modern() -> WebResponse {
+    own_asset(binary_response(
+        200,
+        JPEG_MIME,
+        include_bytes!("../../assets/wordmark-modern.jpeg").to_vec(),
+    ))
+}
+
 /// `no-store` for *our own* assets, as opposed to the vendored SDK below.
 ///
 /// These are compiled into the binary, so a reload can only ever be stale — but
@@ -518,6 +556,7 @@ pub const SDK_BASE: &str = "/assets/vendor/autonomi-sdk/0.1.1/";
 
 const CSS_MIME: &str = "text/css; charset=utf-8";
 const JS_MIME: &str = "application/javascript; charset=utf-8";
+const JPEG_MIME: &str = "image/jpeg";
 
 /// Mandatory, not cosmetic: `WebAssembly.instantiateStreaming` refuses any
 /// content type other than this, so serving the SDK's WASM as anything else

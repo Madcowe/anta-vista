@@ -504,6 +504,108 @@ fn the_scroll_banner_does_not_outlive_the_theme_that_gives_it_a_reason_to_exist(
 }
 
 #[test]
+fn the_wordmark_is_a_theme_swapped_logo_with_the_name_in_alt_text() {
+    // The header carries a logo image per theme rather than the "Anta·Vista"
+    // text, and both ship in the page: CSS decides which one shows, so the
+    // decision needs no script and no flash of the wrong one.
+    let s = server();
+    let page = s.get("/");
+    assert_eq!(page.status, 200);
+    assert!(
+        !page.body.contains("Anta<span class=\"dot\">"),
+        "the text wordmark is still in the served markup"
+    );
+    assert!(
+        page.body
+            .contains(r#"<img class="wordmark-retro" src="/assets/wordmark-retro.jpeg""#),
+        "the retro logo is missing from the page"
+    );
+    assert!(
+        page.body
+            .contains(r#"<img class="wordmark-modern" src="/assets/wordmark-modern.jpeg""#),
+        "the modern logo is missing from the page"
+    );
+
+    // The screen-reader name lives in `alt`. Exactly one copy is ever
+    // displayed — the other is `display:none`, which takes it out of the
+    // accessibility tree — so the h1 announces "Anta-Vista" once, from
+    // whichever theme is on screen, and an image that fails to load still
+    // leaves the name as visible text.
+    assert_eq!(
+        page.body.matches("alt=\"Anta-Vista\"").count(),
+        2,
+        "both logo images need the text alternative"
+    );
+
+    // The intrinsic pixels are in the markup, so the aspect ratio is known
+    // before any stylesheet applies and `height: auto` scales the image
+    // without ever distorting it.
+    assert!(
+        page.body.contains(r#"width="1038" height="440""#),
+        "the retro logo's real dimensions are missing"
+    );
+    assert!(
+        page.body.contains(r#"width="1104" height="274""#),
+        "the modern logo's real dimensions are missing"
+    );
+
+    // Both are served as bytes, typed as images, under our own no-store
+    // policy — a swapped-in logo appears on the next reload, like the CSS.
+    for path in [
+        "/assets/wordmark-retro.jpeg",
+        "/assets/wordmark-modern.jpeg",
+    ] {
+        let logo = s.get(path);
+        assert_eq!(logo.status, 200, "{path} missing");
+        assert!(logo.headers.contains("image/jpeg"), "{}", logo.headers);
+        assert!(logo.headers.contains("no-store"), "{}", logo.headers);
+        assert_eq!(&logo.raw[0..2], b"\xff\xd8", "{path} is not a JPEG");
+    }
+}
+
+#[test]
+fn css_picks_the_theme_logo_and_keeps_its_aspect_ratio() {
+    // Both images are in the markup; which one shows is decided here, from
+    // the `data-theme` the boot script set in <head> before first paint.
+    let modern = server().get("/assets/modern.css").body;
+    let retro = server().get("/assets/retro.css").body;
+
+    // Sizing is unscoped on purpose: retro recolours but does not lay out,
+    // so scoping it would leave the default theme's logo unsized. `height:
+    // auto` is what keeps each logo's own ratio (with the width/height
+    // attributes in the markup).
+    let sized =
+        css_rule(&modern, ".wordmark img").expect("modern.css must size the wordmark images");
+    assert!(sized.contains("height: auto"), "{sized}");
+    assert!(sized.contains("width: 26rem"), "{sized}");
+
+    // The badge is hidden for everyone and re-shown under the retro theme by
+    // an attribute selector, which outranks modern.css's hide whatever order
+    // the two sheets are applied in. The strip needs the mirror rule or the
+    // retro bar would show both logos at once.
+    let hide_badge = css_rule(&modern, ".wordmark img.wordmark-retro")
+        .expect("modern.css must hide the retro badge by default");
+    assert!(hide_badge.contains("display: none"), "{hide_badge}");
+
+    let show_badge = css_rule(
+        &retro,
+        r#"[data-theme="retro"] .wordmark img.wordmark-retro"#,
+    )
+    .expect("retro.css must show the badge in the retro theme");
+    assert!(show_badge.contains("display: block"), "{show_badge}");
+    // The same rule scales the badge to ~80% of modern.css's shared width;
+    // its specificity is what lets the override win.
+    assert!(show_badge.contains("width: 21rem"), "{show_badge}");
+
+    let hide_strip = css_rule(
+        &retro,
+        r#"[data-theme="retro"] .wordmark img.wordmark-modern"#,
+    )
+    .expect("retro.css must hide the modern strip in the retro theme");
+    assert!(hide_strip.contains("display: none"), "{hide_strip}");
+}
+
+#[test]
 fn status_reports_counts_and_dependencies() {
     let s = server().json("/api/status");
     assert_eq!(s["ok"], true);
