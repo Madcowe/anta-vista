@@ -81,6 +81,20 @@ pub fn run(
     av_store::open(&db_path)
         .map_err(|e| CliError::Database(format!("failed to open {}: {e}", db_path.display())))?;
 
+    // Give a fresh install its starter resources: pre-baked rows whose
+    // embeddings were computed at build time, so this is a few local INSERTs —
+    // no network, no model, no wait before the bind. A failure is logged and
+    // skipped: a nicety must not keep the interface from starting.
+    if !crate::starters::seeding_disabled() {
+        match crate::starters::ensure_seeded(&db_path) {
+            Ok(report) if report.seeded > 0 || report.adopted > 0 => {
+                tracing::info!("starter resources ready: {report:?}");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("starter seeding failed: {e}"),
+        }
+    }
+
     // Bind before loading anything expensive, so a port conflict is reported
     // immediately rather than after a model download.
     let addr = SocketAddr::new(host, options.port);

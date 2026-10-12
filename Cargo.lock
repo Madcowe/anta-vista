@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "anta-vista-examples"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "av-core",
  "av-embed",
@@ -185,7 +185,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "av-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "av-core",
  "av-embed",
@@ -200,11 +200,13 @@ dependencies = [
  "console",
  "dialoguer",
  "directories",
+ "hex",
  "indicatif",
  "libc",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tiny_http",
@@ -216,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "av-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "directories",
  "serde",
@@ -231,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "av-embed"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "av-core",
  "fastembed",
@@ -246,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "av-index"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "av-core",
  "av-embed",
@@ -263,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "av-ingest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "av-core",
  "hex",
@@ -281,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "av-net-x0x"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "av-core",
  "base64 0.22.1",
@@ -296,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "av-probe"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "av-core",
  "av-embed",
@@ -321,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "av-query"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "av-core",
  "av-net-x0x",
@@ -357,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "av-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "av-core",
  "rusqlite",
@@ -370,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "av-test-suite"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "av-core",
  "av-embed",
@@ -395,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "av-trust"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "av-core",
  "av-store",

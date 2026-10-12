@@ -62,12 +62,25 @@ fn drain<R: Read + Send + 'static>(mut pipe: R, sink: Arc<Mutex<String>>) {
 
 impl TestServer {
     fn start() -> Self {
+        Self::spawn(false)
+    }
+
+    /// A server on its own fresh database **with** starter seeding on.
+    ///
+    /// The shared harness opts out (see [`Self::spawn`]), because the search
+    /// tests assert exact result sets on a fresh database; this is the one
+    /// server that proves the seeding path actually runs.
+    fn start_seeded() -> Self {
+        Self::spawn(true)
+    }
+
+    fn spawn(seeding: bool) -> Self {
         let dir = std::env::temp_dir().join(format!("av-web-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let db = dir.join("test.db");
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_av"))
-            .args(["web", "--no-open", "--port", "0", "--run-for", "60"])
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_av"));
+        cmd.args(["web", "--no-open", "--port", "0", "--run-for", "60"])
             .env("ANTA_VISTA_DB_PATH", &db)
             // The listener PID file comes from the platform data dir, not from
             // the database path. Redirect it into the temp dir as well, or a
@@ -79,7 +92,14 @@ impl TestServer {
             // The UI starts x0x on boot; a test run must not spawn the
             // developer's real daemon. `ensure_services` respects this and
             // returns without touching the network.
-            .env("ANTA_VISTA_NO_AUTOSTART", "1")
+            .env("ANTA_VISTA_NO_AUTOSTART", "1");
+        if !seeding {
+            // Fresh-install starters would land three extra rows in every
+            // test database and break the exact-count assertions; only
+            // `start_seeded` leaves them on.
+            cmd.env("ANTA_VISTA_NO_SEED", "1");
+        }
+        let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -627,6 +647,28 @@ fn status_reports_counts_and_dependencies() {
     // x0x is not required for the web interface to answer.
     assert_eq!(s["x0x_daemon"]["running"], false);
     assert!(s["minilm_model"]["dimensions"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn a_fresh_web_install_ships_with_the_starter_resources() {
+    // One server *with* seeding, on its own database: the shared harness
+    // opts out via ANTA_VISTA_NO_SEED, because most tests assert exact
+    // result sets and three bundled rows would crowd them. Seeding is pure
+    // local SQL over baked data — no network, no model — so this needs
+    // neither x0x nor MiniLM.
+    let s = TestServer::start_seeded();
+    let status = s.json("/api/status");
+    let db = &status["database"];
+    assert_eq!(
+        db["resources"].as_i64(),
+        Some(3),
+        "fresh install must ship exactly the three starters: {db}"
+    );
+    assert_eq!(
+        db["embeddings"].as_i64(),
+        Some(3),
+        "every starter must carry its baked embedding: {db}"
+    );
 }
 
 #[test]

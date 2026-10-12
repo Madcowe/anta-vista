@@ -1,6 +1,6 @@
 [package]
 name = "av-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [[bin]]
@@ -33,3 +33,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 libc = "0.2"
+
+[dev-dependencies]
+sha2 = { workspace = true }
+hex = { workspace = true }

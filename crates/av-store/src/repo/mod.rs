@@ -7,4 +7,5 @@ pub mod peers;
 pub mod query_cache;
 pub mod relevance;
 pub mod resources;
+pub mod starter_seeds;
 pub mod trust;

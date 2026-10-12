@@ -234,6 +234,31 @@ CREATE TABLE IF NOT EXISTS blocked_locations (
 CREATE INDEX IF NOT EXISTS idx_blocked_locations_location ON blocked_locations(location);
 ";
 
+/// Where a bundled starter resource has already been settled.
+///
+/// `av web` inserts a handful of pre-baked resources (descriptor and embedding
+/// computed at build time) on a fresh database so the interface is not empty
+/// on first open. Seeding must happen at most once *per location*, and the two
+/// reasons pull in the same direction:
+///
+/// - A user who purges a starter must not find it back after the next
+///   restart. Purge is their decision, and this row is what remembers it.
+/// - A starter the user indexed first must not be overwritten. The row that
+///   exists is theirs.
+///
+/// So the marker is written only once the location is actually settled —
+/// either the starter was inserted, or `resources` already held it — and a
+/// location that was skipped (blocked, or an insert that failed) stays
+/// unmarked and is reconsidered on the next boot. That is also why this is a
+/// table of its own rather than anything derived from `resources`: the whole
+/// point is to remember a row that no longer exists.
+pub const MIGRATION_008_STARTER_SEEDS: &str = "
+CREATE TABLE IF NOT EXISTS starter_seeds (
+    location    TEXT PRIMARY KEY,
+    seeded_at   INTEGER NOT NULL
+);
+";
+
 /// Every migration, in the order they must be applied.
 ///
 /// Single source of truth: `db::migrate` walks this, and the on-disk test counts
@@ -247,4 +272,5 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("005_blocks", MIGRATION_005_BLOCKS),
     ("006_name_origin", MIGRATION_006_NAME_ORIGIN),
     ("007_blocked_locations", MIGRATION_007_BLOCKED_LOCATIONS),
+    ("008_starter_seeds", MIGRATION_008_STARTER_SEEDS),
 ];

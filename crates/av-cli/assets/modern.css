@@ -46,9 +46,15 @@ body {
   white-space: nowrap;
 }
 
+/* Top-aligned, not centered: the logo images are ~6.5rem tall (84px in the
+ * retro theme, 104px in modern's), so the bar grew enough that `center`
+ * floated the theme and status buttons into the middle of the header —
+ * away from the corner where controls belong. Shared unscoped rule, like the
+ * rest of the bar's structure: retro.css recolours the bar but does not lay
+ * it out. */
 .bar {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
   padding: 12px 20px;
