@@ -688,11 +688,11 @@ async function fetchAutonomi(address, { onProgress, onStep, onChunk, signal } = 
   };
 }
 
-/* Wire Open and Save for one Autonomi result row. */
+/* Wire the fetch/open flow for one Autonomi result row: the location is the
+ * open path, Stop exists only while bytes are moving, and every outcome is
+ * reported on the row's status line. */
 function wireFetch(node, result, statusEl) {
   const wrap = node.querySelector('[data-role="fetch"]');
-  const openBtn = node.querySelector('[data-role="open"]');
-  const saveBtn = node.querySelector('[data-role="save"]');
   const stopBtn = node.querySelector('[data-role="fetch-stop"]');
 
   const address = autonomiAddress(result.location || '');
@@ -700,26 +700,26 @@ function wireFetch(node, result, statusEl) {
     /* Not an Autonomi address, so there is nothing to fetch. Stays hidden. */
     return;
   }
-  wrap.hidden = false;
 
   let controller = null;
 
+  /* The group holds nothing but Stop, so it exists only while a fetch is
+   * running — at rest the row is the location plus its rating/block actions,
+   * with the status line carrying what happened. Non-Autonomi rows never get
+   * here, so their copy of the group stays hidden for good. */
   const setBusy = (busy) => {
-    openBtn.disabled = busy;
-    saveBtn.disabled = busy;
-    stopBtn.hidden = !busy;
+    wrap.hidden = !busy;
   };
 
-  /* Share one fetch between the two buttons: picking Open over Save and then
-   * changing your mind should reuse the bytes already fetched, not pay for the
-   * whole download twice. The Blob stays valid after the AbortController is
-   * dropped, so it can outlive the fetch it came from. */
+  /* One fetch per row: opening, closing, and opening again reuses the bytes
+   * already fetched rather than paying for a second download. The Blob stays
+   * valid after the AbortController is dropped, so it can outlive the fetch it
+   * came from. */
   let cached = null;
 
-  /* Fetch over WebRTC into a Blob, sharing one fetch between the two buttons.
-   *
-   * `tab` is optional: Open passes the window it is driving so the progress goes
-   * there, Save passes nothing and keeps the detail in the row. */
+  /* Fetch over WebRTC into a Blob. `tab` is the progress window the caller
+   * already opened, or null when the popup was blocked — progress then stays
+   * in the row's status line. */
   const obtain = async (statusEl, tab = null) => {
     if (cached) return cached;
     controller = new AbortController();
@@ -762,8 +762,21 @@ function wireFetch(node, result, statusEl) {
         },
         signal: controller.signal,
       });
+      /* A stop that lands between the last chunk and this line would otherwise
+       * hand back a finished file after Stop was pressed. */
+      if (controller.signal.aborted) throw new DownloadCancelled();
       cached = blob;
       return blob;
+    } catch (err) {
+      /* Our signal is the only source of truth for "the user stopped this".
+       * `fetchAutonomi` throws `DownloadCancelled` at its own entry checks, but
+       * an abort mid-connect or mid-stream arrives with the SDK's wording
+       * instead — and every other error is what routes a failed fetch to the
+       * daemon fallback. So anything thrown while our signal is aborted is
+       * recast as a stop here, or Stop starts a second download that has no
+       * Stop of its own. */
+      if (controller.signal.aborted) throw new DownloadCancelled();
+      throw err;
     } finally {
       setBusy(false);
       controller = null;
@@ -772,14 +785,14 @@ function wireFetch(node, result, statusEl) {
 
   /* Fetch, then hand the bytes to the server to serve on its own origin.
    *
-   * `openProgressTab` is the first statement, and both the Open button and a click
-   * on the location call this directly from their handler, so the popup has a
-   * user gesture behind it. A `window.open` after an await is a popup with no
+   * `openProgressTab` is the first statement, and the location's click handler
+   * calls this directly, so the popup has a user gesture behind it. A
+   * `window.open` after an await is a popup with no
    * gesture and browsers block it — so the tab has to exist before the download
    * starts, and be pointed at the result once it arrives. It opens *onto* the
    * progress page rather than onto `about:blank`, because a tab that says what
    * it is doing is the entire difference between a slow fetch and a broken link. */
-  const openView = async (statusEl) => {
+  const runOpen = async (statusEl) => {
     const tab = openProgressTab();
     if (!tab) {
       setStatus(
@@ -915,12 +928,24 @@ function wireFetch(node, result, statusEl) {
     }
   };
 
-  openBtn.addEventListener('click', () => openView(statusEl));
+  /* One open at a time. The Open/Save buttons used to be disabled while bytes
+   * were moving; with the location as the only control there is nothing left to
+   * disable, and a second click mid-fetch would open a second tab onto the same
+   * download. A repeat after the fetch finishes is a fresh open, as it should
+   * be. */
+  let inFlight = null;
+  const openView = (statusEl) => {
+    if (inFlight) return inFlight;
+    inFlight = runOpen(statusEl).finally(() => {
+      inFlight = null;
+    });
+    return inFlight;
+  };
 
-  /* The location itself opens the file. It is the thing that looks like a link,
-   * so leaving it inert made a link-shaped element that underlined on hover and
-   * did nothing — the Open button existing elsewhere in the row does not make
-   * that discoverable. */
+  /* The location itself opens the file, and it is the only thing that does —
+   * the row carries no Open button. It is the thing that looks like a link, so
+   * leaving it inert would be a link-shaped element that underlines on hover
+   * and does nothing. */
   const loc = node.querySelector('.result-loc');
   if (loc) {
     /* The class selects the pointer cursor in both themes; `role` and
@@ -958,70 +983,20 @@ function wireFetch(node, result, statusEl) {
     });
   }
 
-  saveBtn.addEventListener('click', async () => {
-    try {
-      /* No tab here: Save writes a file rather than opening one, so there is
-       * nothing for a progress window to be. The row's own status line carries
-       * the detail instead. */
-      let blob;
-      try {
-        blob = await obtain(statusEl);
-      } catch (err) {
-        if (err.name === 'DownloadCancelled') throw err;
-        /* The server can fetch it even when this browser cannot — or when the
-         * bytes never made it here at all. It serves them on its own throwaway
-         * origin, so the Save is the same download-by-link as before. */
-        setStatus(statusEl, 'Fetching via your local daemon\u2026', '');
-        const view = await fetchViaDaemon(result.location, {
-          onEvent: (event) => {
-            if (event.type === 'status') setStatus(statusEl, event.message, '');
-          },
-        });
-        downloadBlob(view.url, view.filename);
-        setStatus(statusEl, `Saved as ${view.filename} \u2014 via your daemon.`, 'ok');
-        return;
-      }
-
-      /* Ask the server for the name rather than using the SDK's: it reports
-       * `public-file-<8hex>.bin` for every file, so a save here would put
-       * everything on disk under the same name.
-       *
-       * It used to POST the whole record to `/api/view/blob` purely to read that
-       * name back, which meant saving anything over `MAX_BODY` failed — having
-       * downloaded it successfully first. The bytes are already here; only the
-       * name and the verdict are needed, so only a prefix is asked for. */
-      const plan = await postPlan(result.location, blob.type, blob);
-      downloadBlob(blob, plan.filename);
-      setStatus(statusEl, `Saved as ${plan.filename}.`, 'ok');
-    } catch (err) {
-      if (err.name === 'DownloadCancelled') {
-        setStatus(statusEl, 'Stopped.', '');
-      } else {
-        setStatus(statusEl, `Could not fetch that file: ${err.message}`, 'bad');
-      }
-    }
-  });
-
   stopBtn.addEventListener('click', () => {
     if (controller) controller.abort();
   });
 
-  /* Gate the buttons on what this browser can do, and only on that.
-   *
-   * This used to disable both buttons outright when WebRTC was unavailable,
-   * which was true once and stopped being true: the daemon can fetch a record on
-   * the browser's behalf, so an Autonomi link is openable with nothing installed.
-   * Disabling it here would tell the user a file cannot be opened when it can.
-   *
-   * The title still says *why* the browser is not the transport, because the
-   * daemon fetch is slower and it is useful to know which one is about to run.
-   * It is set only when this browser genuinely cannot, so it never claims a
-   * reason that does not apply. */
+  /* Say on the location itself *why* the browser is not the transport, and
+   * only when that is true. This used to disable the Open/Save buttons outright
+   * when WebRTC was unavailable, which was true once and stopped being true:
+   * the daemon can fetch a record on the browser's behalf, so an Autonomi link
+   * is openable with nothing installed — disabling anything here would tell the
+   * user a file cannot be opened when it can. The daemon fetch is slower, so it
+   * is useful to know which one is about to run. */
   autonomiCapability().then((cap) => {
-    if (cap.available) return;
-    const hint = `Opening it through your local daemon instead: ${cap.reason}`;
-    openBtn.title = hint;
-    saveBtn.title = hint;
+    if (cap.available || !loc) return;
+    loc.title = `${loc.title}. Opening it through your local daemon instead: ${cap.reason}`;
   });
 }
 

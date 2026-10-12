@@ -1042,10 +1042,10 @@ fn a_download_is_named_with_an_extension_we_know() {
 }
 
 #[test]
-fn a_seeded_autonomi_record_is_searchable_and_gets_the_open_and_save_actions() {
+fn a_seeded_autonomi_record_is_searchable() {
     // The end of the chain the prefix sniff exists to serve: a real Autonomi
-    // location, embedded under the profile search actually loads, reaches the
-    // page as a result row with both actions offered. The content here is what
+    // location, embedded under the profile search actually loads, turns up in
+    // the search the page runs. The content here is what
     // `indexAutonomiInBrowser` stores, so if that path changed shape this would
     // be the test to notice.
     let server = server();
@@ -1360,25 +1360,31 @@ fn opening_severs_the_opener_and_saving_never_uploads_the_file() {
         "the noopener feature returns null and would break the redirect"
     );
 
-    // Save used to POST the record to /api/view/blob to read back a filename,
-    // so saving anything over MAX_BODY failed after downloading it fine.
-    // Bounded by the next handler, so an unrelated later block cannot satisfy or
-    // break the assertion.
+    // The download path — now the branch of `openView` taken when the browser
+    // cannot display the type; it used to live under a separate Save button —
+    // used to POST the record to /api/view/blob to read back a filename, so
+    // saving anything over MAX_BODY failed after downloading it fine. Bounded
+    // by the navigation to `postBlob` below, so an unrelated later block
+    // cannot satisfy or break the assertions.
     let save = js
-        .split("saveBtn.addEventListener")
+        .split("const plan = await postPlan(")
         .nth(1)
-        .expect("no save handler")
-        .split("stopBtn.addEventListener")
+        .expect("nothing asks the server for the filename")
+        .split("view = await postBlob")
         .next()
         .unwrap_or_default()
         .to_string();
     assert!(
-        !save.contains("postBlob"),
-        "save still uploads the file to learn its name: {save}"
+        save.contains("downloadBlob(blob, plan.filename)"),
+        "an undisplayable file is fetched but never saved: {save}"
     );
-    assert!(
-        save.contains("postPlan("),
-        "save does not ask the server for the name: {save}"
+    // Exactly one whole-file upload exists in the page: opening a copy the
+    // browser will display, after the plan has said it can be. Learning a
+    // filename must never be it.
+    assert_eq!(
+        js.matches("await postBlob(").count(),
+        1,
+        "the file must be uploaded only to open a displayable copy, never to learn its name"
     );
 
     // Asking the server now means sending *some* bytes, because the Autonomi SDK
@@ -1578,7 +1584,8 @@ fn vendor_paths_cannot_escape_the_vendored_directory() {
 fn an_autonomi_location_looks_clickable_because_it_is() {
     // Regression: `.result-loc` carried `cursor: help` and a comment claiming an
     // Autonomi location had "no open/download path yet". The path existed, but
-    // only on a button elsewhere in the row — so the address underlined on
+    // only on buttons elsewhere in the row (since removed — the location is now
+    // the sole open path) — so the address underlined on
     // hover, showed a question-mark cursor, and did nothing when clicked. The
     // affordance has to match the behaviour.
     let s = server();
@@ -1602,6 +1609,27 @@ fn an_autonomi_location_looks_clickable_because_it_is() {
             openable.contains("cursor: pointer"),
             "{label} .result-loc.is-openable does not take a pointer cursor: {openable}"
         );
+
+        // …and it hovers the way the link it stands in for does. An http
+        // result's heading is a real <a> and takes the theme's link-hover
+        // colour; an Autonomi result's heading is this span, so withholding
+        // the same hover made the two layouts advertise clickability
+        // differently. Modern's rule is grouped with `.result-title:hover`
+        // and retro's mirrors its red; both are found by the same helper.
+        let hover = css_rule(
+            css,
+            &format!(r#"[data-theme="{label}"] .result-loc.is-openable:hover"#),
+        )
+        .unwrap_or_else(|| panic!("{label} has no hover rule for the openable location"));
+        let expected = if label == "modern" {
+            "color: var(--accent)"
+        } else {
+            "color: #ee0000"
+        };
+        assert!(
+            hover.contains(expected),
+            "{label}'s openable location must hover like the title link: {hover}"
+        );
     }
 
     // And the click is really wired, keyed as well as pointed.
@@ -1621,19 +1649,42 @@ fn an_autonomi_location_looks_clickable_because_it_is() {
 }
 
 #[test]
-fn the_page_offers_open_and_save_for_an_autonomi_row() {
+fn the_autonomi_row_opens_through_its_location_and_carries_no_buttons() {
+    // The row deliberately has no Open or Save button: the location is the open
+    // path (a click opens what the browser can show and downloads what it
+    // cannot), the outcome lands on the status line, and the fetch group holds
+    // nothing but Stop — revealed only while bytes are moving.
     let script = server().get("/assets/app.js");
     assert_eq!(script.status, 200);
     let js = script.body.as_str();
     for needle in [
-        "data-role=\"open\"",
-        "data-role=\"save\"",
+        "data-role=\"fetch-stop\"",
         "autonomiAddress",
         "/api/index/bytes",
         "/api/view/blob",
     ] {
         assert!(js.contains(needle), "app.js is missing {needle}");
     }
+    for gone in ["data-role=\"open\"", "data-role=\"save\""] {
+        assert!(
+            !js.contains(gone),
+            "app.js still wires the removed control {gone}"
+        );
+    }
+    // And the markup agrees: no button to click, but a stoppable fetch.
+    let page = server().get("/").body;
+    assert!(
+        !page.contains(">Open</button>"),
+        "the template still offers an Open button"
+    );
+    assert!(
+        !page.contains(">Save</button>"),
+        "the template still offers a Save button"
+    );
+    assert!(
+        page.contains(">Stop</button>"),
+        "a running fetch can no longer be stopped"
+    );
     /* No 501 stub is left to call, and the honest refusal to guess a filename
      * must not come back: the server supplies the name. */
     assert!(
@@ -3706,7 +3757,7 @@ fn the_tab_is_told_the_library_load_before_the_sdk_can_report_it() {
     let body = js
         .split("async function fetchAutonomi")
         .nth(1)
-        .and_then(|rest| rest.split("\n/* Wire Open and Save").next())
+        .and_then(|rest| rest.split("\nfunction wireFetch").next())
         .expect("fetchAutonomi is gone");
 
     let step_at = body
@@ -3737,6 +3788,48 @@ fn connect_receives_its_abort_signal() {
     assert!(
         !js.contains("connect({ onProgress: progress }, { signal })"),
         "this drops the abort signal, because the second argument is not read"
+    );
+}
+
+#[test]
+fn stopping_a_browser_fetch_never_falls_back_to_the_daemon() {
+    // Stop aborts the WebRTC fetch, and the SDK can surface that abort with
+    // its own error wording — while an unrecognised fetch failure is exactly
+    // what routes to the daemon fallback. Left untranslated, Stop therefore
+    // started a *second* download with no Stop of its own. Two things must
+    // hold: `obtain` decides "stopped" from our own signal, whatever was
+    // thrown, and `runOpen` rethrows a stop before it can reach the fallback.
+    let js = js_code(&server().get("/assets/app.js").body);
+
+    let obtain = js
+        .split("const obtain = async")
+        .nth(1)
+        .expect("obtain is gone")
+        .split("const runOpen")
+        .next()
+        .expect("obtain is unbounded");
+    assert!(
+        obtain.contains("controller.signal.aborted"),
+        "a stop must be recognised by our own signal, not the SDK's wording: {obtain}"
+    );
+    assert!(
+        obtain.contains("throw new DownloadCancelled()"),
+        "obtain does not recast the abort into a stop: {obtain}"
+    );
+
+    let open = js
+        .split("const runOpen = async")
+        .nth(1)
+        .expect("runOpen is gone");
+    let fallback_at = open
+        .find("fetchViaDaemon")
+        .expect("the daemon fallback is gone");
+    let stop_at = open
+        .find("err.name === 'DownloadCancelled'")
+        .expect("runOpen does not recognise a stop");
+    assert!(
+        stop_at < fallback_at,
+        "the stop check must come before the daemon fallback, or Stop starts the fallback: {open}"
     );
 }
 
@@ -3871,7 +3964,7 @@ fn a_record_is_streamed_rather_than_downloaded_so_chunks_can_be_counted() {
     let body = js
         .split("async function fetchAutonomi")
         .nth(1)
-        .and_then(|rest| rest.split("\n/* Wire Open and Save").next())
+        .and_then(|rest| rest.split("\nfunction wireFetch").next())
         .expect("fetchAutonomi is gone");
 
     assert!(

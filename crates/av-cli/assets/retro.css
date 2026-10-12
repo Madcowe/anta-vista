@@ -309,6 +309,13 @@
   cursor: pointer;
 }
 
+/* Same role as in modern.css: the openable location stands in for the link a
+   real <a> would be, so it takes the title's hover (the red above) too. The
+   un-marked case stays out of this rule: it does nothing when clicked. */
+[data-theme="retro"] .result-loc.is-openable:hover {
+  color: #ee0000;
+}
+
 [data-theme="retro"] .block-agents {
   display: inline-flex;
   gap: 4px;

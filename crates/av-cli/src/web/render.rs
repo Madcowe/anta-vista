@@ -268,16 +268,14 @@ const PAGE: &str = r##"<!doctype html>
         <button type="button" class="btn btn-quiet btn-block" data-role="block"
           title="Never show or serve this again on this machine">Block</button>
       </span>
-      <!-- Only for an Autonomi result, and only once the browser library is
-           known to be usable; app.js owns the visibility. "Stop" is hidden
-           until a fetch is actually running, because an offer to cancel
-           nothing is noise. -->
+      <!-- The fetch control for an Autonomi result, and only while a fetch is
+           running: an offer to cancel nothing is noise, so app.js reveals this
+           group for the duration of a fetch and hides it again after. There is
+           deliberately no Open or Save button — clicking the location itself
+           is the open path (it opens what the browser can show and downloads
+           what it cannot), and the outcome lands on the status line below. -->
       <span class="result-fetch" data-role="fetch" hidden>
-        <button type="button" class="btn btn-quiet btn-open" data-role="open"
-          title="Fetch this from the Autonomi network and open it in a tab">Open</button>
-        <button type="button" class="btn btn-quiet btn-save" data-role="save"
-          title="Fetch this from the Autonomi network and save it to this device">Save</button>
-        <button type="button" class="btn btn-quiet btn-fetch-stop" data-role="fetch-stop" hidden
+        <button type="button" class="btn btn-quiet btn-fetch-stop" data-role="fetch-stop"
           title="Stop fetching this file">Stop</button>
       </span>
       <!-- Fetch progress and outcome get their own line rather than reusing
