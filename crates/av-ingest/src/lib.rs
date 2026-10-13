@@ -1,3 +1,4 @@
+pub mod ant_manifest;
 pub mod describe;
 pub mod error;
 pub mod filename;

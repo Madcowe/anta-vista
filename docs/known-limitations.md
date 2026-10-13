@@ -161,8 +161,14 @@ though it is the obvious thing to try. A single self-contained file does work, b
 `try.autonomi.com` also ships a strict `Content-Security-Policy`, and the served
 page inherits nothing from the original record's headers.
 
-Folder and manifest support is expected to arrive in the Autonomi client rather
-than be reimplemented here.
+Folder and manifest *expansion* is expected to arrive in the Autonomi client
+rather than be reimplemented here. anta-vista does read a `.ant` manifest at
+ingest — it sniffs the bytes, describes the file by listing its entries, and
+stores the first few hundred paths locally — but it never expands a manifest
+into the files it names, and a manifest *link* (`autonomi://manifest/…`) is
+refused with an explanation rather than fetched: the bytes travel in the link
+itself, so there is nothing on the network to download. To index one, save the
+link's base64url payload as a `.ant` file and index that file instead.
 
 ### Downloads depend on how many seeds are reachable
 

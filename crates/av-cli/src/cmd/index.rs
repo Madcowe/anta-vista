@@ -60,6 +60,14 @@ pub fn index_resource(
     on_progress: Option<&dyn Fn(DownloadEvent)>,
 ) -> CliResult<IndexOutcome> {
     // --- Step 1: Verify URI (unless skipped) --------------------------------
+    // Checked before that step deliberately: a manifest link's bytes travel in
+    // the link itself, and the reachability check below would wrap this
+    // precise error in a generic "URI unreachable".
+    if av_ingest::location::is_manifest_link(uri) {
+        return Err(CliError::Validation(
+            av_ingest::location::manifest_link_error(uri),
+        ));
+    }
     // Only this path checks, because it is the one that has to reach the resource
     // before it can fetch it. A caller already holding the bytes has, by
     // definition, already reached it.
@@ -259,6 +267,15 @@ pub fn run(
     force: bool,
 ) -> CliResult<()> {
     let uri = av_ingest::location::normalize_uri(&uri);
+
+    // A manifest link needs no daemon at all — the bytes are the link — so it
+    // is refused before Step 0 could offer to install one for it.
+    if av_ingest::location::is_manifest_link(&uri) {
+        return Err(CliError::Validation(
+            av_ingest::location::manifest_link_error(&uri),
+        ));
+    }
+
     let db_path = av_core::paths::db_path()
         .ok_or_else(|| CliError::Database("Failed to determine database path".to_string()))?;
     let conn = av_store::open(&db_path).map_err(|e| CliError::Database(e.to_string()))?;

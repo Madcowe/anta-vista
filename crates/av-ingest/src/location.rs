@@ -39,6 +39,10 @@ pub fn analyze_location(location: &str) -> LocationInfo {
         };
     }
 
+    if let Some(manifest) = parse_manifest_location(rest) {
+        return manifest;
+    }
+
     match parse_ant_location(rest) {
         Some(parsed) => LocationInfo {
             scheme: Some(scheme),
@@ -51,6 +55,72 @@ pub fn analyze_location(location: &str) -> LocationInfo {
             inferred_filename: None,
         },
     }
+}
+
+/// A manifest link (ADR-0006): `autonomi://manifest/<unpadded base64url of
+/// the complete .ant bytes>`. The authority is the literal `manifest`, the
+/// payload is the rest of the link verbatim — base64url is case-sensitive,
+/// so nothing here may be folded — and there is no query, fragment or
+/// further path to carry.
+///
+/// Anything that fails these checks is *not* a manifest link and falls
+/// through to the ordinary address parse unchanged, which is the honest
+/// answer for a location we cannot account for. Note the payload is never
+/// decoded here: the bytes travel in the link, and this only recognises the
+/// shape that says where they are.
+fn parse_manifest_location(rest: &str) -> Option<LocationInfo> {
+    let (authority, payload) = split_path(rest);
+    let payload = payload?;
+    if !authority.eq_ignore_ascii_case("manifest") || payload.is_empty() {
+        return None;
+    }
+    if payload.contains(['?', '#']) {
+        return None;
+    }
+    // Strict unpadded base64url: no padding, no `+/`, no percent escapes.
+    if !payload
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some(LocationInfo {
+        scheme: Some("autonomi".to_string()),
+        canonical: Some(format!("{MANIFEST_LINK_PREFIX}{payload}")),
+        inferred_filename: None,
+    })
+}
+
+/// The canonical prefix of a manifest link (ADR-0006): `autonomi://manifest/`
+/// followed by the unpadded base64url of the complete `.ant` bytes.
+pub const MANIFEST_LINK_PREFIX: &str = "autonomi://manifest/";
+
+/// True when `location` is an Autonomi manifest link.
+///
+/// Runs the same parse [`analyze_location`] would, rather than testing the
+/// canonical string for the prefix: a location that *failed* the manifest
+/// checks falls through with its raw text as the canonical, and that text
+/// starts with the prefix too — `autonomi://manifest/QUJD?x=1` would then
+/// pass a prefix test it has not earned.
+pub fn is_manifest_link(location: &str) -> bool {
+    let normalized = normalize_uri(location);
+    let Some((raw_scheme, rest)) = normalized.split_once("://") else {
+        return false;
+    };
+    av_core::types::normalize_scheme(raw_scheme) == "autonomi"
+        && parse_manifest_location(rest).is_some()
+}
+
+/// The one explanation for a manifest link reaching a fetch or verify path:
+/// its bytes travel in the link itself, so there is nothing on the network to
+/// reach. Stated once so `av index`, `av name`, the download backstop and the
+/// web handlers that share them cannot drift.
+pub fn manifest_link_error(location: &str) -> String {
+    format!(
+        "{location} is an Autonomi manifest link: the .ant bytes travel in the link itself, \
+         not on the network, so there is nothing to fetch. Save it as a .ant file and index \
+         that instead."
+    )
 }
 
 struct ParsedAntLocation {
@@ -431,5 +501,42 @@ mod tests {
             info.inferred_filename.as_deref(),
             Some("archive org details some book title chapter 5.pdf")
         );
+    }
+
+    #[test]
+    fn a_manifest_link_keeps_its_payload_verbatim() {
+        // base64url is case-sensitive: folding the authority must not fold the
+        // bytes it carries.
+        const URI: &str = "autonomi://manifest/QUJD-ef_12";
+        let info = analyze_location(URI);
+        assert_eq!(info.scheme.as_deref(), Some("autonomi"));
+        assert_eq!(info.canonical.as_deref(), Some(URI));
+        assert_eq!(info.inferred_filename, None);
+        assert!(is_manifest_link(URI));
+    }
+
+    #[test]
+    fn a_manifest_link_accepts_the_ant_alias_and_an_uppercase_authority() {
+        assert!(is_manifest_link("ant://manifest/QUJD"));
+        assert_eq!(
+            analyze_location("autonomi://MANIFEST/QUJD")
+                .canonical
+                .as_deref(),
+            Some("autonomi://manifest/QUJD")
+        );
+    }
+
+    #[test]
+    fn things_that_are_not_manifest_links_fall_through() {
+        for uri in [
+            "autonomi://manifest",           // no payload
+            "autonomi://manifest/QUJD?x=1",  // a query is not part of a link
+            "autonomi://manifest/QUJD#frag", // neither is a fragment
+            "autonomi://manifest/QU+D",      // padded/base64, not unpadded base64url
+            "autonomi://manifest/QUJD/",     // a further path is not one
+            "autonomi://manifest/QU%4aD",    // percent escapes are not decoded
+        ] {
+            assert!(!is_manifest_link(uri), "{uri} must not be a manifest link");
+        }
     }
 }

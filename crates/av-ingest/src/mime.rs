@@ -63,6 +63,15 @@ fn detect_mime_inner(bytes: &[u8], confidence: Confidence) -> IngestResult<Strin
         return Ok(kind.mime_type().to_string());
     }
 
+    // Autonomi file manifest (`.ant`): a magic like any other, so it holds on
+    // a prefix too, and — unlike the HTML marker — it is a fixed header rather
+    // than a token searched for. Keyed on the bytes alone, never on an `.ant`
+    // name: a non-manifest file merely *called* `.ant` keeps its real sniff,
+    // and only content ever asserts this type.
+    if bytes.starts_with(crate::ant_manifest::MAGIC) {
+        return Ok(av_core::constants::ANT_MANIFEST_MIME.to_string());
+    }
+
     // Fallback: check if it looks like UTF-8 text
     if std::str::from_utf8(bytes).is_ok() {
         // Further check for HTML. A positive marker in the first 512 bytes, so
@@ -265,13 +274,35 @@ pub fn mime_sub(mime: &str) -> &str {
 
 #[cfg(test)]
 mod hint_tests {
-    use super::detect_mime_with_hint;
+    use super::{detect_mime, detect_mime_prefix, detect_mime_with_hint};
 
     /// A page that sniffs as plain text: no markup token appears in it, which is
     /// exactly the real case — a file starting with a BOM, a comment, or a long
     /// `<head>` of attributes has nothing for a content sniffer to key on.
     const OBFUSCATED_HTML: &[u8] =
         b"\xef\xbb\xbfconsole.log(1);/* the opening tag is built here: 'ht'+'ml' */";
+
+    #[test]
+    fn only_manifest_content_asserts_a_manifest_type() {
+        // The `.ant` name resolves nothing: the type is a magic, so the
+        // extension stays off the hint list, and a text file merely called
+        // `.ant` keeps its real sniff. The magic — all four bytes of it, so it
+        // survives a prefix sniff — asserts it regardless of what the name
+        // claims the other way.
+        assert_eq!(
+            detect_mime_with_hint(b"just some words", Some("site.ant")).unwrap(),
+            "text/plain"
+        );
+        assert_eq!(
+            detect_mime(crate::ant_manifest::MAGIC).unwrap(),
+            av_core::constants::ANT_MANIFEST_MIME
+        );
+        assert_eq!(
+            detect_mime_prefix(crate::ant_manifest::MAGIC, Some("page.html")).unwrap(),
+            av_core::constants::ANT_MANIFEST_MIME,
+            "content wins over a name that claims something else"
+        );
+    }
 
     #[test]
     fn a_known_extension_resolves_the_generic_sniff() {

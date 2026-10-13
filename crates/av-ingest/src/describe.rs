@@ -1,11 +1,12 @@
 use crate::{filename::tokenize_filename_opt, metadata::ExtractedMeta};
-use av_core::constants::{EMBED_WINDOW_CHARS, WATCHLIST_MIME};
+use av_core::constants::{ANT_MANIFEST_MIME, EMBED_WINDOW_CHARS, WATCHLIST_MIME};
 
 /// Semantic label for a MIME type, used in description synthesis.
 /// Returns (with_filename_label, no_filename_fallback).
 pub fn semantic_label(mime: &str) -> (&'static str, &'static str) {
     match mime {
         "application/x-watch-list" => ("watch list", "media watch list"),
+        ANT_MANIFEST_MIME => ("file manifest", "file manifest"),
         "image/jpeg" | "image/jpg" => ("image", "photograph or image"),
         "image/png" => ("image", "image"),
         "image/gif" => ("animated image or gif", "animated image or gif"),
@@ -59,6 +60,69 @@ pub fn watchlist_base(mime: &str, filename: Option<&str>, meta: &ExtractedMeta) 
             format!("a {} file", no_fn_label)
         }
     }
+}
+
+/// Base description for an Autonomi file manifest (`.ant`): the bare type,
+/// qualified by the name the creator gave it or the name the file was saved
+/// under, in that order.
+///
+/// The manifest's own `name` outranks the filename deliberately: it is the
+/// label its creator chose (a suggested root directory name), while the
+/// filename of a record fetched from the network is often an address-derived
+/// `….ant` that says nothing. Mirrors `watchlist_base`'s shape otherwise —
+/// stem tokens only, so a URL's directories cannot eat the embed window.
+pub fn manifest_base(filename: Option<&str>, meta: &ExtractedMeta) -> String {
+    let mut base = if let Some(title) = meta
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        format!("an autonomi file manifest titled \"{title}\"")
+    } else {
+        let stem = filename.and_then(|f| {
+            std::path::Path::new(f)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+        });
+        match stem.as_deref().and_then(tokenize_filename_opt) {
+            Some(tokens) => format!("an autonomi file manifest for {tokens}"),
+            None => "an autonomi file manifest".to_string(),
+        }
+    };
+    // A record that stored only the first batch of entries says the true
+    // total here, because `synthesize` then lists no paths at all: a partial
+    // listing whose tail counts the stored prefix would miscount the file.
+    if let Some(count) = manifest_stored_incomplete(meta) {
+        base = format!("{base} with {count} entries");
+    }
+    base
+}
+
+/// The true entry count when the stored record holds only a prefix of the
+/// manifest's entries, else `None`.
+fn manifest_stored_incomplete(meta: &ExtractedMeta) -> Option<usize> {
+    let manifest = meta.extra.get("manifest")?;
+    let count = manifest.get("entry_count")?.as_u64()? as usize;
+    let stored = manifest.get("entries")?.as_array()?.len();
+    Some(count).filter(|count| count > &stored)
+}
+
+/// Every stored entry's path, in manifest order (entries without a path
+/// extract under their content address and have nothing to show).
+fn manifest_paths(meta: &ExtractedMeta) -> Vec<String> {
+    meta.extra
+        .get("manifest")
+        .and_then(|m| m.get("entries"))
+        .and_then(|e| e.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("path").and_then(|p| p.as_str()))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Fill a description into the embedding window: base first, then optional
@@ -163,6 +227,19 @@ pub fn synthesize(mime: &str, filename: Option<&str>, meta: &ExtractedMeta) -> S
         return fill_into_window(&base, &items, None, EMBED_WINDOW_CHARS);
     }
 
+    if mime == ANT_MANIFEST_MIME {
+        // A manifest describes itself by listing: base first (which carries
+        // the true total when only a prefix of entries was stored), then
+        // every path we can honestly claim to hold.
+        let base = manifest_base(filename, meta);
+        let items = if manifest_stored_incomplete(meta).is_some() {
+            Vec::new()
+        } else {
+            manifest_paths(meta)
+        };
+        return fill_into_window(&base, &items, None, EMBED_WINDOW_CHARS);
+    }
+
     let subtype = mime.split('/').nth(1).unwrap_or("unknown");
     let (with_fn_label, no_fn_label) = semantic_label(mime);
     let major = mime.split('/').next().unwrap_or("");
@@ -213,6 +290,95 @@ pub fn synthesize(mime: &str, filename: Option<&str>, meta: &ExtractedMeta) -> S
 mod tests {
     use super::*;
     use av_core::constants::WATCHLIST_MIME;
+    use serde_json::json;
+
+    fn manifest_meta(
+        name: Option<&str>,
+        entry_count: usize,
+        entries: serde_json::Value,
+    ) -> ExtractedMeta {
+        ExtractedMeta {
+            title: name.map(str::to_owned),
+            extra: json!({
+                "manifest": { "name": name, "entry_count": entry_count, "entries": entries }
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_manifest_describes_itself_by_listing_its_entries() {
+        let meta = manifest_meta(
+            Some("site"),
+            2,
+            json!([
+                {"path": "index.html", "size": 120, "source": "public"},
+                {"path": "style.css", "size": 34, "source": "embedded"},
+            ]),
+        );
+        // The creator's own name outranks the address-derived filename.
+        let description = synthesize(ANT_MANIFEST_MIME, Some("711c7e20.ant"), &meta);
+        assert_eq!(
+            description,
+            "an autonomi file manifest titled \"site\" containing: index.html, style.css"
+        );
+    }
+
+    #[test]
+    fn a_manifest_without_a_name_falls_back_to_its_filename_then_the_bare_type() {
+        let meta = manifest_meta(None, 0, json!([]));
+        assert_eq!(
+            synthesize(ANT_MANIFEST_MIME, Some("photo-gallery.ant"), &meta),
+            "an autonomi file manifest for photo gallery"
+        );
+        assert_eq!(
+            synthesize(ANT_MANIFEST_MIME, None, &meta),
+            "an autonomi file manifest"
+        );
+    }
+
+    #[test]
+    fn an_entry_without_a_path_contributes_nothing_to_the_listing() {
+        // Entries without a path are extracted under their content address and
+        // carry nothing worth showing; the ones that do keep their order.
+        let meta = manifest_meta(
+            Some("site"),
+            2,
+            json!([
+                {"path": null, "size": 3, "source": "embedded"},
+                {"path": "b.txt", "size": 1, "source": "public"},
+            ]),
+        );
+        assert_eq!(
+            synthesize(ANT_MANIFEST_MIME, None, &meta),
+            "an autonomi file manifest titled \"site\" containing: b.txt"
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_stored_only_a_prefix_of_its_entries_counts_them_instead_of_listing() {
+        // The honesty rule: `metadata_json` keeps the first 500 entries, so
+        // when only a prefix is stored the description states the true total
+        // and lists nothing — a partial listing's fill tail would count the
+        // stored prefix as though it were the whole manifest.
+        let meta = manifest_meta(
+            Some("big"),
+            100_000,
+            json!([
+                {"path": "a/1.txt", "size": 1, "source": "public"},
+                {"path": "a/2.txt", "size": 1, "source": "public"},
+            ]),
+        );
+        let description = synthesize(ANT_MANIFEST_MIME, None, &meta);
+        assert_eq!(
+            description,
+            "an autonomi file manifest titled \"big\" with 100000 entries"
+        );
+        assert!(
+            !description.contains("containing"),
+            "the stored prefix must not be presented as the manifest"
+        );
+    }
 
     #[test]
     fn watchlist_base_uses_only_last_segment_stem() {

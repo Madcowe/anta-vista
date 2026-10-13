@@ -123,6 +123,7 @@ fn kind_to_str(k: &ResourceKind) -> &str {
         ResourceKind::File => "file",
         ResourceKind::Pdf => "pdf",
         ResourceKind::WatchList => "watchlist",
+        ResourceKind::Manifest => "manifest",
         ResourceKind::Other(_) => "other",
     }
 }
@@ -135,6 +136,7 @@ fn str_to_kind(s: &str) -> ResourceKind {
         "file" => ResourceKind::File,
         "pdf" => ResourceKind::Pdf,
         "watchlist" => ResourceKind::WatchList,
+        "manifest" => ResourceKind::Manifest,
         other => ResourceKind::Other(other.to_owned()),
     }
 }
@@ -153,6 +155,7 @@ mod tests {
             ResourceKind::File,
             ResourceKind::Pdf,
             ResourceKind::WatchList,
+            ResourceKind::Manifest,
         ];
         for kind in kinds {
             assert_eq!(str_to_kind(kind_to_str(&kind)), kind);
@@ -188,6 +191,7 @@ mod tests {
     #[test]
     fn str_to_kind_unknown_becomes_other() {
         assert_eq!(str_to_kind("watchlist"), ResourceKind::WatchList);
+        assert_eq!(str_to_kind("manifest"), ResourceKind::Manifest);
         assert_eq!(
             str_to_kind("mystery"),
             ResourceKind::Other("mystery".to_owned())

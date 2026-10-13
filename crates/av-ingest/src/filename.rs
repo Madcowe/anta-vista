@@ -134,7 +134,10 @@ pub fn suggest_filename_with(location: &str, known_name: Option<&str>, mime: &st
 /// The inverse of `mime::HINTED_TYPES`, and kept complete against it: a type we
 /// are willing to *resolve* on a name is a type we should be willing to *name*,
 /// or the two disagree and a `.csv` file is downloaded as an untyped blob.
-/// `every_type_we_would_resolve_can_also_be_named` pins the pairing.
+/// `every_type_we_would_resolve_can_also_be_named` pins the pairing. The reverse
+/// direction is allowed to run wider — a name-only entry (`.ant`) simply says
+/// what a manifest a browser holds should be called, without pretending the
+/// extension could have proved the type.
 pub(crate) fn extension_for_mime(mime: &str) -> Option<&'static str> {
     let mime = mime.split(';').next().unwrap_or(mime).trim();
     Some(match mime {
@@ -164,6 +167,10 @@ pub(crate) fn extension_for_mime(mime: &str) -> Option<&'static str> {
         "video/quicktime" => "mov",
         "application/zip" => "zip",
         "application/xhtml+xml" => "xhtml",
+        // Name-only, the mirror of what the `.ant` hint deliberately is not:
+        // content is what decides a manifest, but a manifest a browser saved
+        // (or an unnamed one at all) must not come back as an untyped blob.
+        "application/vnd.autonomi.manifest" => "ant",
         _ => return None,
     })
 }
@@ -230,6 +237,18 @@ mod tests {
                 "{blank:?} must not produce an empty or dotted name"
             );
         }
+    }
+
+    #[test]
+    fn a_manifest_saved_without_an_extension_gets_the_one_it_is_known_by() {
+        // The pairing's one name-only member: `.ant` never *proves* a type —
+        // the sniff does that — but a manifest we know about must still be
+        // saved under an extension the system can open.
+        let uri = format!("autonomi://{HEX}");
+        assert_eq!(
+            suggest_filename_with(&uri, Some("site"), av_core::constants::ANT_MANIFEST_MIME),
+            "site.ant"
+        );
     }
 
     #[test]

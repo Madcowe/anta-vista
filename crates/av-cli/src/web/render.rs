@@ -391,124 +391,124 @@ pub fn vendor_asset(rel: &str) -> Option<WebResponse> {
     let (mime, body): (&str, &[u8]) = match rel {
         "capabilities.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/capabilities.js").as_slice(),
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/capabilities.js").as_slice(),
         ),
         "client.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/client.js").as_slice(),
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/client.js").as_slice(),
         ),
         "errors.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/errors.js").as_slice(),
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/errors.js").as_slice(),
         ),
         "file-reader.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/file-reader.js").as_slice(),
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/file-reader.js").as_slice(),
         ),
         "index.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/index.js").as_slice(),
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/index.js").as_slice(),
         ),
         "internal/abort.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/abort.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/internal/abort.js")
                 .as_slice(),
         ),
         "internal/media.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/media.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/internal/media.js")
                 .as_slice(),
         ),
         "internal/payment-network.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/payment-network.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/internal/payment-network.js")
                 .as_slice(),
         ),
         "internal/progress.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/progress.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/internal/progress.js")
                 .as_slice(),
         ),
         "internal/protocol.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/protocol.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/internal/protocol.js")
                 .as_slice(),
         ),
         "internal/record-store.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/record-store.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/internal/record-store.js")
                 .as_slice(),
         ),
         "internal/runtime.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/runtime.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/internal/runtime.js")
                 .as_slice(),
         ),
         "internal/snapshot.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/snapshot.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/internal/snapshot.js")
                 .as_slice(),
         ),
         "internal/staging.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/staging.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/internal/staging.js")
                 .as_slice(),
         ),
         "internal/upload-recovery.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/upload-recovery.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/internal/upload-recovery.js")
                 .as_slice(),
         ),
         "internal/upload-sources.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/upload-sources.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/internal/upload-sources.js")
                 .as_slice(),
         ),
         "internal/window-checkpoint.js" => (
             JS_MIME,
             include_bytes!(
-                "../../assets/vendor/ant-browser-sdk/0.1.1/internal/window-checkpoint.js"
+                "../../assets/vendor/ant-browser-sdk/0.1.2/internal/window-checkpoint.js"
             )
             .as_slice(),
         ),
         "internal/window-stager.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/internal/window-stager.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/internal/window-stager.js")
                 .as_slice(),
         ),
         "limits.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/limits.js").as_slice(),
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/limits.js").as_slice(),
         ),
         "manual-payment.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/manual-payment.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/manual-payment.js")
                 .as_slice(),
         ),
         "network-profile.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/network-profile.js")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/network-profile.js")
                 .as_slice(),
         ),
         "payment.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/payment.js").as_slice(),
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/payment.js").as_slice(),
         ),
         "save.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/save.js").as_slice(),
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/save.js").as_slice(),
         ),
         "upload-worker.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/upload-worker.js").as_slice(),
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/upload-worker.js").as_slice(),
         ),
         "wasm/ant_core.js" => (
             JS_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/wasm/ant_core.js").as_slice(),
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/wasm/ant_core.js").as_slice(),
         ),
         "wasm/ant_core_bg.wasm" => (
             WASM_MIME,
-            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.1/wasm/ant_core_bg.wasm")
+            include_bytes!("../../assets/vendor/ant-browser-sdk/0.1.2/wasm/ant_core_bg.wasm")
                 .as_slice(),
         ),
         _ => return None,
@@ -547,10 +547,10 @@ pub fn vendor_rel_path(path: &str) -> Option<&str> {
 /// Version of the vendored Autonomi browser SDK. Part of the asset path so a
 /// future SDK lands under a new prefix and browsers cannot serve a stale mix of
 /// two versions' modules against one cached WASM binary.
-pub const SDK_VERSION: &str = "0.1.1";
+pub const SDK_VERSION: &str = "0.1.2";
 
 /// Where the vendored SDK is served from, relative to this server's root.
-pub const SDK_BASE: &str = "/assets/vendor/autonomi-sdk/0.1.1/";
+pub const SDK_BASE: &str = "/assets/vendor/autonomi-sdk/0.1.2/";
 
 const CSS_MIME: &str = "text/css; charset=utf-8";
 const JS_MIME: &str = "application/javascript; charset=utf-8";

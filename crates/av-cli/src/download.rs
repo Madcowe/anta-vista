@@ -62,6 +62,14 @@ pub fn download_content(
     on_event: Option<&dyn Fn(DownloadEvent)>,
     opts: DownloadOptions,
 ) -> CliResult<Vec<u8>> {
+    // Backstop: a manifest link's bytes travel in the link itself, so neither
+    // antd nor the ant CLI can hold them — every backend below would fail on
+    // a link that was never addressable, with a confusing daemon error.
+    if av_ingest::location::is_manifest_link(uri) {
+        return Err(CliError::Validation(
+            av_ingest::location::manifest_link_error(uri),
+        ));
+    }
     let location_info = av_ingest::location::analyze_location(uri);
     let scheme = location_info.scheme.as_deref().unwrap_or("file");
 
@@ -194,6 +202,14 @@ pub fn verify_uri_exists(uri: &str) -> CliResult<()> {
             Ok(())
         }
         "autonomi" => {
+            // Nothing on the network holds a manifest link's bytes — they are
+            // the link — so a backend check could only ever report "unreachable"
+            // about a location that was never addressable.
+            if av_ingest::location::is_manifest_link(uri) {
+                return Err(CliError::Validation(
+                    av_ingest::location::manifest_link_error(uri),
+                ));
+            }
             // Check if antd daemon is running via health endpoint.
             let health_url = "http://localhost:8082/health";
             let healthy = match ureq::get(health_url).call() {
@@ -596,6 +612,29 @@ mod tests {
             .map(|c| c.index)
             .collect();
         assert_eq!(retried, vec![2]);
+    }
+
+    #[test]
+    fn a_manifest_link_is_refused_with_a_precise_error() {
+        // Both halves of "can we reach this URI?" must name the real problem:
+        // a manifest link's bytes are the link, so a fetch would fail in a
+        // backend that never had them, and a verify would go hunting for a
+        // daemon that cannot help.
+        const URI: &str = "autonomi://manifest/QUJD";
+        let err = download_content(URI, None, DownloadOptions::default())
+            .expect_err("nothing on the network holds a manifest link");
+        match err {
+            CliError::Validation(msg) => {
+                assert!(msg.contains("manifest link"), "{msg}");
+                assert!(msg.contains(".ant file"), "{msg}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+        let err = verify_uri_exists(URI).expect_err("manifest links are never addressable");
+        match err {
+            CliError::Validation(msg) => assert!(msg.contains("manifest link"), "{msg}"),
+            other => panic!("expected a validation error, got {other:?}"),
+        }
     }
 
     /// The end-to-end shape: a file that grows between polls, read through the

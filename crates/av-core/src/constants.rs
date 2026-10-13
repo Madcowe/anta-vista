@@ -31,6 +31,15 @@ pub const EMBED_WINDOW_CHARS: usize = 1024;
 pub const WATCHLIST_MIME: &str = "application/x-watch-list";
 
 // ---------------------------------------------------------------------------
+// Autonomi file manifest (`.ant`, ant-client ADR-0006) file type
+// ---------------------------------------------------------------------------
+/// MIME type of an Autonomi file manifest, recognised from its magic bytes
+/// alone. Deliberately absent from the extension-hint table: the `.ant` name
+/// is only ever a *name*, and letting it produce this type would relabel any
+/// text file that happens to be called `.ant` as a manifest.
+pub const ANT_MANIFEST_MIME: &str = "application/vnd.autonomi.manifest";
+
+// ---------------------------------------------------------------------------
 // URI schemes
 // ---------------------------------------------------------------------------
 /// Input alias accepted for the canonical `autonomi` scheme.

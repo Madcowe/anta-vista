@@ -32,6 +32,8 @@ pub enum ResourceKind {
     Pdf,
     /// W@tch (Watch-It) `.watch-list` media bundle.
     WatchList,
+    /// Autonomi file manifest (`.ant`, ant-client ADR-0006).
+    Manifest,
     Other(String),
 }
 

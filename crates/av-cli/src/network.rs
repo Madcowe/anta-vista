@@ -84,6 +84,8 @@ pub fn execute_search(
             "audio" => av_core::types::ResourceKind::Audio,
             "file" => av_core::types::ResourceKind::File,
             "pdf" => av_core::types::ResourceKind::Pdf,
+            "watchlist" => av_core::types::ResourceKind::WatchList,
+            "manifest" => av_core::types::ResourceKind::Manifest,
             other => av_core::types::ResourceKind::Other(other.to_owned()),
         };
         query_filter.kind = av_index::filter::KindFilter::new(vec![rk]);

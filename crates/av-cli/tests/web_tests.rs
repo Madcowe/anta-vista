@@ -1584,13 +1584,13 @@ fn an_oversized_upload_is_refused_rather_than_truncated() {
 #[test]
 fn the_vendored_sdk_is_served_with_types_the_browser_accepts() {
     let s = server();
-    let js = s.get("/assets/vendor/autonomi-sdk/0.1.1/index.js");
+    let js = s.get("/assets/vendor/autonomi-sdk/0.1.2/index.js");
     assert_eq!(js.status, 200, "vendor index.js missing: {}", js.body);
     assert!(js.headers.contains("javascript"), "{}", js.headers);
 
     // The WASM is the reason the WASM MIME rule exists: served as
     // `application/octet-stream` a module import fails to stream-compile.
-    let wasm = s.get("/assets/vendor/autonomi-sdk/0.1.1/wasm/ant_core_bg.wasm");
+    let wasm = s.get("/assets/vendor/autonomi-sdk/0.1.2/wasm/ant_core_bg.wasm");
     assert_eq!(wasm.status, 200);
     assert!(
         wasm.headers.contains("application/wasm"),
@@ -1602,7 +1602,7 @@ fn the_vendored_sdk_is_served_with_types_the_browser_accepts() {
     // The runtime prefix and the boot global the classic app.js reads must agree.
     let page = s.get("/");
     assert!(
-        page.body.contains("/assets/vendor/autonomi-sdk/0.1.1/"),
+        page.body.contains("/assets/vendor/autonomi-sdk/0.1.2/"),
         "page does not name the sdk base"
     );
 }
@@ -1610,8 +1610,8 @@ fn the_vendored_sdk_is_served_with_types_the_browser_accepts() {
 #[test]
 fn vendor_paths_cannot_escape_the_vendored_directory() {
     for path in [
-        "/assets/vendor/antonomi-sdk/0.1.1/../../../etc/passwd",
-        "/assets/vendor/autonomi-sdk/0.1.1/wasm/../../../../Cargo.toml",
+        "/assets/vendor/antonomi-sdk/0.1.2/../../../etc/passwd",
+        "/assets/vendor/autonomi-sdk/0.1.2/wasm/../../../../Cargo.toml",
     ] {
         let res = server().get(path);
         assert!(
@@ -4143,7 +4143,7 @@ fn the_vendored_sdk_is_cacheable_because_its_url_carries_the_version() {
     // compiling, and two tabs opening at once competed for the same CPU doing it
     // twice. The version is in the path, so nothing here can change meaning in
     // place and a year-long immutable cache is safe.
-    let sdk = server().get("/assets/vendor/autonomi-sdk/0.1.1/wasm/ant_core_bg.wasm");
+    let sdk = server().get("/assets/vendor/autonomi-sdk/0.1.2/wasm/ant_core_bg.wasm");
     assert_eq!(sdk.status, 200);
     assert!(
         sdk.headers.contains("immutable"),

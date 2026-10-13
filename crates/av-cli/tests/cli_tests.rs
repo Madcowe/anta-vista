@@ -283,3 +283,48 @@ fn show_peers_is_a_search_flag_and_not_a_resolve_flag() {
         "resolve must not accept --show-peers"
     );
 }
+
+#[test]
+fn indexing_a_manifest_link_is_refused_before_any_daemon_or_model_work() {
+    // The bytes of a manifest link travel in the link itself, so there is
+    // nothing on the network to fetch: the refusal has to arrive before the
+    // antd gate could offer to install a daemon for it (a `MissingDependency`
+    // here would send the user to install a backend that cannot help), and
+    // before the model load or even the database open. The error names the
+    // real problem instead.
+    let cli = av_cli::Cli {
+        non_interactive: true,
+        config: None,
+        timeout: 1000,
+        stream: false,
+        verbose: 0,
+        command: None,
+    };
+    let startup_state = av_cli::startup::StartupState {
+        config: av_core::config::AvConfig::default(),
+        config_path: None,
+        x0x_config: None,
+        antd_running: false,
+        minilm_loaded: false,
+        listener_running: false,
+    };
+
+    let err = av_cli::cmd::index::run(
+        cli,
+        startup_state,
+        "autonomi://manifest/QUJD".to_string(),
+        None,
+        false,
+        false,
+        false,
+    )
+    .expect_err("nothing on the network holds a manifest link");
+
+    match err {
+        av_cli::cmd::CliError::Validation(msg) => {
+            assert!(msg.contains("manifest link"), "{msg}");
+            assert!(msg.contains(".ant file"), "{msg}");
+        }
+        other => panic!("expected a validation error, got {other:?}"),
+    }
+}

@@ -278,7 +278,7 @@ let sdkPromise = null;
  * poisoned cache. */
 function loadSdk() {
   if (!sdkPromise) {
-    const base = window.__AV_SDK_BASE__ || '/assets/vendor/autonomi-sdk/0.1.1/';
+    const base = window.__AV_SDK_BASE__ || '/assets/vendor/autonomi-sdk/0.1.2/';
     sdkPromise = import(`${base}index.js`).then(
       (mod) => ({ mod }),
       (err) => ({ error: `the Autonomi browser library could not be loaded (${err.message})` })

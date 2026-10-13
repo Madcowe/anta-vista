@@ -107,6 +107,7 @@ fn kind_from_mime(mime: &str) -> ResourceKind {
         "video" => ResourceKind::File,
         "text" => ResourceKind::Text,
         "application" => match mime {
+            av_core::constants::ANT_MANIFEST_MIME => ResourceKind::Manifest,
             "application/pdf" => ResourceKind::Pdf,
             _ => ResourceKind::File,
         },
