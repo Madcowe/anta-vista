@@ -94,6 +94,22 @@ fn error_response(e: crate::cmd::CliError) -> WebResponse {
     json_error(status, code, &e.to_string())
 }
 
+/// `GET /api/ping` — the cheapest possible "is this anta-vista?" answer.
+///
+/// No database, no dependency probe: `web::run` uses it to tell a second
+/// launch that the port it wanted is already held by another copy of this
+/// program (and so should be reused) rather than by something else entirely.
+pub fn ping() -> WebResponse {
+    json_response(
+        json!({
+            "ok": true,
+            "service": "anta-vista",
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+        .to_string(),
+    )
+}
+
 /// `GET /api/status` — the same fields `av status` prints, plus the live
 /// dependency probe the setup banner needs.
 pub fn status(state: &Arc<AppState>) -> WebResponse {

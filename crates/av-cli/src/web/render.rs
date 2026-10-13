@@ -78,6 +78,11 @@ const PAGE: &str = r##"<!doctype html>
 <!-- Shown when the network side needs attention. Populated from /api/deps. -->
 <div id="setup-banner" class="banner" hidden role="status"></div>
 
+<!-- Shown by app.js when the polls stop being answered: the server this page
+     was loaded from is gone. Deliberately not the setup banner, whose
+     install-only meaning is pinned by test. -->
+<div id="server-banner" class="banner" hidden role="status"></div>
+
 <main id="main">
   <div class="search-block">
     <form id="search-form" class="search" role="search">

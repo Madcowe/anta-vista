@@ -7,6 +7,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use crate::cmd::{CliError, CliResult};
 use crate::startup::StartupState;
@@ -97,9 +98,35 @@ pub fn run(
 
     // Bind before loading anything expensive, so a port conflict is reported
     // immediately rather than after a model download.
+    //
+    // A conflict with *another copy of this program* is not an error: the
+    // browser's close button does not stop the server, so the natural second
+    // start — another double-click of the binary, or `av web` while one runs —
+    // would otherwise die here, with the bind error printed where an icon
+    // launch has nowhere to print it. Reuse the instance that is already up:
+    // say where it is, open it the way a fresh launch would, and exit 0.
     let addr = SocketAddr::new(host, options.port);
-    let server =
-        Server::http(addr).map_err(|e| CliError::Other(format!("failed to bind {addr}: {e}")))?;
+    let port = options.port;
+    let server = match Server::http(addr) {
+        Ok(server) => server,
+        // tiny_http hands back a boxed error, so the `AddrInUse` kind has to
+        // be recovered by downcast before it can be matched.
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+                && already_running_at(host, port) =>
+        {
+            let url = format!("http://{host}:{port}/");
+            println!("anta-vista web interface is already running at {url}");
+            if options.open_browser {
+                open_browser(&url);
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(CliError::Other(format!("failed to bind {addr}: {e}")));
+        }
+    };
     let bound_port = server
         .server_addr()
         .to_ip()
@@ -143,6 +170,28 @@ pub fn run(
     // `server` is moved into the worker pool; from here on the process blocks.
     server::serve(state, server, options.run_for)
         .map_err(|e| CliError::Other(format!("web server failed: {e}")))
+}
+
+/// Probe a busy port for another copy of this program.
+///
+/// The caller only reaches this after a bind failed with `AddrInUse`, so the
+/// question is whether the squatter is an anta-vista web server we can reuse
+/// or something else entirely — in which case the caller reports the bind
+/// error as before. A hung anta-vista answers nothing and also falls through
+/// to the error, which is the honest answer: there is a process on the port
+/// but it is not usable.
+fn already_running_at(host: IpAddr, port: u16) -> bool {
+    let url = format!("http://{host}:{port}/api/ping");
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(800))
+        .build();
+    match agent.get(&url).call() {
+        Ok(resp) => resp
+            .into_json::<serde_json::Value>()
+            .map(|v| v["ok"] == true && v["service"] == "anta-vista")
+            .unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 /// Best-effort launch of the system browser.

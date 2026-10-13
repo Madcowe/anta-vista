@@ -68,6 +68,7 @@ const ui = {
   listenerStop: el('listener-stop'),
   overlay: el('overlay'),
   banner: el('setup-banner'),
+  serverBanner: el('server-banner'),
   form: el('search-form'),
   q: el('q'),
   autonomiOnly: el('autonomi-only'),
@@ -140,7 +141,16 @@ ui.themeToggle.addEventListener('click', () => {
 /* ------------------------------------------------------------------ api -- */
 
 async function api(path, options) {
-  const res = await fetch(path, options);
+  let res;
+  try {
+    res = await fetch(path, options);
+  } catch (err) {
+    /* A rejected fetch on loopback is not a flaky network: the server this
+     * page came from is gone. The next poll would notice within seconds, but
+     * the user just hit it — raise the banner now. */
+    noteServerDown();
+    throw err;
+  }
   let body = null;
   try {
     body = await res.json();
@@ -2060,6 +2070,42 @@ ui.listenerStop.addEventListener('click', () =>
   runService(ui.listenerStop, '/api/listener/stop', 'stop the listener', 'Listener stopped.')
 );
 
+/* -------------------------------------------------------- server heartbeat -- */
+
+/* This page is served by the very server it polls, so a rejected fetch on
+ * loopback means that server is gone — there is no transient network in
+ * between, and nothing in a page can start a process, so the banner's job is
+ * to say so honestly and to keep checking. While the server is down the poll
+ * runs every few seconds instead of every 15, which is what makes the tab
+ * come back on its own the moment av is started again on this address. */
+const SERVER_POLL_MS = 15000;
+const SERVER_RETRY_MS = 3000;
+let serverDown = false;
+
+function noteServerDown() {
+  if (serverDown) return;
+  serverDown = true;
+  const text = document.createElement('span');
+  text.textContent =
+    'The Anta-Vista server is not responding \u2014 it looks stopped. ' +
+    'Start it again (for example `av web`) and this page will reconnect ' +
+    'on its own once it is back on this address.';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn';
+  button.textContent = 'Check now';
+  button.addEventListener('click', () => refreshDeps());
+  ui.serverBanner.replaceChildren(text, button);
+  ui.serverBanner.hidden = false;
+}
+
+function noteServerUp() {
+  if (!serverDown) return;
+  serverDown = false;
+  ui.serverBanner.hidden = true;
+  ui.serverBanner.replaceChildren();
+}
+
 /* ---------------------------------------------------------- setup banner -- */
 
 /* The most recent /api/deps payload. `ensureServices` reads it to decide
@@ -2071,8 +2117,11 @@ async function refreshDeps() {
   try {
     data = await api('/api/deps');
   } catch (err) {
+    /* A network rejection has already raised the banner (see `api`); an HTTP
+     * error means the server is alive and answering, so neither belongs here. */
     return;
   }
+  noteServerUp();
   const d = data.deps || {};
   lastDeps = d;
 
@@ -2167,4 +2216,14 @@ ui.dialog.addEventListener('close', async () => {
 
 applyTheme(document.documentElement.dataset.theme || 'retro');
 refreshDeps();
-setInterval(refreshDeps, 15000);
+
+/* One poll at a time, on a chain rather than `setInterval`: a down server is
+ * re-checked every few seconds so a restart is noticed promptly, and the
+ * interval goes back to its lazy rate as soon as an answer comes back. */
+function scheduleDeps() {
+  setTimeout(async () => {
+    await refreshDeps();
+    scheduleDeps();
+  }, serverDown ? SERVER_RETRY_MS : SERVER_POLL_MS);
+}
+scheduleDeps();

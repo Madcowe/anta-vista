@@ -165,6 +165,10 @@ fn route(
         (_, "/assets/wordmark-retro.jpeg") => Ok(render::wordmark_retro()),
         (_, "/assets/wordmark-modern.jpeg") => Ok(render::wordmark_modern()),
 
+        // The cheapest route here: no state, no database, no probe. A second
+        // `av web` hitting a busy port asks this before concluding the
+        // squatter is another copy of the program.
+        (Method::Get, "/api/ping") => Ok(handlers::ping()),
         (Method::Get, "/api/status") => Ok(handlers::status(state)),
         (Method::Get, "/api/deps") => Ok(handlers::deps(state)),
         (Method::Get, "/api/search") => Ok(handlers::search(state, query)),

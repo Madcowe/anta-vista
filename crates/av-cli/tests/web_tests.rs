@@ -3342,6 +3342,109 @@ fn the_status_trigger_is_a_toggle_rather_than_an_open_button() {
     );
 }
 
+#[test]
+fn the_ping_endpoint_identifies_the_server() {
+    let body = server().get("/api/ping").body;
+    let v: Value = serde_json::from_str(&body).expect("ping answers JSON");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["service"], "anta-vista");
+}
+
+/// Run `av` in the same isolated environment the server harness uses, so a
+/// second launch cannot touch the developer's real database or daemons.
+fn isolated_web(args: &[&str]) -> std::process::Output {
+    let dir = std::env::temp_dir().join(format!("av-web-second-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    Command::new(env!("CARGO_BIN_EXE_av"))
+        .args(args)
+        .env("ANTA_VISTA_DB_PATH", dir.join("test.db"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("HOME", dir.join("home"))
+        .env("ANTA_VISTA_NO_AUTOSTART", "1")
+        .env("ANTA_VISTA_NO_SEED", "1")
+        .output()
+        .expect("run av web")
+}
+
+#[test]
+fn a_second_web_on_a_busy_port_reuses_the_running_server() {
+    // The browser's close button does not stop the server, so the natural
+    // second start — another double-click of the binary, or `av web` while
+    // one runs — lands on a busy port. It must find the first instance, say
+    // where it is, and exit successfully, not die on the bind with an error
+    // an icon launch has nowhere to show.
+    let running = server();
+    let port = running.port.to_string();
+    let out = isolated_web(&["web", "--no-open", "--port", &port, "--run-for", "3"]);
+    assert!(
+        out.status.success(),
+        "second launch should reuse the first; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("already running"),
+        "second launch should say where the running server is; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_foreign_listener_on_the_port_is_not_mistaken_for_av() {
+    // Anything else on the port — a hung anta-vista included, since a hung
+    // one answers nothing — must still get the bind error rather than being
+    // "reused" into a browser tab that cannot work.
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = occupied.local_addr().expect("addr").port().to_string();
+    let out = isolated_web(&["web", "--no-open", "--port", &port, "--run-for", "3"]);
+    assert!(
+        !out.status.success(),
+        "a foreign occupant must not pass for anta-vista"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("failed to bind"),
+        "the bind error should still be reported; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn the_dead_tab_banner_reconnects_on_its_own() {
+    let markup = server().get("/").body;
+    assert!(
+        markup.contains(r#"<div id="server-banner" class="banner" hidden role="status"></div>"#),
+        "the dead-server banner must exist and start hidden"
+    );
+
+    let js = js_code(&server().get("/assets/app.js").body);
+    // A rejected fetch — from the poll or from any user action — raises the
+    // banner at once rather than waiting for the next interval.
+    assert!(
+        js.contains("noteServerDown()"),
+        "a failed fetch must mark the server down"
+    );
+    // The next successful poll takes it down, which is what makes the tab
+    // come back on its own after av is restarted on the same address.
+    assert!(
+        js.contains("noteServerUp()"),
+        "a successful poll must clear the down state"
+    );
+    assert!(
+        js.contains("serverDown ? SERVER_RETRY_MS : SERVER_POLL_MS"),
+        "a down server must be re-checked fast, so a restart is noticed promptly"
+    );
+    assert!(
+        js.contains("button.textContent = 'Check now'"),
+        "the banner must offer an immediate check"
+    );
+    // The lazy interval is gone: a down server would otherwise take up to
+    // 15s to be noticed as back.
+    assert!(
+        !js.contains("setInterval(refreshDeps"),
+        "the deps poll must be a chain whose delay depends on the down state"
+    );
+}
+
 /// Strip `/* */` and `//` comments from JavaScript, so an assertion about code
 /// cannot pass or fail on the word appearing in the comment explaining it.
 ///
