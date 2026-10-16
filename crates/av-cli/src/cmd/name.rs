@@ -4,9 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::cmd::{CliError, CliResult};
 use crate::download::verify_uri_exists;
 use crate::output::print_output;
-use crate::startup::{
-    StartupState, ant_cli_binary_available, install_ant_cli, refresh_ant_path, start_antd_daemon,
-};
+use crate::startup::{StartupState, ant_cli_binary_available, install_ant_cli, start_antd_daemon};
 use av_core::types::{NameRecord, NameRecordType, normalize_name};
 use av_net_x0x::client::X0xNetClient;
 use av_net_x0x::dispatcher::MessageDispatcher;
@@ -63,10 +61,18 @@ pub fn run(
                     .map_err(|e| CliError::Other(e.to_string()))?
                     && install_ant_cli()
                 {
-                    // The PowerShell installer may put ant.exe in various locations
-                    // that aren't yet in PATH for the current terminal session.
-                    refresh_ant_path();
-                    println!("ant CLI installed successfully.");
+                    // Detection consults ~/.local/bin as well as PATH, so an
+                    // installer that drops ant outside the terminal's PATH is
+                    // still usable here — but the user's own shell will need
+                    // the advice the installer just printed above.
+                    if ant_cli_binary_available() {
+                        println!("ant CLI installed successfully.");
+                    } else {
+                        println!(
+                            "The installer finished, but ant could not be found even in \
+                             ~/.local/bin. Re-run the install command above and read its output."
+                        );
+                    }
                 } else {
                     println!();
                     #[cfg(windows)]

@@ -274,7 +274,16 @@ fn download_via_ant_cli(
         .transpose()?;
     let diag_path = diagnostics.as_ref().map(|d| d.path().to_owned());
 
-    let mut cmd = Command::new("ant");
+    // Resolve through the shared helper (PATH, then the installer's candidate
+    // directories) rather than a bare name: detection and use must agree, or a
+    // binary found only in ~/.local/bin is reported as installed and then
+    // fails to spawn.
+    let ant_bin =
+        crate::startup::ant_resolve_path().ok_or_else(|| CliError::MissingDependency {
+            code: "no_download_backend",
+            detail: "ant CLI not found (run `ant --version` to check your install)".to_string(),
+        })?;
+    let mut cmd = Command::new(ant_bin);
     cmd.args(["file", "download", "-o"])
         .arg(&tmp_path)
         .arg(addr);

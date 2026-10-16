@@ -75,6 +75,17 @@ impl TestServer {
     }
 
     fn spawn(seeding: bool) -> Self {
+        Self::spawn_with(seeding, &[])
+    }
+
+    /// Spawn with extra environment on top of the standard isolation.
+    ///
+    /// Used by the installer tests: `ANTA_VISTA_X0X_INSTALL_CMD` /
+    /// `ANTA_VISTA_ANT_INSTALL_CMD` point the install endpoints at stub
+    /// scripts, so a test never reaches the network. Each server gets its own
+    /// temp HOME, so the stubs and any binaries they drop stay inside the
+    /// test.
+    fn spawn_with(seeding: bool, extra_env: &[(&str, &str)]) -> Self {
         let dir = std::env::temp_dir().join(format!("av-web-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let db = dir.join("test.db");
@@ -98,6 +109,9 @@ impl TestServer {
             // test database and break the exact-count assertions; only
             // `start_seeded` leaves them on.
             cmd.env("ANTA_VISTA_NO_SEED", "1");
+        }
+        for (key, value) in extra_env {
+            cmd.env(key, value);
         }
         let mut child = cmd
             .stdout(Stdio::piped())
@@ -123,6 +137,12 @@ impl TestServer {
         };
         server.port = server.wait_for_port();
         server
+    }
+
+    /// The temp HOME this server was given, so a test can pre-seed
+    /// `~/.local/bin` before or after spawn.
+    fn home(&self) -> PathBuf {
+        self.db.parent().expect("db has a parent dir").join("home")
     }
 
     /// The server's stderr so far, for failure messages.
@@ -4457,5 +4477,320 @@ fn an_sdk_operation_boundary_is_not_reported_as_the_users_download_finishing() {
         page.contains("phaseText.textContent = 'Ready.'")
             && page.contains("sub.textContent = 'Opening the file"),
         "the hand-off must be announced: {page}"
+    );
+}
+
+// --- installer endpoints ----------------------------------------------------
+//
+// These use the `ANTA_VISTA_*_INSTALL_CMD` seam to point the install endpoints
+// at stub scripts inside a temp HOME, so nothing here reaches the network and
+// no test can touch a real x0x or ant install. PATH is pinned to /usr/bin:/bin
+// so a developer who happens to have x0x installed cannot short-circuit the
+// stub tests with `already_installed`.
+
+/// Write an executable shell stub and return its path.
+#[cfg(unix)]
+fn write_stub(dir: &std::path::Path, name: &str, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).expect("create stub dir");
+    let path = dir.join(name);
+    std::fs::write(&path, script).expect("write stub");
+    let mut perm = std::fs::metadata(&path)
+        .expect("stub metadata")
+        .permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&path, perm).expect("chmod stub");
+    path
+}
+
+/// Environment that isolates an install test: no real installer, no real
+/// binary on PATH, everything inside the server's temp HOME.
+#[cfg(unix)]
+fn install_env(var: &'static str, stub: &std::path::Path) -> Vec<(&'static str, String)> {
+    vec![
+        ("PATH", "/usr/bin:/bin".to_string()),
+        (var, stub.to_string_lossy().into_owned()),
+    ]
+}
+
+#[cfg(unix)]
+#[test]
+fn install_x0x_reports_the_log_and_a_hint_when_the_binary_never_appears() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let stub = write_stub(
+        tmp.path(),
+        "install-x0x.sh",
+        "#!/bin/sh\necho 'downloading x0x…'\necho 'connection refused' >&2\nexit 1\n",
+    );
+    let env = install_env("ANTA_VISTA_X0X_INSTALL_CMD", &stub);
+    let s = TestServer::spawn_with(
+        false,
+        &env.iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect::<Vec<_>>(),
+    );
+
+    let res = s.post("/api/deps/x0x/install", "{}");
+    assert_eq!(res.status, 200, "{}", res.body);
+    let body = res.json();
+    // Transport-level ok: the request ran. The outcome is in the other fields.
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(body["installed"], false, "{body}");
+    let log = body["log"].as_str().unwrap_or_default();
+    assert!(
+        log.contains("downloading x0x"),
+        "log must carry stdout: {log}"
+    );
+    assert!(
+        log.contains("connection refused"),
+        "log must carry stderr: {log}"
+    );
+    let hint = body["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains("without leaving a working"),
+        "a failed verification must say so: {hint}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn install_x0x_short_circuits_when_the_binary_is_already_in_the_installer_home() {
+    // The Porteus case: the binary sits in ~/.local/bin, not on PATH. The
+    // endpoint must recognise it and refuse to re-run the script.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ran_marker = tmp.path().join("installer-ran");
+    let stub = write_stub(
+        tmp.path(),
+        "install-x0x.sh",
+        &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", ran_marker.display()),
+    );
+    let env = install_env("ANTA_VISTA_X0X_INSTALL_CMD", &stub);
+    let s = TestServer::spawn_with(
+        false,
+        &env.iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    write_stub(
+        &s.home().join(".local").join("bin"),
+        "x0x",
+        "#!/bin/sh\nexit 0\n",
+    );
+
+    let res = s.post("/api/deps/x0x/install", "{}");
+    assert_eq!(res.status, 200, "{}", res.body);
+    let body = res.json();
+    assert_eq!(body["installed"], true, "{body}");
+    assert_eq!(body["already_installed"], true, "{body}");
+    assert!(
+        !ran_marker.exists(),
+        "an already-installed binary must not re-run the installer"
+    );
+    // needs_install follows the binary, so the setup banner can clear.
+    let deps = s.json("/api/deps");
+    assert_eq!(deps["needs_install"], false, "{deps}");
+}
+
+#[cfg(unix)]
+#[test]
+fn install_x0x_that_leaves_a_binary_reports_installed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Success, but the daemon is never started: installed=true, running=false,
+    // and the hint says the daemon is not answering rather than pretending all
+    // is well. (install_x0x_with sleeps briefly after success before the
+    // re-check, so this test takes a few seconds by design.)
+    let stub = write_stub(
+        tmp.path(),
+        "install-x0x.sh",
+        "#!/bin/sh\n\
+         mkdir -p \"$HOME/.local/bin\"\n\
+         printf '#!/bin/sh\\nexit 0\\n' > \"$HOME/.local/bin/x0x\"\n\
+         chmod +x \"$HOME/.local/bin/x0x\"\n\
+         echo 'x0x installed'\n\
+         exit 0\n",
+    );
+    let env = install_env("ANTA_VISTA_X0X_INSTALL_CMD", &stub);
+    let s = TestServer::spawn_with(
+        false,
+        &env.iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect::<Vec<_>>(),
+    );
+
+    let res = s.post("/api/deps/x0x/install", "{}");
+    assert_eq!(res.status, 200, "{}", res.body);
+    let body = res.json();
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(body["installed"], true, "binary was created: {body}");
+    let log = body["log"].as_str().unwrap_or_default();
+    assert!(log.contains("x0x installed"), "{log}");
+    let hint = body["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains("daemon is not answering"),
+        "installed but not running must say so: {hint}"
+    );
+    let deps = s.json("/api/deps");
+    assert_eq!(deps["needs_install"], false, "{deps}");
+    assert_eq!(deps["deps"]["x0x_installed"], true, "{deps}");
+}
+
+#[cfg(unix)]
+#[test]
+fn install_ant_reports_the_log_and_a_hint_when_the_binary_never_appears() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let stub = write_stub(
+        tmp.path(),
+        "install-ant.sh",
+        "#!/bin/sh\necho 'downloading ant…'\necho 'HTTP 503' >&2\nexit 1\n",
+    );
+    let env = install_env("ANTA_VISTA_ANT_INSTALL_CMD", &stub);
+    let s = TestServer::spawn_with(
+        false,
+        &env.iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect::<Vec<_>>(),
+    );
+
+    let res = s.post("/api/deps/ant/install", "{}");
+    assert_eq!(res.status, 200, "{}", res.body);
+    let body = res.json();
+    assert_eq!(
+        body["ok"], true,
+        "transport ok even when the install fails: {body}"
+    );
+    assert_eq!(body["installed"], false, "{body}");
+    let log = body["log"].as_str().unwrap_or_default();
+    assert!(log.contains("downloading ant"), "{log}");
+    assert!(log.contains("HTTP 503"), "{log}");
+    let hint = body["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("without leaving a working"), "{hint}");
+}
+
+#[cfg(unix)]
+#[test]
+fn install_ant_that_leaves_a_binary_reports_installed_and_path_advice() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let stub = write_stub(
+        tmp.path(),
+        "install-ant.sh",
+        "#!/bin/sh\n\
+         mkdir -p \"$HOME/.local/bin\"\n\
+         printf '#!/bin/sh\\nexit 0\\n' > \"$HOME/.local/bin/ant\"\n\
+         chmod +x \"$HOME/.local/bin/ant\"\n\
+         echo 'ant installed'\n\
+         exit 0\n",
+    );
+    let env = install_env("ANTA_VISTA_ANT_INSTALL_CMD", &stub);
+    let s = TestServer::spawn_with(
+        false,
+        &env.iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect::<Vec<_>>(),
+    );
+
+    let res = s.post("/api/deps/ant/install", "{}");
+    assert_eq!(res.status, 200, "{}", res.body);
+    let body = res.json();
+    assert_eq!(body["installed"], true, "binary was created: {body}");
+    let hint = body["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains("PATH"),
+        "a successful install must surface the PATH advice: {hint}"
+    );
+}
+
+#[test]
+fn the_install_dialog_stays_open_and_reports_the_outcome_in_place() {
+    // The old flow closed the dialog on submit (method="dialog") and wrote the
+    // outcome into ui.banner, which the next refreshDeps wiped — a successful
+    // install looked like nothing happened. The run must happen while the
+    // dialog is open, and the result must land inside it.
+    let markup = server().get("/").body;
+    assert!(
+        markup.contains(r#"id="install-hint""#) && markup.contains(r#"id="install-output""#),
+        "the dialog needs a place for the hint and the installer log: {markup}"
+    );
+    assert!(
+        markup.contains(r#"<button type="button" id="install-run""#),
+        "Run must be type=button so method=dialog does not close on click: {markup}"
+    );
+
+    let js = js_code(&server().get("/assets/app.js").body);
+    assert!(
+        js.contains("ui.dialogRun.addEventListener('click'"),
+        "the install POST is driven by the Run button's click, not by close"
+    );
+    assert!(
+        !js.contains("returnValue !== 'run'"),
+        "the old close-then-install flow must be gone"
+    );
+    assert!(
+        js.contains("if (ui.dialog.dataset.ran === '1') refreshDeps();"),
+        "closing after a run refreshes deps; the banner and drawer read from them"
+    );
+    assert!(
+        !js.contains("setStatus(\n      ui.banner,"),
+        "the outcome must not go back into the banner the poll wipes"
+    );
+}
+
+#[test]
+fn an_install_triggered_by_an_index_offers_to_finish_that_index() {
+    // A no_download_backend failure strands the user's link behind the
+    // installer: after a successful ant install the dialog must offer to
+    // finish the job it interrupted, not strand them at a lone Cancel.
+    let markup = server().get("/").body;
+    assert!(
+        markup.contains(r#"<button type="button" id="install-index""#)
+            && markup.contains(">Index link<"),
+        "the dialog needs an Index link button: {markup}"
+    );
+    assert!(
+        markup.contains(r#"id="install-close""#),
+        "the dismiss button needs an id so its label can change: {markup}"
+    );
+
+    let js = js_code(&server().get("/assets/app.js").body);
+
+    // The pending link travels from the failed index into the dialog...
+    let run_index = js.find("async function runIndex(").expect("runIndex body");
+    assert!(
+        js[run_index..].contains("{ uri, tags }"),
+        "the no_download_backend path must carry the link it could not index"
+    );
+    // ...and comes back out through the same index route, not a diverging copy.
+    let index_btn = js
+        .find("ui.dialogIndex.addEventListener('click'")
+        .expect("Index link handler");
+    let after_index_btn = js[index_btn..]
+        .find("}")
+        .map(|i| index_btn + i)
+        .unwrap_or(js.len());
+    assert!(
+        js[index_btn..after_index_btn].contains("runIndex(uri, tags)"),
+        "the Index link must retry through runIndex"
+    );
+
+    // It appears only on success, and only for an ant install that has a link
+    // pending — a banner-triggered x0x install must not offer it.
+    let run = js
+        .find("ui.dialogRun.addEventListener('click'")
+        .expect("install run handler");
+    assert!(
+        js[run..].contains("if (key === 'ant' && ui.dialog.dataset.pendingUri)"),
+        "the Index link is revealed by the ant success path only"
+    );
+
+    // Once the consent phase is over, "Cancel" is the wrong word for leaving.
+    assert!(
+        js[run..].contains("ui.dialogClose.textContent = 'Close'"),
+        "after a run, Cancel becomes Close"
+    );
+    let open = js
+        .find("function openInstall(")
+        .expect("openInstall definition");
+    assert!(
+        js[open..run].contains("ui.dialogClose.textContent = 'Cancel'"),
+        "opening the dialog again restores Cancel for the consent phase"
     );
 }

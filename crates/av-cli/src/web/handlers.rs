@@ -1125,10 +1125,35 @@ pub fn start_antd(state: &Arc<AppState>) -> WebResponse {
     )
 }
 
+/// Advice for a successful install: Anta-Vista finds the binary in the
+/// installer's home directory on its own, but the user's own terminal will not
+/// unless they take the PATH advice the installer itself printed.
+fn installed_hint(name: &str) -> String {
+    if cfg!(target_os = "windows") {
+        // Neither Windows installer modifies PATH; it only drops files into
+        // %USERPROFILE%\.local\bin. "Open a new terminal" would be a lie.
+        format!(
+            "Installed. Anta-Vista finds {name} automatically; for your own \
+             terminal, add %USERPROFILE%\\.local\\bin to PATH."
+        )
+    } else {
+        format!(
+            "Installed. Anta-Vista finds {name} in ~/.local/bin automatically; \
+             for your own terminal, add it to PATH: \
+             export PATH=\"$HOME/.local/bin:$PATH\""
+        )
+    }
+}
+
 /// `POST /api/deps/x0x/install` — runs the platform installer.
 ///
 /// The UI shows the exact command from `/api/deps` first and requires a
 /// separate click before calling this, so an install is never implicit.
+///
+/// `ok` here means *the request ran*, not *the dependency now works*: the
+/// installer is a third-party script and can fail in ways only its log shows,
+/// so the transport stays `ok: true` and the outcome lives in `installed`,
+/// `running`, `log` and `hint`.
 pub fn install_x0x(state: &Arc<AppState>) -> WebResponse {
     let command = crate::startup::x0x_install_command();
     if crate::startup::x0x_binary_available() {
@@ -1138,26 +1163,56 @@ pub fn install_x0x(state: &Arc<AppState>) -> WebResponse {
                 "dependency": "x0x",
                 "installed": true,
                 "already_installed": true,
+                "running": crate::startup::x0x_running(),
                 "command": command,
+                "log": "",
+                "hint": null,
             })
             .to_string(),
         );
     }
-    // Capture installer output so it cannot interleave with the server's.
-    let ok = crate::startup::install_x0x_with(std::process::Stdio::piped());
+    let (ran_ok, log) = crate::startup::install_x0x_with();
     state.refresh_network_deps();
+    let installed = crate::startup::x0x_binary_available();
+    let running = crate::startup::x0x_running();
+    let hint = if !installed {
+        Some(format!(
+            "The installer {} without leaving a working x0x binary. \
+             Read the log below — most often the download failed, or the \
+             binary landed somewhere unexpected.",
+            if ran_ok {
+                "exited successfully"
+            } else {
+                "failed"
+            },
+        ))
+    } else if !running {
+        Some(
+            "x0x is installed, but its daemon is not answering yet. \
+             Try Start in the status drawer, or run `x0x start` in a terminal."
+                .to_string(),
+        )
+    } else {
+        Some(installed_hint("x0x"))
+    };
     json_response(
         json!({
-            "ok": ok,
+            "ok": true,
             "dependency": "x0x",
-            "installed": crate::startup::x0x_binary_available(),
+            "installed": installed,
+            "running": running,
             "command": command,
+            "log": log,
+            "hint": hint,
         })
         .to_string(),
     )
 }
 
 /// `POST /api/deps/ant/install`
+///
+/// Same contract as [`install_x0x`]: `ok` is transport-level; the outcome is
+/// in `installed`/`log`/`hint`.
 pub fn install_ant(state: &Arc<AppState>) -> WebResponse {
     let command = crate::startup::ant_install_command();
     if crate::startup::ant_cli_binary_available() {
@@ -1168,20 +1223,39 @@ pub fn install_ant(state: &Arc<AppState>) -> WebResponse {
                 "installed": true,
                 "already_installed": true,
                 "command": command,
+                "log": "",
+                "hint": null,
             })
             .to_string(),
         );
     }
-    let ok = crate::startup::install_ant_cli_with(std::process::Stdio::piped());
-    // The installer may have dropped ant somewhere not yet on this PATH.
-    crate::startup::refresh_ant_path();
+    let (ran_ok, log) = crate::startup::install_ant_cli_with();
+    // Detection consults the installer's candidate directories as well as
+    // PATH, so a binary outside this process's PATH is still found here.
     state.refresh_network_deps();
+    let installed = crate::startup::ant_cli_binary_available();
+    let hint = if !installed {
+        Some(format!(
+            "The installer {} without leaving a working ant binary. \
+             Read the log below — most often the download failed, or the \
+             binary landed somewhere unexpected.",
+            if ran_ok {
+                "exited successfully"
+            } else {
+                "failed"
+            },
+        ))
+    } else {
+        Some(installed_hint("ant"))
+    };
     json_response(
         json!({
-            "ok": ok,
+            "ok": true,
             "dependency": "ant",
-            "installed": crate::startup::ant_cli_binary_available(),
+            "installed": installed,
             "command": command,
+            "log": log,
+            "hint": hint,
         })
         .to_string(),
     )

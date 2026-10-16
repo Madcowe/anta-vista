@@ -84,6 +84,10 @@ const ui = {
   dialogBlurb: el('install-blurb'),
   dialogCommand: el('install-command'),
   dialogConfirm: el('install-confirm'),
+  dialogHint: el('install-hint'),
+  dialogOutput: el('install-output'),
+  dialogClose: el('install-close'),
+  dialogIndex: el('install-index'),
   blockDialog: el('block-dialog'),
   blockKeep: el('block-dialog').querySelector('[data-role="block-keep"]'),
   blockDelete: el('block-dialog').querySelector('[data-role="block-delete"]'),
@@ -1804,13 +1808,20 @@ async function indexAutonomiInBrowser(uri, tags) {
   return postBlob('/api/index/bytes', uri, blob, tags ? { 'X-Anta-Tags': tags } : {});
 }
 
-ui.addForm.addEventListener('submit', async (event) => {
+ui.addForm.addEventListener('submit', (event) => {
   event.preventDefault();
   const uri = el('uri').value.trim();
   if (!uri) return;
+  runIndex(uri, el('tags').value.trim());
+});
 
-  const tags = el('tags').value.trim();
-
+/* Index one link. One function, two callers: the Add a Link form, and the
+ * install dialog's "Index link" button — a `no_download_backend` failure
+ * leaves the job pending behind the installer, and the retry must take the
+ * exact same route rather than a second, diverging copy of it. (Not by
+ * re-submitting the search form: that is pinned out of this file, and the
+ * pending index may outlive the form's current contents anyway.) */
+async function runIndex(uri, tags) {
   /* Whose screen the results area is when this index finishes is decided here:
    * any search submitted from now on takes it over (see `resultsEpoch`). */
   indexEpoch = resultsEpoch;
@@ -1881,19 +1892,22 @@ ui.addForm.addEventListener('submit', async (event) => {
     if (err.code === 'no_download_backend') {
       indexProgressLine('ERROR: Autonomi support needs the ant CLI or antd daemon.');
       /* Two dialogs at once is confusing; the install dialog says what to do
-       * about it, so the progress log steps aside rather than nesting. */
+       * about it, so the progress log steps aside rather than nesting. The
+       * link the user asked for travels along: after a successful install the
+       * dialog offers to finish this exact job. */
       ui.indexProgress.close();
       openInstall(
         'ant',
         'Install ant CLI',
         err.message,
-        (err.body && err.body.command) || ''
+        (err.body && err.body.command) || '',
+        { uri, tags }
       );
     } else {
       indexProgressLine(`ERROR: Could not add that link: ${err.message}`);
     }
   }
-});
+}
 
 /* --------------------------------------------------------------- status -- */
 
@@ -2178,15 +2192,30 @@ async function ensureServices(show) {
 /* ------------------------------------------------------ install dialog -- */
 
 /* Nothing installs without this: the exact command is displayed, and the
- * confirm checkbox is what arms the button. */
-function openInstall(key, title, blurb, command) {
+ * confirm checkbox is what arms the button. The dialog resets fully on open,
+ * so a previous run's hint, log and pending index never bleed into the next
+ * one. `pending` is the {uri, tags} of an index that failed for want of this
+ * installer; when set, a successful install offers to finish that job. */
+function openInstall(key, title, blurb, command, pending) {
   ui.dialogTitle.textContent = title;
   ui.dialogBlurb.textContent = blurb || '';
   ui.dialogCommand.textContent = command || '(no command shown)';
   ui.dialogCommand.hidden = !command;
   ui.dialogConfirm.checked = false;
+  ui.dialogConfirm.hidden = false;
+  ui.dialogRun.hidden = false;
+  ui.dialogRun.textContent = 'Run installer';
   ui.dialogRun.disabled = true;
+  ui.dialogHint.hidden = true;
+  ui.dialogHint.textContent = '';
+  ui.dialogOutput.hidden = true;
+  ui.dialogOutput.textContent = '';
+  ui.dialogClose.textContent = 'Cancel';
+  ui.dialogIndex.hidden = true;
   ui.dialog.dataset.key = key;
+  ui.dialog.dataset.ran = '';
+  ui.dialog.dataset.pendingUri = (pending && pending.uri) || '';
+  ui.dialog.dataset.pendingTags = (pending && pending.tags) || '';
   ui.dialog.showModal();
 }
 
@@ -2194,22 +2223,81 @@ ui.dialogConfirm.addEventListener('change', () => {
   ui.dialogRun.disabled = !ui.dialogConfirm.checked;
 });
 
-ui.dialog.addEventListener('close', async () => {
-  if (ui.dialog.returnValue !== 'run') return;
+/* Finish an index that the installer interrupted. The dialog closes first so
+ * the progress dialog it opens is not stacked on top of it, and the run takes
+ * the shared `runIndex` route — the same one the form uses. */
+ui.dialogIndex.addEventListener('click', () => {
+  const uri = ui.dialog.dataset.pendingUri;
+  const tags = ui.dialog.dataset.pendingTags;
+  if (!uri) return;
+  ui.dialog.close();
+  runIndex(uri, tags);
+});
+
+/* Run the install while the dialog stays open, then report the outcome
+ * *inside* it. The button is type="button" precisely so the form's
+ * method="dialog" does not close the dialog the moment it is pressed — the
+ * old flow closed first and wrote its result into ui.banner, which the next
+ * refreshDeps wiped, so a successful install looked like nothing happened.
+ *
+ * `ok` from the server is transport-level only; the truth is in `installed`,
+ * `hint` and `log`, which is what gets shown. */
+ui.dialogRun.addEventListener('click', async () => {
   const key = ui.dialog.dataset.key;
   const path = key === 'ant' ? '/api/deps/ant/install' : '/api/deps/x0x/install';
+  ui.dialogRun.disabled = true;
+  ui.dialogRun.textContent = 'Installing… (this can take a minute)';
   try {
     const data = await postJSON(path, {});
-    setStatus(
-      ui.banner,
-      data.installed ? `${key} installed.` : `${key} install did not complete.`,
-      data.installed ? 'ok' : 'bad'
-    );
+    ui.dialog.dataset.ran = '1';
+    /* The consent phase is over: "Cancel" no longer describes dismiss. */
+    ui.dialogClose.textContent = 'Close';
+    const installed = data.already_installed || data.installed;
+    ui.dialogTitle.textContent = installed
+      ? key === 'ant'
+        ? 'ant CLI is installed'
+        : 'x0x is installed'
+      : `${key} install did not complete`;
+    ui.dialogConfirm.hidden = true;
+    if (data.hint) {
+      ui.dialogHint.textContent = data.hint;
+      ui.dialogHint.hidden = false;
+    }
+    const log = (data.log || '').trim();
+    if (log) {
+      ui.dialogOutput.textContent = log;
+      ui.dialogOutput.hidden = false;
+    }
+    if (installed) {
+      ui.dialogRun.hidden = true;
+      /* The x0x installer starts the daemon itself on success, but not
+       * always; ensureServices brings it up if the ping still fails. */
+      if (key === 'x0x') ensureServices();
+      /* An index waiting behind this install: offer to finish it now. */
+      if (key === 'ant' && ui.dialog.dataset.pendingUri) {
+        ui.dialogIndex.hidden = false;
+      }
+    } else {
+      ui.dialogRun.textContent = 'Retry';
+      ui.dialogRun.disabled = false;
+    }
   } catch (err) {
-    setStatus(ui.banner, `Install failed: ${err.message}`, 'bad');
-  } finally {
-    refreshDeps();
+    ui.dialog.dataset.ran = '1';
+    ui.dialogClose.textContent = 'Close';
+    ui.dialogConfirm.hidden = true;
+    ui.dialogTitle.textContent = `${key} install failed`;
+    ui.dialogHint.textContent = err.message;
+    ui.dialogHint.hidden = false;
+    ui.dialogRun.textContent = 'Retry';
+    ui.dialogRun.disabled = false;
   }
+});
+
+/* Closing after a run is what refreshes the dependency state: the banner and
+ * the drawer read from /api/deps, and the install may have changed them. A
+ * dialog that was only opened and cancelled (never ran) does not need it. */
+ui.dialog.addEventListener('close', () => {
+  if (ui.dialog.dataset.ran === '1') refreshDeps();
 });
 
 /* ----------------------------------------------------------------- boot -- */

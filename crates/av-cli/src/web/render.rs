@@ -150,7 +150,9 @@ const PAGE: &str = r##"<!doctype html>
 
 <div id="overlay" class="overlay" hidden></div>
 
-<!-- Confirmation dialog, used before running any installer. -->
+<!-- Confirmation dialog, used before running any installer. The dialog stays
+     open through the run so the installer's outcome and log can be read here;
+     Cancel (or Esc) closes it, which is what refreshes the dependency state. -->
 <dialog id="install-dialog" class="dialog">
   <form method="dialog">
     <h2 id="install-title">Install dependency</h2>
@@ -162,9 +164,19 @@ const PAGE: &str = r##"<!doctype html>
       <input type="checkbox" id="install-confirm">
       <span>Run this command on my machine</span>
     </label>
+    <!-- Outcome after a run: a one-line hint (success, PATH advice, or why
+         verification failed) plus the installer's own log tail. -->
+    <p id="install-hint" class="hint" hidden></p>
+    <pre id="install-output" class="command" hidden></pre>
     <menu>
-      <button value="cancel" class="btn btn-quiet">Cancel</button>
-      <button value="run" id="install-run" class="btn btn-primary" disabled>Run installer</button>
+      <button value="cancel" id="install-close" class="btn btn-quiet">Cancel</button>
+      <!-- Revealed after a successful ant install that was triggered by a
+           failed index: the link the user wanted is still pending, so the
+           dialog offers to finish that job rather than strand them. -->
+      <button type="button" id="install-index" class="btn btn-primary" hidden>Index link</button>
+      <!-- type="button": a method="dialog" form closes on submit, and the
+           install POST has to run *while the dialog is open*. -->
+      <button type="button" id="install-run" class="btn btn-primary" disabled>Run installer</button>
     </menu>
   </form>
 </dialog>

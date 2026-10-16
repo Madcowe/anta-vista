@@ -3,7 +3,6 @@ use av_core::config::AvConfig;
 use av_net_x0x::client::X0xConfig;
 use dialoguer::Confirm;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -120,38 +119,91 @@ pub fn load_config(cli: &crate::Cli) -> CliResult<(AvConfig, Option<PathBuf>)> {
     }
 }
 
+/// Test seam: override an installer command without touching production
+/// behaviour. The web test harness points these at stub scripts so an install
+/// test never reaches the network.
+fn env_override(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// The literal command used to install x0x on this platform, suitable for
 /// showing to a user before they consent to running it.
-pub fn x0x_install_command() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "powershell -NoProfile -Command \"Invoke-WebRequest -Uri https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip -OutFile x0x.zip; tar -xf x0x.zip -C $env:USERPROFILE\\.local\\bin; Remove-Item x0x.zip\""
-    } else {
-        "curl -sfL https://x0x.md | sh -s -- --start"
-    }
+pub fn x0x_install_command() -> String {
+    env_override("ANTA_VISTA_X0X_INSTALL_CMD").unwrap_or_else(|| {
+        if cfg!(target_os = "windows") {
+            "powershell -NoProfile -Command \"Invoke-WebRequest -Uri https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip -OutFile x0x.zip; tar -xf x0x.zip -C $env:USERPROFILE\\.local\\bin; Remove-Item x0x.zip\"".to_string()
+        } else {
+            "curl -sfL https://x0x.md | sh -s -- --start".to_string()
+        }
+    })
 }
 
 /// The literal command used to install the ant CLI on this platform.
-pub fn ant_install_command() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "powershell -NoProfile -Command \"irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex\""
-    } else {
-        "curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash"
+pub fn ant_install_command() -> String {
+    env_override("ANTA_VISTA_ANT_INSTALL_CMD").unwrap_or_else(|| {
+        if cfg!(target_os = "windows") {
+            "powershell -NoProfile -Command \"irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex\"".to_string()
+        } else {
+            "curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash".to_string()
+        }
+    })
+}
+
+/// Run `program` with `args`, capturing everything it prints.
+fn run_capture(program: &str, args: &[&str]) -> (bool, String) {
+    match std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())
+    {
+        Ok(out) => {
+            let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+            let err = String::from_utf8_lossy(&out.stderr);
+            if !err.trim().is_empty() {
+                if !log.is_empty() {
+                    log.push('\n');
+                }
+                log.push_str(&err);
+            }
+            (out.status.success(), cap_install_log(log))
+        }
+        Err(e) => (false, format!("could not start the installer: {e}")),
     }
 }
 
-/// Run an installer, sending its output to `stdio`.
+/// Largest installer log kept for the response, counting bytes from the end.
 ///
-/// The CLI passes [`Stdio::inherit`] so the user watches it happen. The web
-/// interface passes [`Stdio::piped`] so the log can be captured and shown in
-/// the response instead of corrupting the server's own stdout.
-fn run_installer(command: &str, stdio: Stdio) -> bool {
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdout(stdio)
-        .stderr(Stdio::inherit())
-        .status();
-    matches!(status, Ok(s) if s.success())
+/// Installers are third-party scripts; a log is for the human to read in the
+/// dialog, not to store, and the interesting part (verification results, the
+/// PATH advice, the final error) is at the end.
+const INSTALL_LOG_CAP: usize = 8 * 1024;
+
+fn cap_install_log(log: String) -> String {
+    if log.len() <= INSTALL_LOG_CAP {
+        return log;
+    }
+    let mut start = log.len() - INSTALL_LOG_CAP;
+    while start < log.len() && !log.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("… (earlier output trimmed)\n{}", &log[start..])
+}
+
+/// Run an installer shell command, capturing its combined stdout/stderr.
+///
+/// Captured rather than inherited or discarded: the web dialog shows this log
+/// after the run, and it is where the installers' own advice — x0x's "add
+/// ~/.local/bin to PATH", most notably — becomes visible to a browser user
+/// instead of vanishing into the server's stdout.
+fn run_installer(command: &str) -> (bool, String) {
+    if cfg!(target_os = "windows") {
+        run_capture("powershell", &["-NoProfile", "-Command", command])
+    } else {
+        run_capture("sh", &["-c", command])
+    }
 }
 
 pub fn start_antd_daemon() -> bool {
@@ -194,81 +246,84 @@ pub fn ant_cli_binary_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Install the ant CLI. `stdio` controls where the installer's own output goes;
-/// see [`run_installer`].
-pub fn install_ant_cli_with(stdio: Stdio) -> bool {
-    if !cfg!(target_os = "windows") {
-        // Linux/macOS: use the official install script
-        run_installer(
-            "curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash",
-            stdio,
+/// Install the ant CLI, returning the installer's exit status and its log.
+///
+/// On Windows the built-in installer is a PowerShell one-liner run directly;
+/// a test override is always routed through [`run_installer`].
+pub fn install_ant_cli_with() -> (bool, String) {
+    if let Some(cmd) = env_override("ANTA_VISTA_ANT_INSTALL_CMD") {
+        return run_installer(&cmd);
+    }
+    if cfg!(target_os = "windows") {
+        run_capture(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex",
+            ],
         )
     } else {
-        // Windows: use the official PowerShell install script
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command"])
-            .arg(
-                "irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex",
-            )
-            .stdout(stdio)
-            .stderr(Stdio::inherit())
-            .status();
-        matches!(status, Ok(s) if s.success())
+        run_installer(&ant_install_command())
     }
 }
 
+/// Interactive-CLI installer: runs the installer and echoes its log, so the
+/// terminal user watches it happen exactly as they did when the output was
+/// inherited.
 pub fn install_ant_cli() -> bool {
-    install_ant_cli_with(Stdio::inherit())
+    let (ok, log) = install_ant_cli_with();
+    print!("{log}");
+    ok
 }
 
 pub fn x0x_binary_available() -> bool {
-    let bin = if cfg!(target_os = "windows") {
-        "x0x.exe"
+    x0x_resolve_path().is_some_and(|path| {
+        std::process::Command::new(path)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Install x0x, returning the installer's exit status and its log.
+///
+/// The script starts the daemon itself and waits for it to answer its health
+/// endpoint, so the caller only has to settle briefly before probing.
+pub fn install_x0x_with() -> (bool, String) {
+    let (ok, log) = if let Some(cmd) = env_override("ANTA_VISTA_X0X_INSTALL_CMD") {
+        run_installer(&cmd)
+    } else if cfg!(target_os = "windows") {
+        run_capture(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                concat!(
+                    "$zip = \"$env:TEMP\\x0x.zip\"; ",
+                    "$target = \"$env:USERPROFILE\\.local\\bin\"; ",
+                    "mkdir -Force $target | Out-Null; ",
+                    "Invoke-WebRequest -Uri \"https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip\" -OutFile $zip; ",
+                    "tar -xf $zip -C $target --strip-components=1; ",
+                    "Remove-Item $zip -Force",
+                ),
+            ],
+        )
     } else {
-        "x0x"
+        run_installer(&x0x_install_command())
     };
-    std::process::Command::new(bin)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Install x0x. `stdio` controls where the installer's own output goes; see
-/// [`run_installer`].
-pub fn install_x0x_with(stdio: Stdio) -> bool {
-    if !cfg!(target_os = "windows") {
-        // Linux/macOS: use the install script
-        let ok = run_installer("curl -sfL https://x0x.md | sh -s -- --start", stdio);
-        if ok {
-            std::thread::sleep(Duration::from_secs(3));
-        }
-        ok
-    } else {
-        // Windows: download zip via PowerShell, extract to ~\.local\bin
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command"])
-            .arg(concat!(
-                "$zip = \"$env:TEMP\\x0x.zip\"; ",
-                "$target = \"$env:USERPROFILE\\.local\\bin\"; ",
-                "mkdir -Force $target | Out-Null; ",
-                "Invoke-WebRequest -Uri \"https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip\" -OutFile $zip; ",
-                "tar -xf $zip -C $target --strip-components=1; ",
-                "Remove-Item $zip -Force",
-            ))
-            .stdout(stdio)
-            .stderr(Stdio::inherit())
-            .status();
-        let ok = matches!(status, Ok(s) if s.success());
-        if ok {
-            std::thread::sleep(Duration::from_secs(3));
-        }
-        ok
+    if ok {
+        std::thread::sleep(Duration::from_secs(3));
     }
+    (ok, log)
 }
 
+/// Interactive-CLI installer: runs the installer and echoes its log.
 pub fn install_x0x() -> bool {
-    install_x0x_with(Stdio::inherit())
+    let (ok, log) = install_x0x_with();
+    print!("{log}");
+    ok
 }
 
 /// Build a lightweight ureq agent with a short connect timeout, used
@@ -329,11 +384,11 @@ pub struct DependencyStatus {
     pub x0x_api: String,
     pub x0x_agent_id: String,
     /// Literal install command for this platform, shown before consent.
-    pub x0x_install_cmd: &'static str,
+    pub x0x_install_cmd: String,
     pub ant_cli_installed: bool,
     pub antd_running: bool,
     /// Literal install command for this platform, shown before consent.
-    pub ant_install_cmd: &'static str,
+    pub ant_install_cmd: String,
     pub av_listener_running: bool,
     pub av_listener_pid: Option<u32>,
 }
@@ -369,8 +424,10 @@ pub fn probe_dependencies() -> DependencyStatus {
     }
 }
 
-/// Directories the Windows ant installer may drop `ant.exe` into without the
-/// current process PATH picking it up.
+/// Directories the installers may drop a binary into without the current
+/// process PATH picking it up. Both upstream installers default to
+/// `~/.local/bin` on Unix (the ant script also honours `INSTALL_DIR`, and its
+/// macOS default is `/usr/local/bin`, which is already on every PATH).
 #[cfg(windows)]
 pub fn ant_candidate_dirs() -> Vec<PathBuf> {
     let profile = std::env::var("USERPROFILE").unwrap_or_default();
@@ -386,70 +443,78 @@ pub fn ant_candidate_dirs() -> Vec<PathBuf> {
 
 #[cfg(not(windows))]
 pub fn ant_candidate_dirs() -> Vec<PathBuf> {
+    local_bin_dirs()
+}
+
+/// The x0x installer's home: the script hardcodes `$HOME/.local/bin`.
+#[cfg(windows)]
+pub fn x0x_candidate_dirs() -> Vec<PathBuf> {
+    let profile = std::env::var("USERPROFILE").unwrap_or_default();
+    vec![PathBuf::from(&profile).join(".local").join("bin")]
+}
+
+#[cfg(not(windows))]
+pub fn x0x_candidate_dirs() -> Vec<PathBuf> {
+    local_bin_dirs()
+}
+
+#[cfg(not(windows))]
+fn local_bin_dirs() -> Vec<PathBuf> {
     directories::BaseDirs::new()
         .map(|d| vec![d.home_dir().join(".local").join("bin")])
         .unwrap_or_default()
 }
 
-/// Prepend the ant candidate directories to this process's PATH.
+fn path_list_separator() -> char {
+    if cfg!(windows) { ';' } else { ':' }
+}
+
+/// Resolve `exe` against a PATH string and a list of candidate directories,
+/// preferring a PATH hit — the answer a fresh shell would get.
 ///
-/// Only safe to call from a single-threaded context (the CLI calls it during
-/// startup). Server threads must not mutate process-global state, so they should
-/// use [`ant_resolve_path`] instead.
-pub fn refresh_ant_path() {
-    let dirs = ant_candidate_dirs();
-    let current = std::env::var("PATH").unwrap_or_default();
-    let mut to_add = Vec::new();
-    for path in &dirs {
-        let p = path.to_string_lossy().to_string();
-        if !p.is_empty()
-            && path.join("ant.exe").exists()
-            && !current.split(';').any(|existing| existing == p)
-        {
-            to_add.push(p);
-        }
+/// Pure so the rule can be tested without mutating the process environment.
+fn resolve_bin(exe: &str, path: &str, candidates: &[PathBuf]) -> Option<PathBuf> {
+    let sep = path_list_separator();
+    if path
+        .split(sep)
+        .any(|dir| !dir.is_empty() && PathBuf::from(dir).join(exe).exists())
+    {
+        return Some(PathBuf::from(exe));
     }
-    if !to_add.is_empty() {
-        let new_path = to_add.join(";") + ";" + &current;
-        // SAFETY: single-threaded at startup before any env reads race
-        unsafe { std::env::set_var("PATH", new_path) };
-    }
+    candidates.iter().map(|d| d.join(exe)).find(|p| p.exists())
+}
+
+/// Resolve the `x0x` executable, consulting the installer's home directory as
+/// well as PATH.
+///
+/// Thread-safe, because it builds the candidate list per call instead of
+/// mutating process-global state. The official installer always writes
+/// `~/.local/bin`, which is on the PATH of a login shell on some
+/// distributions and not others — detection, start, and install all have to
+/// agree on the answer.
+pub fn x0x_resolve_path() -> Option<PathBuf> {
+    let exe = if cfg!(target_os = "windows") {
+        "x0x.exe"
+    } else {
+        "x0x"
+    };
+    let path = std::env::var("PATH").unwrap_or_default();
+    resolve_bin(exe, &path, &x0x_candidate_dirs())
 }
 
 /// Resolve the `ant` executable, consulting the installer's candidate
 /// directories as well as PATH.
 ///
-/// Thread-safe, unlike [`refresh_ant_path`], because it builds the candidate
-/// path list per call instead of mutating process-global state.
+/// Thread-safe, because it builds the candidate list per call instead of
+/// mutating process-global state.
 pub fn ant_resolve_path() -> Option<PathBuf> {
     let exe = if cfg!(target_os = "windows") {
         "ant.exe"
     } else {
         "ant"
     };
-    // Prefer a hit on PATH, matching what a user would get in a fresh shell.
-    if which_on_path(exe) {
-        return Some(PathBuf::from(exe));
-    }
-    ant_candidate_dirs()
-        .into_iter()
-        .find(|d| d.join(exe).exists())
-}
-
-#[cfg(windows)]
-fn which_on_path(exe: &str) -> bool {
-    std::env::var("PATH")
-        .unwrap_or_default()
-        .split(';')
-        .any(|dir| PathBuf::from(dir).join(exe).exists())
-}
-
-#[cfg(not(windows))]
-fn which_on_path(exe: &str) -> bool {
-    std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .any(|dir| PathBuf::from(dir).join(exe).exists())
+    let path = std::env::var("PATH").unwrap_or_default();
+    resolve_bin(exe, &path, &ant_candidate_dirs())
 }
 
 fn enforce_dependencies(cli: &crate::Cli, state: &mut StartupState) -> CliResult<()> {
@@ -675,19 +740,14 @@ pub fn stop_x0x_daemon() -> bool {
         return true;
     }
 
-    let run_stop = |bin: &str| -> bool {
-        matches!(
-            std::process::Command::new(bin).arg("stop").status(),
+    let bin = x0x_resolve_path();
+    let invoked = match bin {
+        Some(ref p) => matches!(
+            std::process::Command::new(p).arg("stop").status(),
             Ok(s) if s.success()
-        )
+        ),
+        None => false,
     };
-
-    let invoked = run_stop("x0x")
-        || directories::BaseDirs::new()
-            .map(|d| d.home_dir().join(".local/bin/x0x"))
-            .filter(|p| p.exists())
-            .map(|p| run_stop(p.to_str().unwrap_or("x0x")))
-            .unwrap_or(false);
     if !invoked {
         return !x0x_running();
     }
@@ -706,7 +766,7 @@ pub fn stop_x0x_daemon() -> bool {
 pub fn start_x0x_daemon() -> bool {
     let retry_until = std::time::Instant::now() + Duration::from_secs(8);
 
-    let try_path = |bin: &str| -> bool {
+    let try_path = |bin: &PathBuf| -> bool {
         match std::process::Command::new(bin).arg("start").spawn() {
             Ok(_) => {
                 while std::time::Instant::now() < retry_until {
@@ -723,14 +783,106 @@ pub fn start_x0x_daemon() -> bool {
         }
     };
 
-    if try_path("x0x") {
-        return true;
+    match x0x_resolve_path() {
+        Some(path) => try_path(&path),
+        None => false,
     }
-    if let Some(base_dirs) = directories::BaseDirs::new() {
-        let local_x0x = base_dirs.home_dir().join(".local/bin/x0x");
-        if local_x0x.exists() {
-            return try_path(local_x0x.to_str().unwrap_or("x0x"));
-        }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn touch_exe(dir: &std::path::Path, name: &str) -> PathBuf {
+        fs::create_dir_all(dir).expect("create dir");
+        let path = dir.join(name);
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write exe");
+        path
     }
-    false
+
+    #[test]
+    fn resolve_bin_prefers_a_path_hit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let on_path = tmp.path().join("path");
+        let elsewhere = tmp.path().join("elsewhere");
+        touch_exe(&on_path, "x0x");
+        touch_exe(&elsewhere, "x0x");
+        let path_str = on_path.to_string_lossy().into_owned();
+        let got = resolve_bin("x0x", &path_str, &[elsewhere.clone()]);
+        assert_eq!(
+            got,
+            Some(PathBuf::from("x0x")),
+            "a PATH hit must win, because that is what a fresh shell would get"
+        );
+    }
+
+    #[test]
+    fn resolve_bin_falls_back_to_candidate_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let candidates = tmp.path().join("local-bin");
+        touch_exe(&candidates, "x0x");
+        let got = resolve_bin("x0x", "", &[candidates.clone()]);
+        assert_eq!(
+            got,
+            Some(candidates.join("x0x")),
+            "a binary only in the installer's home must still be found — that is \
+             the Porteus case, where ~/.local/bin is not on PATH"
+        );
+    }
+
+    #[test]
+    fn resolve_bin_returns_none_when_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(resolve_bin("x0x", "", &[tmp.path().to_path_buf()]), None);
+        assert_eq!(
+            resolve_bin("x0x", tmp.path().to_string_lossy().as_ref(), &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn cap_install_log_keeps_short_logs() {
+        assert_eq!(cap_install_log("small".into()), "small");
+    }
+
+    #[test]
+    fn cap_install_log_truncates_from_the_front() {
+        let head = "H".repeat(INSTALL_LOG_CAP);
+        let tail = "interesting error at the end";
+        let capped = cap_install_log(format!("{head}{tail}"));
+        assert!(capped.contains(tail), "the end of the log is what matters");
+        assert!(capped.contains("trimmed"));
+        assert!(capped.len() < head.len() + tail.len() + 64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_installer_captures_stdout_and_stderr() {
+        let (ok, log) = run_installer("echo out; echo err 1>&2; exit 0");
+        assert!(ok);
+        assert!(log.contains("out"), "stdout must be captured: {log}");
+        assert!(log.contains("err"), "stderr must be captured: {log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_installer_reports_failure_with_the_log() {
+        let (ok, log) = run_installer("echo boom; exit 1");
+        assert!(!ok);
+        assert!(
+            log.contains("boom"),
+            "a failed installer still has a log: {log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_installer_reports_a_missing_program() {
+        // Routed through `sh -c`, so a missing program is the shell's failure —
+        // which is still a failed install with a readable log, not a panic.
+        let (ok, log) = run_installer("/nonexistent/definitely-not-a-real-installer");
+        assert!(!ok);
+        assert!(log.contains("not found"), "got: {log}");
+    }
 }

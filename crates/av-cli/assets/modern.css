@@ -382,6 +382,14 @@ input[type="text"] {
   font-size: 0.82rem;
 }
 
+/* The installer log can be long; keep the dialog scrollable rather than
+ * letting it grow past the viewport. Structural, so unscoped: retro.css
+ * recolours but does not lay out. */
+#install-output {
+  max-height: 12rem;
+  overflow-y: auto;
+}
+
 .check {
   display: flex;
   gap: 8px;

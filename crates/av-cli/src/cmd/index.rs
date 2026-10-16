@@ -16,9 +16,7 @@ use serde_json::json;
 use crate::cmd::{CliError, CliResult};
 use crate::download::{DownloadEvent, DownloadOptions, download_content, verify_uri_exists};
 use crate::output::{abbrev, print_output};
-use crate::startup::{
-    StartupState, ant_cli_binary_available, install_ant_cli, refresh_ant_path, start_antd_daemon,
-};
+use crate::startup::{StartupState, ant_cli_binary_available, install_ant_cli, start_antd_daemon};
 
 /// Result of indexing one URI.
 pub struct IndexOutcome {
@@ -316,10 +314,18 @@ pub fn run(
             .map_err(|e| CliError::Other(e.to_string()))?
             && install_ant_cli()
         {
-            // The PowerShell installer may put ant.exe in various locations
-            // that aren't yet in PATH for the current terminal session.
-            refresh_ant_path();
-            println!("ant CLI installed successfully.");
+            // Detection consults ~/.local/bin as well as PATH, so an installer
+            // that drops ant outside the terminal's PATH is still usable here —
+            // but the user's own shell will need the advice the installer just
+            // printed above.
+            if ant_cli_binary_available() {
+                println!("ant CLI installed successfully.");
+            } else {
+                println!(
+                    "The installer finished, but ant could not be found even in \
+                     ~/.local/bin. Re-run the install command above and read its output."
+                );
+            }
         } else {
             println!();
             #[cfg(windows)]
