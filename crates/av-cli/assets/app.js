@@ -102,6 +102,11 @@ const ui = {
   removeDialog: el('remove-dialog'),
   removeTitle: el('remove-title'),
   removeBlurb: el('remove-blurb'),
+  mediaDialog: el('media-dialog'),
+  mediaTitle: el('media-title'),
+  mediaPlayer: el('media-player'),
+  mediaStatus: el('media-status'),
+  mediaSave: el('media-save'),
   dialogRun: el('install-run'),
 };
 
@@ -184,8 +189,18 @@ const postJSON = (path, payload) =>
 
 /* Mirrors the server's MAX_BODY. The server rejects an oversized body rather
  * than truncating it, but discovering that after a fetch that may have taken
- * half a minute is a poor trade, so the check happens before the upload. */
+ * half a minute is a poor trade, so the check happens before the upload.
+ * This is the *viewer* cap: /api/view/blob takes a copy the browser wants
+ * displayed, and displayable files are small. */
 const MAX_UPLOAD = 32 * 1024 * 1024;
+
+/* Mirrors the server's INDEX_BODY — the cap on /api/index/bytes, which takes
+ * the whole record. Deliberately far above MAX_UPLOAD: indexing wants a
+ * movie as readily as a page, and the browser already holds the bytes, so
+ * the only question is how much the index will take. Past this, indexing
+ * falls back to the local daemon, which fetches the record itself and never
+ * crosses this server's body limit at all. */
+const MAX_INDEX_UPLOAD = 512 * 1024 * 1024;
 
 /* The two binary endpoints take the file as the request body, so the location
  * rides in a header. Both are same-origin POSTs from this page, which is what
@@ -230,6 +245,17 @@ const postPlan = (uri, mimeType, blob) =>
     },
     body: blob ? blob.slice(0, PLAN_PREFIX) : null,
   });
+
+/* Ask the server whether this location is blocked here, before any bytes move.
+ *
+ * A browser WebRTC fetch reaches no route of ours, so this question cannot be
+ * answered from inside the transfer — the page has to ask it first. The answer
+ * comes from the same `refuse_if_blocked` every fetching route uses, so the page
+ * and the server cannot disagree about what is blocked. Throws the server's
+ * refusal with `err.code` set (`blocked`, or `block_check_failed` when the block
+ * list itself could not be read — which is also a refusal). */
+const checkBlocked = (uri) =>
+  api('/api/blocked?location=' + encodeURIComponent(uri));
 
 /* Hand bytes straight to the browser as a file, named by the server.
  *
@@ -614,7 +640,59 @@ class DownloadCancelled extends Error {
   }
 }
 
-async function fetchAutonomi(address, { onProgress, onStep, onChunk, signal } = {}) {
+/* One AutonomiClient for the life of the page, shared by every open, save and
+ * index.
+ *
+ * `AutonomiClient.connect` is not cheap: it compiles and instantiates the
+ * 5.4 MB WASM core *inside itself*, dials the bootstrap seeds and authenticates
+ * — and until this existed every operation built its own client and threw it
+ * away, never closing it (a leaked WebRTC association per click), so the compile
+ * and the handshake were paid on every single open, index and save. Now they are
+ * paid once, started by the first of them or by a hover, and later operations go
+ * straight to `openFile`.
+ *
+ * The promise — including its failure — is what the concurrency safety rides
+ * on: the placeholder is assigned synchronously, before the first `await`, so
+ * two callers racing here share one connect instead of starting two. A *failed*
+ * connect clears the slot rather than being cached, because a daemon coming up
+ * mid-session should not condemn the browser route until the next page load.
+ *
+ * No `signal` belongs to this connect: a shared connection is not one
+ * operation's to abort. Stop still works — it aborts at `openFile` and the
+ * stream, which are per-operation — and a connect left running in the
+ * background after a Stop just means the next operation finds it ready. */
+let sharedClientPromise = null;
+
+function invalidateSharedClient() {
+  sharedClientPromise = null;
+}
+
+async function getSharedClient({ onProgress } = {}) {
+  if (!sharedClientPromise) {
+    sharedClientPromise = (async () => {
+      const { mod, error } = await loadSdk();
+      if (error) throw new Error(error);
+      /* One options object, and only one: the second argument of `connect` is
+       * read only for the string-multiaddress form, so passing settings there
+       * silently drops them. */
+      return mod.AutonomiClient.connect({ onProgress });
+    })().catch((err) => {
+      sharedClientPromise = null;
+      throw err;
+    });
+  }
+  return sharedClientPromise;
+}
+
+/* Open a record and hand back its reader — before a single byte has moved.
+ *
+ * Everything up to and including `openFile` lives here so that callers can
+ * decide what to do with the bytes *after* the plan does: a file the browser
+ * cannot show streams to disk through the service worker, a displayable one
+ * is assembled and handed to the viewer, and both start from this same
+ * open. `fetchAutonomi` below is the whole-file shape, kept for the callers
+ * (indexing) that genuinely need every byte in one piece. */
+async function openAutonomi(address, { onProgress, onStep, signal } = {}) {
   /* Announce the library load ourselves, because it is the longest silent stretch
    * in the entire fetch and it is *not* the SDK's to report.
    *
@@ -626,7 +704,7 @@ async function fetchAutonomi(address, { onProgress, onStep, onChunk, signal } = 
    * the user is waiting for, and a slow connection looks exactly like a hang.
    */
   if (onStep) onStep('Loading the Autonomi library (about 5 MB, once)');
-  const { mod, error } = await loadSdk();
+  const { error } = await loadSdk();
   if (error) throw new Error(error);
   if (signal && signal.aborted) throw new DownloadCancelled();
 
@@ -635,35 +713,43 @@ async function fetchAutonomi(address, { onProgress, onStep, onChunk, signal } = 
   };
   if (onStep) onStep('Looking for the nodes holding this file');
 
-  /* **One** argument, and that is load-bearing.
-   *
-   * `AutonomiClient.connect(bootstrap, options)` reads a plain object in the first
-   * argument as a network profile and takes its settings from a rest-spread of
-   * that object — the second argument is only consulted for the string form (one
-   * explicit WebRTC multiaddress). Passing `{ onProgress }` first and `{ signal }`
-   * second therefore silently *drops the abort signal*: `connect` succeeds, and
-   * Stop cannot cancel it. Everything goes in the first argument.
-   */
-  const client = await mod.AutonomiClient.connect({ onProgress: progress, signal });
+  /* The page's shared connection — see `getSharedClient` for why it is one.
+   * The connect itself is not this operation's to abort: Stop reaches the work
+   * through `signal` on `openFile` and on the stream, which are per-operation,
+   * while this call waits on a connect that may have been started by a hover or
+   * by an earlier open. */
+  let client = await getSharedClient({ onProgress: progress });
 
   /* **Open and stream, do not `download()`.**
    *
    * `download()` is the wrong call for a progress display, and not because of
-   * anything in this project. It waits for the whole file and reports once at the
-   * end with `phase: "complete"` and the final byte total — so during the part the
-   * user is actually waiting for it says nothing at all. The reference app at
+   * anything in this project. It waits for the whole file and reports once at
+   * the end with `phase: "complete"` and the final byte total — so during the part
+   * the user is actually waiting for it says nothing at all. The reference app at
    * try.autonomi.com shows per-chunk progress for exactly this reason: it opens a
    * reader and consumes a stream, so it can count arrivals as they happen.
    *
    * `openFile()` gives us two things `download()` never exposes: `reader.size`,
    * known from the DataMap *before* any chunk moves, and a `stream()` that yields
    * the plaintext a chunk at a time. With both, a live "N chunks · X of Y" is
-   * arithmetic rather than a guess.
-   *
-   * The parts are accumulated because the caller still needs the whole file to
-   * hand to the server, so this is the same peak memory as `download()`'s blob —
-   * the gain is observability, not a smaller footprint. */
-  const reader = await client.openFile(address, { onProgress: progress, signal });
+   * arithmetic rather than a guess. */
+  let reader;
+  try {
+    reader = await client.openFile(address, { onProgress: progress, signal });
+  } catch (err) {
+    /* A stop is a stop: never spent on a reconnect. */
+    if (signal && signal.aborted) throw err;
+    if (err.name === 'DownloadCancelled') throw err;
+    /* The shared client can outlive the connection under it — a laptop that
+     * slept, a network that changed — and, unlike the fresh-per-click client
+     * this replaced, nothing else is going to swap it out. So one retry on a
+     * fresh connect: a failure that repeats there is the file's, not the
+     * connection's, and it reaches the caller (and from there the daemon
+     * route). Abort is excluded above so Stop can never trigger this. */
+    invalidateSharedClient();
+    client = await getSharedClient({ onProgress: progress });
+    reader = await client.openFile(address, { onProgress: progress, signal });
+  }
 
   /* The SDK reports `phase: "complete"` the moment this reader exists, which is
    * before a single byte has moved — see `PHASE_LABELS`. So the line under
@@ -672,35 +758,823 @@ async function fetchAutonomi(address, { onProgress, onStep, onChunk, signal } = 
 
   const totalBytes = Number(reader.size) || 0;
   if (!totalBytes) throw new Error('the Autonomi library did not report a file size');
+  return {
+    reader,
+    client,
+    totalBytes,
+    contentType: reader.contentType || 'application/octet-stream',
+  };
+}
 
-  const parts = [];
-  let received = 0;
-  let chunks = 0;
-  const handle = reader.stream({ chunkSize: READ_CHUNK_BYTES, signal }).getReader();
+/* Read an open stream to its end, counting as it goes.
+ *
+ * `receivedSoFar` / `chunksSoFar` / `parts` seed the counters when a prefix
+ * has already been read — the plan takes the leading bytes before the branch
+ * is known, so the rest continues the same count rather than starting a
+ * second one. The total is checked here, for every caller: a short stream
+ * that passes for a complete file is a corrupt save or a blank viewer, and
+ * this is the one place both outcomes can be caught. */
+async function drainRest(handle, {
+  signal,
+  onChunk,
+  receivedSoFar = 0,
+  chunksSoFar = 0,
+  totalBytes,
+  parts = [],
+} = {}) {
+  let received = receivedSoFar;
+  let chunks = chunksSoFar;
   for (;;) {
     const { done, value } = await handle.read();
     if (done) break;
+    if (signal && signal.aborted) throw new DownloadCancelled();
     if (!value || !value.byteLength) continue;
     parts.push(value);
     received += value.byteLength;
     chunks += 1;
     if (onChunk) onChunk({ chunks, bytes: received, totalBytes });
   }
-
   if (received !== totalBytes) {
     throw new Error(
       `the Autonomi library returned ${received} of ${totalBytes} bytes`
     );
   }
-
-  /* Nonfatal seed churn is expected: the SDK retries and, when it succeeds,
-   * logs nothing to report. Only a settled failure reaches here. */
-  return {
-    blob: new Blob(parts, {
-      type: reader.contentType || 'application/octet-stream',
-    }),
-  };
+  return { parts, received, chunks };
 }
+
+/* Fetch a record whole, into a Blob.
+ *
+ * The parts are accumulated because the caller still needs the whole file to
+ * hand to the server, so this is the same peak memory as `download()`'s blob —
+ * the gain over it is observability (per-chunk counts on the way), not a
+ * smaller footprint. The open path no longer comes here: it streams to disk
+ * or feeds the viewer from the prefix, and only indexing still wants this
+ * shape. Nonfatal seed churn is expected: the SDK retries and, when it
+ * succeeds, logs nothing to report. Only a settled failure reaches the
+ * caller. */
+async function fetchAutonomi(address, { onProgress, onStep, onChunk, signal } = {}) {
+  const opened = await openAutonomi(address, { onProgress, onStep, signal });
+  const handle = opened.reader
+    .stream({ chunkSize: READ_CHUNK_BYTES, signal })
+    .getReader();
+  const { parts } = await drainRest(handle, {
+    signal,
+    onChunk,
+    totalBytes: opened.totalBytes,
+  });
+  return { blob: new Blob(parts, { type: opened.contentType }) };
+}
+
+const STREAM_SW_URL = '/autonomi-stream-sw.js';
+
+/* Wait for the streaming worker to control this page, or give up.
+ *
+ * The boot handshake (`ensureWorkerControlAtBoot`) has usually done the
+ * registering already; this is the on-demand path — a caller that wants
+ * the controller in hand before speaking to the worker, reached while the
+ * boot's reload flag was already spent. `skipWaiting` plus
+ * `clients.claim` in the worker make the wait short: `ready` resolves
+ * once a registration is active and the controller follows from the
+ * claim. A browser without service workers, or a registration this page
+ * refuses, answers null, and the caller falls back to the buffered
+ * download, which needs nothing of the sort. */
+async function ensureServiceWorker() {
+  if (!('serviceWorker' in navigator)) return null;
+  try {
+    if (!navigator.serviceWorker.controller) {
+      await navigator.serviceWorker.register(STREAM_SW_URL);
+    }
+    await navigator.serviceWorker.ready;
+    if (navigator.serviceWorker.controller) return navigator.serviceWorker.controller;
+    return await new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        navigator.serviceWorker.removeEventListener('controllerchange', done);
+        resolve(navigator.serviceWorker.controller);
+      };
+      const timer = setTimeout(done, 3000);
+      navigator.serviceWorker.addEventListener('controllerchange', done);
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
+/* Make this page *controlled* by the streaming worker before anything needs
+ * it — reloading once if the browser will not claim it.
+ *
+ * Control, not registration, is what the media route runs on: the SDK's
+ * `MediaBridge` refuses to hand over a player URL until
+ * `navigator.serviceWorker.controller` is ours (its error, after a 10 s
+ * wait, is "did not take control of this page; reload once and retry"), and
+ * a save without a controller silently degrades to the buffered path.
+ * Registration alone does not deliver control to the page that performs it:
+ * `clients.claim()` is known to skip its own registering document — the
+ * browser's and the SDK's shared remedy is a single reload — while every
+ * later load of an already-registered page is controlled at load time, by
+ * ordinary rules. So at boot: a page that already has a controller does
+ * nothing; a page that does not gets registered here, claim gets its
+ * chance, and only a controller that still has not arrived reloads the
+ * page — after which the active worker controls it at load, the ordinary
+ * way. The flag is sessionStorage (per tab, gone when it closes) and is
+ * set *before* the async work, so even a double boot cannot double-reload
+ * and a profile where control never lands loops at most once — and
+ * storage that refuses the flag means no reload at all, because a reload
+ * we cannot remember is a reload we can repeat. */
+function ensureWorkerControlAtBoot() {
+  if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+  if (navigator.serviceWorker.controller) return;
+  try {
+    if (sessionStorage.getItem('anta-vista-sw-reloaded')) return;
+    sessionStorage.setItem('anta-vista-sw-reloaded', '1');
+  } catch (_) {
+    return;
+  }
+  ensureServiceWorker().then((controller) => {
+    if (controller) return;
+    location.reload();
+  });
+}
+
+/* Keep the streaming worker awake for as long as something rides it.
+ *
+ * Firefox terminates a service worker that has heard nothing for ~30
+ * seconds — even one that is mid-stream, spooling a download to disk
+ * (StreamSaver's README states the timeout outright; immich #21490
+ * reproduces the kill failing large saves). The dead worker takes the
+ * response body down with it, and Firefox reports the half-written `.part`
+ * file as one whose "source file could not be read" — which reads as the
+ * file being broken rather than as the worker being killed. Chrome counts
+ * an open response body as activity and waits minutes, so the same save
+ * works there and the failure looks Firefox-specific. A message event *is*
+ * activity at the worker, so a ping comfortably inside the window keeps it
+ * alive; the two reasons overlap, because a playing session needs the same
+ * protection (the worker holds the session's taught MIME, and a resumed
+ * player after the kill would get a 400 instead of its bytes). */
+let keepaliveReasons = new Set();
+let keepaliveTimer = null;
+
+function keepaliveAdd(reason) {
+  keepaliveReasons.add(reason);
+  if (keepaliveTimer) return;
+  keepaliveTimer = setInterval(() => {
+    const controller =
+      navigator.serviceWorker && navigator.serviceWorker.controller;
+    if (!controller) return;
+    try {
+      controller.postMessage({ type: 'av-ping' });
+    } catch (_) {}
+  }, 10000);
+}
+
+function keepaliveRemove(reason) {
+  keepaliveReasons.delete(reason);
+  if (keepaliveTimer === null || keepaliveReasons.size) return;
+  clearInterval(keepaliveTimer);
+  keepaliveTimer = null;
+}
+
+/* The worker's own messages, in this page's console. It announces them to
+ * every window client (Firefox shows no worker console here, so anything
+ * logged only there is invisible — an unknown-token 404 looked like a
+ * browser-side download failure with no cause anywhere), and this is the
+ * other half: hear the announcement and say it where the user can see it
+ * and paste it. Failures print as errors; lifecycle lines (`av-stream-log`
+ * — chiefly the worker's realm starting again, which is what an idle kill
+ * looks like from outside) print plainly, so an error-level console filter
+ * does not hide the restart that explains them. */
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    const msg = event.data;
+    if (msg && msg.type === 'av-stream-failure') {
+      console.error(msg.label, msg.message || '');
+    } else if (msg && msg.type === 'av-stream-log') {
+      console.log(msg.label, msg.message || '');
+    }
+  });
+}
+
+/* Saves run through memory up to this size, and through the worker past it.
+ *
+ * Buffering is the default because it is the route every browser completes:
+ * the bytes assemble into a Blob and an object URL downloads them, with no
+ * service worker in the path at all. It costs the file's size in memory
+ * while it runs — fine for anything a tab can hold, and exactly what breaks
+ * for anything it cannot, so past this line a save streams to disk through
+ * the worker instead, one chunk at a time. (`try.autonomi.com` draws the
+ * same line with its own `MAX_PAGE_FILE_BYTES`.) An unknown size — not a
+ * safe integer — counts as below the cap: buffering reads whatever is there. */
+const SAVE_BUFFER_CAP = 512 * 1024 * 1024;
+
+/* Start a browser download whose body arrives live from the worker.
+ *
+ * Only called for a file past SAVE_BUFFER_CAP; below the cap the caller
+ * buffers straight to an object URL. Returns the port to pipe the file into,
+ * or null when this browser has no worker to stream through — the caller
+ * then buffers, as it always used to.
+ * The token is minted here, one per click, and travels in the URL; the
+ * worker refuses a token it does not know, so the route cannot be aimed at
+ * another download. `downloadUrl` rather than a navigation of this page:
+ * the tab must stay where it is and keep feeding the port. The size goes
+ * along because it is already known (the DataMap says before the first
+ * chunk moves), so the worker can declare it: the browser's download UI
+ * then shows a real total instead of an anonymous crawl, and a body that
+ * stops short of the declared length fails loudly rather than saving a
+ * silent hole. The keepalive starts here and ends when the pipe settles. */
+async function startSWDownload(filename, mime, size, source = '') {
+  const controller = await ensureServiceWorker();
+  if (!controller) return null;
+  const token =
+    self.crypto && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  /* Hand the token to `target` and wait for its answer on a fresh port. The
+   * worker confirms the registration on that port before the click goes
+   * out: the token travels by message and the download by navigation, the
+   * two take different routes to the worker, and a fetch that wins the race
+   * gets the worker's empty 404 — a failed download in the browser's manager
+   * while this pipe waits for pulls that will never come. No confirmation
+   * means no click: the caller's buffered fallback needs no worker, so a
+   * worker that is slow, old, or gone degrades the save instead of breaking
+   * it. */
+  const registerOn = async (target) => {
+    const channel = new MessageChannel();
+    const confirmed = new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 2000);
+      channel.port1.onmessage = (event) => {
+        if (event.data && event.data.type === 'ready') {
+          clearTimeout(timer);
+          resolve(true);
+        }
+      };
+    });
+    target.postMessage(
+      {
+        type: 'av-download',
+        token,
+        filename: filename || '',
+        mime: mime || '',
+        size: Number.isSafeInteger(size) && size >= 0 ? size : -1,
+        /* Which flow is saving — the player's dialog or a result row. The
+         * worker repeats it on cancel, so a console line names the path
+         * that died instead of leaving two downloads to tell apart by
+         * filename alone. */
+        source: source || '',
+      },
+      [channel.port2]
+    );
+    if (!(await confirmed)) {
+      channel.port1.onmessage = null;
+      try {
+        channel.port1.close();
+      } catch (_) {}
+      return null;
+    }
+    channel.port1.onmessage = null;
+    return channel.port1;
+  };
+  let port = await registerOn(controller);
+  /* The controller can be replaced between the handshake and the click — a
+   * registration update activating (a rebuild served new worker bytes, and
+   * `skipWaiting` makes the swap immediate) starts a fresh realm whose token
+   * map is empty, and the navigation this click starts would be answered
+   * with that realm's 404. Re-register with whoever will actually answer:
+   * the token is a string, so the new realm can hold it too. */
+  const active = navigator.serviceWorker.controller;
+  if (active && active !== controller) {
+    port = await registerOn(active);
+  }
+  if (!port) {
+    console.warn(
+      'the download worker did not confirm in time; saving through memory instead'
+    );
+    return null;
+  }
+  downloadUrl('/av-download/' + encodeURIComponent(token), filename);
+  /* One line per attempt, before anything can fail: which file, which flow.
+   * A session where two downloads ran under two different names was
+   * undecidable from the failure lines alone — the cancelled one and the
+   * one Firefox complained about could not be matched to a click. */
+  console.log('av-download started', filename || '(unnamed)', source || '(untagged)');
+  keepaliveAdd('download');
+  return port;
+}
+
+/* Pipe an open Autonomi stream into a service-worker download.
+ *
+ * Speaks the worker's pull protocol: one `pull` in, one chunk out (or
+ * `done`/`error` at the end), so a slow disk pauses the WebRTC read instead
+ * of piling the file up in memory — which is the entire point of the route.
+ * A `cancelled` from the worker means the user dropped the download in the
+ * browser's UI, and is a stop rather than a failure.
+ *
+ * `parts` are bytes already read before this pipe existed — the plan's
+ * leading chunk. The worker declared the whole DataMap length from the
+ * first byte, so those bytes must go down the same pipe too: a body that
+ * started mid-file stops one prefix short of its own Content-Length, and
+ * the `received !== totalBytes` check below would fail every save the plan
+ * had already touched. The player's Save reads no prefix and passes none. */
+/* How long a confirmed pipe waits for the worker's first pull before it
+ * calls the silence a failure. The worker asks for data the moment the
+ * download navigation lands on a realm that knows the token — near
+ * instantly, because the response headers go out with the stream and the
+ * browser starts consuming at once. A pull that never comes means the
+ * fetch landed somewhere that did not know the token (a registration
+ * update swapped realms mid-flow), or the worker died between confirm and
+ * fetch: Firefox's download UI reports that 404 on its own schedule —
+ * sometimes only when the download is inspected — while this pipe would
+ * wait forever. Generous next to the real timeline, because the cost of a
+ * false failure is a real save; the point is to fail while the user is
+ * still watching. */
+const FIRST_PULL_TIMEOUT_MS = 15000;
+/* How long a *running* pipe tolerates silence. One number for two
+ * directions, because they are the same question asked of two parties:
+ * after a pull the network owes a chunk, after a chunk the worker owes a
+ * pull. A pause in either used to leave this pipe waiting forever with the
+ * dialog frozen on its last count, while the browser's download UI reports
+ * the interrupted body only when the download is inspected and Firefox
+ * shows nothing in the page console at all. Each phase arms the window
+ * with a message that names which side went quiet. */
+const STALL_TIMEOUT_MS = 60000;
+
+function pipeReaderToPort(
+  handle,
+  port,
+  { signal, totalBytes, onChunk, parts = [] } = {}
+) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let received = 0;
+    let chunks = 0;
+    let silence = null;
+    let onControllerChange = null;
+    const pending = parts.slice();
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      if (silence !== null) clearTimeout(silence);
+      if (onControllerChange !== null && 'serviceWorker' in navigator) {
+        navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
+        onControllerChange = null;
+      }
+      keepaliveRemove('download');
+      port.onmessage = null;
+      try {
+        port.close();
+      } catch (_) {}
+      if (err) reject(err);
+      else resolve();
+    };
+    /* One timer owns every silence check: each phase arms it with its own
+     * message and arming again *replaces* the previous deadline, so a
+     * phase's window can never outlive the phase. (What this replaced — a
+     * raw first-pull setTimeout that only `finish` ever cleared — fired its
+     * 15 s window long after the first pull had proved itself, killing any
+     * save that took longer than that.) */
+    const arm = (ms, message, hint) => {
+      if (silence !== null) clearTimeout(silence);
+      silence = setTimeout(() => {
+        /* Tell the worker too: the browser's download UI shows only that
+         * the body failed, never why, and a named error on the port makes
+         * the worker announce it to the page (see `av-stream: download
+         * failed`). */
+        try {
+          port.postMessage({ type: 'error', message });
+        } catch (_) {}
+        finish(new Error(`${message} (${hint})`));
+      }, ms);
+    };
+    const pump = async () => {
+      /* One pull answers one chunk; the loop only skips empty reads without
+       * starving the worker's pending pull. The plan's parts go first —
+       * they are the file's leading bytes, already in hand. */
+      for (;;) {
+        if (signal && signal.aborted) throw new DownloadCancelled();
+        let value;
+        if (pending.length) {
+          value = pending.shift();
+        } else {
+          const next = await handle.read();
+          if (settled) return;
+          if (next.done) {
+            if (received !== totalBytes) {
+              const message = `the Autonomi library returned ${received} of ${totalBytes} bytes`;
+              try {
+                port.postMessage({ type: 'error', message });
+              } catch (_) {}
+              throw new Error(message);
+            }
+            try {
+              port.postMessage({ type: 'done' });
+            } catch (_) {}
+            finish(null);
+            return;
+          }
+          value = next.value;
+        }
+        if (!value || !value.byteLength) continue;
+        chunks += 1;
+        received += value.byteLength;
+        /* Transfer the exact bytes: a Uint8Array view may sit inside a larger
+         * ArrayBuffer, and posting the whole backing store would ship bytes
+         * that are not the file's. */
+        const buf =
+          value.byteOffset === 0 && value.byteLength === value.buffer.byteLength
+            ? value.buffer
+            : value.slice().buffer;
+        try {
+          port.postMessage({ type: 'chunk', bytes: buf }, [buf]);
+        } catch (err) {
+          throw new Error(`the download channel closed (${err.message})`);
+        }
+        if (onChunk) onChunk({ chunks, bytes: received, totalBytes });
+        /* The chunk is the worker's cue to ask again. Arm *that* direction
+         * before waiting: a worker that never does is a dead or replaced
+         * realm, and the browser's download UI reports one only when the
+         * download is inspected. */
+        arm(STALL_TIMEOUT_MS, 'the worker stopped asking for data', 'the transfer stalled');
+        return; /* this pull is answered; wait for the next */
+      }
+    };
+    /* The first pull is the worker proving it received the token and started
+     * the stream. No pull is the failure class the confirm was built to
+     * prevent still happening — after it, from the other side. */
+    arm(FIRST_PULL_TIMEOUT_MS, 'the worker never asked for any data', 'the download did not start');
+    port.onmessage = (event) => {
+      const msg = event.data;
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'pull' && !settled) {
+        /* The first pull proves the token landed; every later one proves the
+         * realm is still alive. From here the network owes the next chunk,
+         * so the deadline passes to the read — replacing the first-pull
+         * window that just proved itself. */
+        arm(STALL_TIMEOUT_MS, 'the network did not deliver the next chunk', 'the transfer stalled');
+        pump().catch((err) => {
+          /* Tell the worker even when the stop was ours: an unanswered pull
+           * leaves the browser's download waiting on a body that is never
+           * coming, and a failed download is the honest read-out either way.
+           * The failure is also named here, because Firefox shows no worker
+           * logs in the page console — without this line a broken save shows
+           * only the browser's own "source file could not be read". */
+          try {
+            port.postMessage({ type: 'error', message: err.message || 'stopped' });
+          } catch (_) {}
+          if (!(err && err.name === 'DownloadCancelled')) {
+            console.error('the download pipe failed', err);
+          }
+          finish(err);
+        });
+      } else if (msg.type === 'cancelled' && !settled) {
+        finish(new DownloadCancelled());
+      }
+    };
+    /* A registration update activating mid-save swaps the controller and
+     * terminates the realm serving this download: the port dies, the
+     * browser's body dies with it ("source file could not be read"), and
+     * this pipe would sit out its silence window guessing which side went
+     * quiet. The replacement *is* the diagnosis — name it the moment it
+     * happens. The page's boot handshake listens for the same event
+     * elsewhere; this listener exists only while one pipe runs and is
+     * removed in `finish`. */
+    onControllerChange = () => {
+      finish(
+        new Error(
+          'the streaming worker was replaced mid-save; the download was interrupted \u2014 try saving again'
+        )
+      );
+    };
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
+    }
+  });
+}
+
+/* Why a file is being saved rather than shown. Every reason that applies is
+ * stated — a video whose player failed *and* which is over the viewer limit
+ * hits both, and naming only the size would hide the thing the click
+ * actually wanted. `playerFailed` is only ever passed from the fresh-open
+ * path: a cached reopen never had a player attempt. */
+const downloadWhy = (renderable, size, playerFailed = false) =>
+  [
+    playerFailed && 'the player could not open',
+    !renderable && 'this file type cannot be shown in a browser',
+    size > MAX_UPLOAD &&
+      `it is ${formatBytes(size)}, over the ${formatBytes(MAX_UPLOAD)} viewer limit`,
+  ]
+    .filter(Boolean)
+    .join(', and ');
+
+/* ---------------------------------------------------------- media player -- */
+
+/* Mirrors the SDK's `SDK_LIMITS.mediaMaxFileBytes` (and the worker's
+ * `MAX_STREAM_FILE_BYTES`): past this the stream URL is refused, so the page
+ * checks it before offering playback — a save is the honest route there. */
+const MEDIA_MAX_BYTES = 1000000000;
+
+/* What the plan's MIME means for this dialog: audio and video play here.
+ * Everything else is a save or a viewer, decided by the branches below. */
+const isMediaMime = (mime) =>
+  typeof mime === 'string' && /^(audio|video)\//i.test(mime);
+
+/* Whether playback through the worker is possible at all: a secure context
+ * (loopback counts) and service-worker support. The player is one route, not
+ * the only one — when this is false the bytes in hand fall through to the
+ * viewer or the save, which ask nothing of the sort. */
+const mediaCapability = () =>
+  typeof navigator !== 'undefined' &&
+  'serviceWorker' in navigator &&
+  window.isSecureContext === true;
+
+/* The session id the SDK's MediaBridge baked into the stream URL. It keys
+ * both halves of the worker protocol: the range messages the bridge answers,
+ * and the MIME taught to the worker before the first byte is asked for. */
+function mediaSessionId(url) {
+  const match = /__autonomi_stream\/([0-9a-f]{32})\//.exec(String(url || ''));
+  return match ? match[1] : null;
+}
+
+/* Teach the worker the MIME our own sniffing decided, and wait for the ack.
+ *
+ * The SDK reports `application/octet-stream` for most records, and the
+ * worker serves only audio/* and video/* — so without this the first range
+ * request is a 400 and every real file fails to play. Awaited before
+ * `video.src` is set, because the first fetch can race a postMessage. */
+function teachMediaType(sessionId, mime) {
+  return new Promise((resolve, reject) => {
+    const controller =
+      navigator.serviceWorker && navigator.serviceWorker.controller;
+    if (!controller) {
+      reject(new Error('the media worker is not controlling this page'));
+      return;
+    }
+    const channel = new MessageChannel();
+    const timer = setTimeout(() => {
+      reject(new Error('the media worker did not acknowledge the type'));
+    }, 5000);
+    channel.port1.onmessage = (event) => {
+      clearTimeout(timer);
+      try {
+        channel.port1.close();
+      } catch (_) {}
+      const msg = event.data;
+      if (msg && msg.ok) resolve();
+      else
+        reject(
+          new Error((msg && msg.error) || 'the media worker refused the type')
+        );
+    };
+    channel.port1.start();
+    controller.postMessage(
+      { type: 'av-media-type', sessionId, mime },
+      [channel.port2]
+    );
+  });
+}
+
+/* The one open player: one dialog, one element, one worker session. The
+ * dialog is deliberately *not* modal — listening while browsing is the point
+ * of an inline player, and a modal would make the row's own Block button
+ * unreachable while its file plays. */
+let mediaSession = null;
+
+/* Synchronous teardown, idempotent: null the session first so a second call
+ * (or a late close event) finds nothing to close. */
+function teardownPlayer() {
+  const session = mediaSession;
+  mediaSession = null;
+  keepaliveRemove('media');
+  ui.mediaPlayer.pause();
+  ui.mediaPlayer.removeAttribute('src');
+  ui.mediaPlayer.load(); // releases the fetch behind the old src
+  ui.mediaStatus.textContent = '';
+  if (session) {
+    try {
+      session.source.close();
+    } catch (_) {}
+  }
+}
+
+ui.mediaDialog.addEventListener('close', () => {
+  teardownPlayer();
+});
+
+/* Non-modal dialogs are not closed by Esc the way modal ones are, and this
+ * dialog has no other dismissal besides its own button. */
+ui.mediaDialog.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    ui.mediaDialog.close();
+  }
+});
+
+ui.mediaPlayer.addEventListener('error', () => {
+  if (!ui.mediaDialog.open) return;
+  ui.mediaStatus.textContent =
+    'This file could not be played. Close the player and use Save to disk.';
+});
+
+/* Stop playback of `location` if that is what is playing. Blocking or
+ * removing a resource out from under a player that is streaming it would
+ * otherwise keep the bytes arriving after the row is gone. */
+function closePlayerIf(location) {
+  if (!mediaSession || mediaSession.location !== location) return;
+  if (ui.mediaDialog.open) ui.mediaDialog.close(); // → 'close' → teardown
+  else teardownPlayer();
+}
+
+/* Play `plan` through the client's media source. The plan's prefix reader is
+ * not this route's — MediaBridge opens its own random-access reader — so the
+ * caller keeps or cancels theirs independently.
+ *
+ * The open gets the same invalidate-and-retry-once `openAutonomi` applies to
+ * its own: `createMediaSource` is a *second* network reader on the same
+ * connection — random access, a different wasm path from the sequential open
+ * that already fetched the plan's prefix — and this network fails transiently
+ * per attempt. One bad lookup here used to surrender the entire route: the
+ * file fell through to a full download (a 52 MB video that had a player
+ * waiting for it) or to the viewer (an mp3 that had one too). Failures after
+ * the reader exists — the worker's type ack, an unrecognised session URL —
+ * are *not* retried; a reconnect cannot fix those. Every failure is logged
+ * with its real error, because the fall-through's messages describe the route
+ * taken, never the cause. */
+async function startPlayer({ address, location, plan, onProgress, statusEl }) {
+  let source;
+  let client = await getSharedClient({ onProgress });
+  try {
+    source = await client.createMediaSource(address, {
+      serviceWorkerUrl: STREAM_SW_URL,
+      ...(onProgress ? { onProgress } : {}),
+    });
+  } catch (err) {
+    console.error('the media reader could not be opened', err);
+    if (err.name === 'DownloadCancelled') throw err;
+    invalidateSharedClient();
+    setStatus(statusEl, 'The player could not connect; trying once more…', '');
+    client = await getSharedClient({ onProgress });
+    source = await client.createMediaSource(address, {
+      serviceWorkerUrl: STREAM_SW_URL,
+      ...(onProgress ? { onProgress } : {}),
+    });
+  }
+  try {
+    const sessionId = mediaSessionId(source.url);
+    if (!sessionId) throw new Error('the media URL was not recognised');
+    await teachMediaType(sessionId, plan.mime_type);
+  } catch (err) {
+    console.error('the media worker did not take the session', err);
+    try {
+      source.close();
+    } catch (_) {}
+    throw err;
+  }
+  teardownPlayer(); // replaces any previous session before this one lands
+  mediaSession = {
+    source,
+    location,
+    address,
+    /* The server's name first, never the SDK's: `file.name` is always a
+     * synthetic `public-file-<8hex>.bin`, and this is the name the Save
+     * button downloads under — SDK-first put that placeholder on the user's
+     * disk and named every console line about the save after it. */
+    filename: plan.filename || source.file.name || 'file',
+    mime: plan.mime_type,
+  };
+  /* From here the worker is carrying this session: its range route, its
+   * taught MIME. Stay on it until teardown, so Firefox's idle clock cannot
+   * forget the session under a paused player. */
+  keepaliveAdd('media');
+  ui.mediaTitle.textContent = mediaSession.filename;
+  ui.mediaStatus.textContent = '';
+  ui.mediaSave.disabled = false;
+  ui.mediaPlayer.src = source.url;
+  if (!ui.mediaDialog.open) ui.mediaDialog.show();
+  setStatus(
+    statusEl,
+    `Playing ${mediaSession.filename} \u2014 streamed, not held in memory.`,
+    'ok'
+  );
+  /* Autoplay policies want a gesture, and this flow started with a click —
+   * but a browser that still refuses is not broken; the controls are here. */
+  try {
+    await ui.mediaPlayer.play();
+  } catch (_) {}
+}
+
+/* Save what is playing to disk — through memory, or through the worker when
+ * the file is past SAVE_BUFFER_CAP. A fresh sequential reader rather than the
+ * player's random-access one: the two would interleave reads on a reader
+ * tuned for seeking, and a save is a different shape of read anyway. */
+ui.mediaSave.addEventListener('click', async () => {
+  const session = mediaSession;
+  if (!session || ui.mediaSave.disabled) return;
+  ui.mediaSave.disabled = true;
+  const status = (text) => {
+    ui.mediaStatus.textContent = text;
+  };
+  /* A save that has started but has not seen a byte yet says so on a timer,
+   * per stage: the open narrates its own phases through `onStep`, but the
+   * stretch after the click — the worker confirming, the first pull reaching
+   * the network — had no voice at all, and an unchanging status with the
+   * button disabled reads as a dead click rather than as a slow network. */
+  let waiting = null;
+  let stage = 'open';
+  let firstByte = false;
+  /* The last progress line, kept for the cancel report: the frozen count
+   * was the only datum showing how far a dying transfer got, and the
+   * cancellation message used to overwrite it. */
+  let lastProgress = '';
+  const clickedAt = Date.now();
+  try {
+    status('Preparing the download\u2026');
+    waiting = setInterval(() => {
+      if (firstByte) return;
+      status(
+        stage === 'open'
+          ? 'Still looking for the nodes holding this file \u2014 the network is slow to respond\u2026'
+          : 'Waiting for the first byte \u2014 the network can take a while to start\u2026'
+      );
+    }, 12000);
+    const controller = new AbortController();
+    /* Open the file *before* the download starts. The lookup can take
+     * seconds, and a download started ahead of it is a bare `.part` file
+     * receiving nothing for that whole stretch — exactly the silence in
+     * which Firefox's idle clock (see `keepaliveAdd`) runs out — and a
+     * failure here used to leave that hungry download hung behind it. With
+     * the reader open first, the first chunk follows the click at once and
+     * a failed open starts no download at all. */
+    const opened = await openAutonomi(session.address, {
+      signal: controller.signal,
+      onStep: (step) => status(step),
+    });
+    const handle = opened.reader
+      .stream({ chunkSize: READ_CHUNK_BYTES, signal: controller.signal })
+      .getReader();
+    stage = 'stream';
+    /* Through memory unless the file is past SAVE_BUFFER_CAP: buffering is
+     * the route every browser completes, and the worker's stream is what a
+     * file too large to hold needs. */
+    const overCap =
+      Number.isSafeInteger(opened.totalBytes) &&
+      opened.totalBytes > SAVE_BUFFER_CAP;
+    let port = null;
+    if (overCap) {
+      port = await startSWDownload(session.filename, session.mime, opened.totalBytes, 'player');
+    }
+    const noteChunk = ({ chunks, bytes, totalBytes }) => {
+      firstByte = true;
+      lastProgress = `${chunks} chunk${chunks === 1 ? '' : 's'} received · ${formatBytes(
+        bytes
+      )} of ${formatBytes(totalBytes)}`;
+      status(lastProgress);
+    };
+    if (port) {
+      await pipeReaderToPort(handle, port, {
+        signal: controller.signal,
+        totalBytes: opened.totalBytes,
+        onChunk: noteChunk,
+      });
+    } else {
+      /* The default save: the bytes are already open here — drain them into
+       * a Blob and hand that to the anchor, rather than fetching the whole
+       * file a second time. Also the over-cap fallback when no worker
+       * answered — a memory-heavy save beats no save. */
+      const { parts } = await drainRest(handle, {
+        signal: controller.signal,
+        totalBytes: opened.totalBytes,
+        onChunk: noteChunk,
+      });
+      downloadBlob(
+        new Blob(parts, { type: opened.contentType }),
+        session.filename
+      );
+    }
+    status(`Downloaded as ${session.filename}.`);
+  } catch (err) {
+    if (err.name === 'DownloadCancelled') {
+      /* Nothing in this dialog aborts the save — there is no Stop button
+       * here and the controller is never aborted — so a cancel reaching the
+       * catch is the browser's download UI dropping the transfer, or the
+       * worker reporting that it did. The silent return this replaced read
+       * as a save that finished and produced no file; say what happened —
+       * and keep the progress line in front of it, because the frozen count
+       * is the datum that shows how far the transfer got. */
+      const elapsed = `${Date.now() - clickedAt}ms, ${lastProgress || 'no bytes yet'}`;
+      console.warn('the media save was cancelled', err, elapsed);
+      status(
+        `${lastProgress ? `${lastProgress} \u2014 ` : ''}The download was cancelled before it finished \u2014 nothing was saved.`
+      );
+      return;
+    }
+    /* Named here too, not only on the status line: a save that fails after
+     * the dialog's status has scrolled or been replaced still leaves this
+     * console line, which is what gets pasted into a bug report. */
+    console.error('the media save failed', err);
+    status(`Could not save: ${err.message}`);
+  } finally {
+    if (waiting !== null) clearInterval(waiting);
+    ui.mediaSave.disabled = false;
+  }
+});
 
 /* Wire the fetch/open flow for one Autonomi result row: the location is the
  * open path, Stop exists only while bytes are moving, and every outcome is
@@ -725,140 +1599,341 @@ function wireFetch(node, result, statusEl) {
     wrap.hidden = !busy;
   };
 
-  /* One fetch per row: opening, closing, and opening again reuses the bytes
-   * already fetched rather than paying for a second download. The Blob stays
-   * valid after the AbortController is dropped, so it can outlive the fetch it
-   * came from. */
+  /* One open per row: opening, closing, and opening again reuses the bytes
+   * already fetched rather than paying for a second download — when there are
+   * bytes to reuse. A streamed download deliberately leaves nothing behind (a
+   * local copy of the file is what that route exists to avoid), so reopening
+   * one costs a fresh fetch, exactly as a second click on a link should. The
+   * Blob stays valid after the AbortController is dropped, so it can outlive
+   * the fetch it came from. */
   let cached = null;
 
-  /* Fetch over WebRTC into a Blob. `tab` is the progress window the caller
-   * already opened, or null when the popup was blocked — progress then stays
-   * in the row's status line. */
-  const obtain = async (statusEl, tab = null) => {
-    if (cached) return cached;
-    controller = new AbortController();
-    setBusy(true);
-    setStatus(
-      statusEl,
-      'Looking for the nodes holding this file\u2026',
-      ''
-    );
-    try {
-      const { blob } = await fetchAutonomi(address, {
-        onProgress: (event) => reportSdkProgress(tab, statusEl, event),
-        // The steps the SDK does not report for itself — chiefly the WASM load.
-        onStep: (message) => {
-          setStatus(statusEl, message, '');
-          toTab(tab, { type: 'phase', message });
-        },
-        // A count per chunk read, which is the live part of the download.
-        onChunk: ({ chunks, bytes, totalBytes }) => {
-          /* The same `chunk` channel the ant CLI diagnostics use, so one element
-           * renders both transports identically instead of each having its own
-           * read-out. `expected_bytes` is ours alone \u2014 the CLI reports distinct
-           * retrieved chunks and their bytes, which is deliberately not a fraction
-           * of the file because self-encryption padding means it never can be. */
-          setStatus(
-            statusEl,
-            `${chunks} chunk${chunks === 1 ? '' : 's'} received \u00b7 ${formatBytes(
-              bytes
-            )} of ${formatBytes(totalBytes)}`,
-            ''
-          );
-          toTab(tab, {
-            type: 'chunk',
-            index: chunks,
-            chunks,
-            total_bytes: bytes,
-            expected_bytes: totalBytes,
-            retried: false,
-          });
-        },
-        signal: controller.signal,
-      });
-      /* A stop that lands between the last chunk and this line would otherwise
-       * hand back a finished file after Stop was pressed. */
-      if (controller.signal.aborted) throw new DownloadCancelled();
-      cached = blob;
-      return blob;
-    } catch (err) {
-      /* Our signal is the only source of truth for "the user stopped this".
-       * `fetchAutonomi` throws `DownloadCancelled` at its own entry checks, but
-       * an abort mid-connect or mid-stream arrives with the SDK's wording
-       * instead — and every other error is what routes a failed fetch to the
-       * daemon fallback. So anything thrown while our signal is aborted is
-       * recast as a stop here, or Stop starts a second download that has no
-       * Stop of its own. */
-      if (controller.signal.aborted) throw new DownloadCancelled();
-      throw err;
-    } finally {
-      setBusy(false);
-      controller = null;
-    }
-  };
-
-  /* Fetch, then hand the bytes to the server to serve on its own origin.
+  /* Whether this row's stored `mime_type` is still believed for opening.
    *
-   * `openProgressTab` is the first statement, and the location's click handler
-   * calls this directly, so the popup has a user gesture behind it. A
-   * `window.open` after an await is a popup with no
+   * The stored mime decides *before any await* whether this open will need the
+   * progress tab at all (see `likelyMedia`), so a wrong one would show up as an
+   * open that fetched the file and then had nowhere to display it. The tab's
+   * absence at the hand-off below is the only evidence that can produce — a
+   * popup the browser blocked looks identical everywhere else — so that is where
+   * the belief is dropped, and the next click opens the tab normally. */
+  let trustStoredMime = true;
+
+  /* The shared progress wiring for one open: SDK phases go to the headline
+   * (row status and tab alike), and the chunk counts — ours, from the stream
+   * we are actually consuming — go to the status line and the tab. */
+  const hooksFor = (tab) => ({
+    onProgress: (event) => reportSdkProgress(tab, statusEl, event),
+    // The steps the SDK does not report for itself — chiefly the WASM load.
+    onStep: (message) => {
+      setStatus(statusEl, message, '');
+      toTab(tab, { type: 'phase', message });
+    },
+    // A count per chunk read, which is the live part of the download.
+    onChunk: ({ chunks, bytes, totalBytes }) => {
+      /* The same `chunk` channel the ant CLI diagnostics use, so one element
+       * renders both transports identically instead of each having its own
+       * read-out. `expected_bytes` is ours alone \u2014 the CLI reports distinct
+       * retrieved chunks and their bytes, which is deliberately not a fraction
+       * of the file because self-encryption padding means it never can be. */
+      setStatus(
+        statusEl,
+        `${chunks} chunk${chunks === 1 ? '' : 's'} received \u00b7 ${formatBytes(
+          bytes
+        )} of ${formatBytes(totalBytes)}`,
+        ''
+      );
+      toTab(tab, {
+        type: 'chunk',
+        index: chunks,
+        chunks,
+        total_bytes: bytes,
+        expected_bytes: totalBytes,
+        retried: false,
+      });
+    },
+  });
+
+  /* Open the record, then let the plan decide what the rest of the file
+   * becomes.
+   *
+   * `openProgressTab` is the first statement *of every open that may need the
+   * tab*, and the location's click handler calls this directly, so the popup has
+   * a user gesture behind it. A `window.open` after an await is a popup with no
    * gesture and browsers block it — so the tab has to exist before the download
    * starts, and be pointed at the result once it arrives. It opens *onto* the
    * progress page rather than onto `about:blank`, because a tab that says what
-   * it is doing is the entire difference between a slow fetch and a broken link. */
+   * it is doing is the entire difference between a slow fetch and a broken link.
+   *
+   * The one kind of open that needs no tab is the one this row can name before
+   * any await: audio and video play *here*, in this page's player dialog, and
+   * detouring through a tab just to close it again was the choreography of a
+   * loading page appearing, vanishing, and reappearing as a small window — worse
+   * than no tab at all. For those rows the phases land on the row's own status
+   * line instead (every `toTab` of a null tab is a no-op), and `trustStoredMime`
+   * is what keeps a stored mime that turns out to be wrong from ever producing
+   * an open with nowhere to show its file. */
   const runOpen = async (statusEl) => {
-    const tab = openProgressTab();
-    if (!tab) {
+    const likelyMedia =
+      trustStoredMime &&
+      !cached &&
+      isMediaMime(result.mime_type) &&
+      mediaCapability();
+    /* Whether the media route was attempted and failed. The endings below name
+     * it when it is true: a fallback that reports only its own reason (a size
+     * limit, a "cannot be shown") hides the fact that the route the click
+     * actually wanted — playing the file — is what broke. */
+    let playerFailed = false;
+    const tab = likelyMedia ? null : openProgressTab();
+    if (!tab && !likelyMedia) {
       setStatus(
         statusEl,
         'Your browser blocked the new tab. Allow pop-ups for this page, then try again.',
         'warn'
       );
     }
+    const hooks = hooksFor(tab);
+
+    /* Read the remainder into an assembled Blob — the viewer route, the
+     * default save below SAVE_BUFFER_CAP, and the fallback when no worker
+     * answers for an over-cap file. A file small enough that the prefix read
+     * already returned all of it needs no second phase: these bytes are the
+     * file. */
+    const restToBlob = async (handle, prefixParts, received, opened) => {
+      if (received === opened.totalBytes) {
+        return new Blob(prefixParts, { type: opened.contentType });
+      }
+      const rest = await drainRest(handle, {
+        signal: controller && controller.signal,
+        onChunk: hooks.onChunk,
+        receivedSoFar: received,
+        chunksSoFar: prefixParts.length,
+        totalBytes: opened.totalBytes,
+      });
+      return new Blob([...prefixParts, ...rest.parts], { type: opened.contentType });
+    };
+
     try {
+      /* Refuse before the library loads or a node is contacted. A WebRTC
+       * transfer reaches no route of ours, so without this the first server-side
+       * answer would arrive only after `postPlan` — by which time the SDK is
+       * compiled and the DataMap lookup has already gone out. `postPlan` below
+       * re-checks anyway: a block that lands *during* the fetch is caught there,
+       * and nothing is served either way. */
+      await checkBlocked(result.location);
       /* Fetched in the browser when it can be, which is the default and needs
-       * nothing installed. `obtain` may decline — no WebRTC, no capability, a
-       * failed transfer, or a file too large to hand back to the server — and
-       * those are all routing decisions rather than failures, so they fall
-       * through to the daemon instead of ending the open. */
+       * nothing installed. Every browser path below may decline — no WebRTC,
+       * no capability, a failed transfer — and those are routing decisions
+       * rather than failures, so they fall through to the daemon instead of
+       * ending the open. */
       let view;
       let bytes = 0;
       let via = 'browser';
       try {
-        const blob = await obtain(statusEl, tab);
+        if (cached) {
+          /* A reopen of bytes already here: no network, and the plan is
+           * re-asked because it is a cheap 16 KB question whose answer (the
+           * name, the verdict) the row may want again.
+           *
+           * No media branch here, deliberately: the player never populates
+           * `cached` (it streams and holds nothing), so a media plan on a
+           * cached blob cannot happen — the bytes came from the viewer path,
+           * which only runs for non-media types. */
+          const plan = await postPlan(result.location, cached.type, cached);
+          bytes = cached.size;
+          if (!plan.renderable || bytes > MAX_UPLOAD) {
+            toTab(tab, { type: 'phase', message: 'Saving the file.' });
+            downloadBlob(cached, plan.filename);
+            if (tab) tab.close();
+            setStatus(
+              statusEl,
+              `Downloaded as ${plan.filename} \u2014 ${downloadWhy(plan.renderable, bytes)}.`,
+              'ok'
+            );
+            return;
+          }
+          setStatus(statusEl, 'Opening\u2026', '');
+          view = await postBlob('/api/view/blob', result.location, cached);
+        } else {
+          /* A fresh open, in three moves: fetch the leading bytes and ask the
+           * plan what they are; then let the verdict — not the transport —
+           * decide what the rest of the file becomes. Assembling everything
+           * before asking is what made a 64 MB record cost 64 MB of page
+           * memory just to learn it was headed for the downloads folder. */
+          controller = new AbortController();
+          setBusy(true);
+          setStatus(statusEl, 'Looking for the nodes holding this file\u2026', '');
+          const opened = await openAutonomi(address, {
+            onProgress: hooks.onProgress,
+            onStep: hooks.onStep,
+            signal: controller.signal,
+          });
+          const handle = opened.reader
+            .stream({ chunkSize: READ_CHUNK_BYTES, signal: controller.signal })
+            .getReader();
 
-        /* Decide before uploading. Both reasons used to be discovered by POSTing
-         * the file and being refused: a 64 MB record was fetched successfully and
-         * then failed with "request body is larger than the 33554432 byte limit",
-         * and an unrenderable type was served `inline` and shown as an empty
-         * window. We are already holding the bytes in both cases, so neither needs
-         * the round-trip — ask for the name and the verdict, then act. Only the
-         * leading prefix goes up, so this stays cheap for a 64 MB record. */
-        const plan = await postPlan(result.location, blob.type, blob);
-        bytes = blob.size;
+          /* The leading bytes, for the plan. `PLAN_PREFIX` is the cap the
+           * server will read; the first chunk is usually larger, which is
+           * fine — and for a file smaller than one chunk it *is* the file,
+           * noted below by comparing against the total. */
+          const prefixParts = [];
+          let received = 0;
+          while (received < PLAN_PREFIX) {
+            const { done, value } = await handle.read();
+            if (done) break;
+            if (!value || !value.byteLength) continue;
+            prefixParts.push(value);
+            received += value.byteLength;
+          }
+          if (controller.signal.aborted) throw new DownloadCancelled();
+          setBusy(false); /* the plan is a question, not a transfer */
 
-        if (!plan.renderable || blob.size > MAX_UPLOAD) {
-          /* Both reasons are stated when both apply. A large binary hits both, and
-           * naming only the type would leave the size — the thing that actually
-           * made this slow — unmentioned. */
-          const why = [
-            !plan.renderable && 'this file type cannot be shown in a browser',
-            blob.size > MAX_UPLOAD &&
-              `it is ${formatBytes(blob.size)}, over the ${formatBytes(MAX_UPLOAD)} viewer limit`,
-          ]
-            .filter(Boolean)
-            .join(', and ');
-          toTab(tab, { type: 'phase', message: 'Saving the file.' });
-          downloadBlob(blob, plan.filename);
-          if (tab) tab.close();
-          setStatus(statusEl, `Downloaded as ${plan.filename} \u2014 ${why}.`, 'ok');
-          return;
+          const prefixBlob = new Blob(prefixParts, { type: opened.contentType });
+          const plan = await postPlan(result.location, opened.contentType, prefixBlob);
+
+          /* Audio and video play here, in the page, streamed — the one kind
+           * the viewer's "upload it whole" route is wrong for even when the
+           * file fits: a film the browser could seek is a film that should
+           * not be held as a Blob first. Falls through when this browser
+           * cannot do it (no secure context, no worker) or the file is past
+           * the SDK's media cap: the bytes in hand are still shown or saved
+           * below, so a player that does not exist is a route, not a wall. */
+          if (
+            isMediaMime(plan.mime_type) &&
+            opened.totalBytes <= MEDIA_MAX_BYTES &&
+            mediaCapability()
+          ) {
+            try {
+              await startPlayer({
+                address,
+                location: result.location,
+                plan,
+                onProgress: hooks.onProgress,
+                statusEl,
+              });
+              /* The player owns a random-access reader of its own; the plan's
+               * sequential one is finished and would only hold the stream. */
+              await handle.cancel().catch(() => {});
+              if (tab) tab.close();
+              return;
+            } catch (err) {
+              if (err.name === 'DownloadCancelled') throw err;
+              /* A player that cannot be created is a routing decision: the
+               * prefix reader is untouched, and the flow continues — the
+               * viewer or the save below, or the daemon after that. The
+               * endings must name this, because a fallback reporting only its
+               * own reason would hide what the click actually wanted. The
+               * real error is logged here, unconditionally: failures thrown
+               * before `startPlayer`'s own logging could run (the shared
+               * connect, the retry's connect or second attempt) would
+               * otherwise reach this catch invisibly, and the fall-through
+               * messages describe the route taken, never the cause. */
+              console.error('the player could not open', err);
+              playerFailed = true;
+              setStatus(statusEl, 'The player could not open; trying another route…', '');
+            }
+          }
+
+          if (plan.renderable && opened.totalBytes <= MAX_UPLOAD) {
+            /* Viewer: the server needs the whole file, so the rest is read
+             * here — but the verdict is already in hand, and a file that
+             * fails it never reaches this branch at all. */
+            setBusy(true);
+            let blob;
+            try {
+              blob = await restToBlob(handle, prefixParts, received, opened);
+            } finally {
+              setBusy(false);
+            }
+            if (controller.signal.aborted) throw new DownloadCancelled();
+            cached = blob;
+            bytes = blob.size;
+            setStatus(statusEl, 'Opening\u2026', '');
+            view = await postBlob('/api/view/blob', result.location, blob);
+          } else {
+            /* Download: the rest of the file goes to disk, named by the
+             * server, from the browser's own downloads. Two roads — through
+             * memory (the default, see SAVE_BUFFER_CAP) or through the
+             * worker's stream for a file too large to hold. Same destination
+             * and same auto-save either way. */
+            const why = downloadWhy(plan.renderable, opened.totalBytes, playerFailed);
+            toTab(tab, { type: 'phase', message: 'Saving the file.' });
+            setStatus(statusEl, 'Preparing the download\u2026', '');
+            const overCap =
+              Number.isSafeInteger(opened.totalBytes) &&
+              opened.totalBytes > SAVE_BUFFER_CAP;
+            if (overCap) {
+              /* Past the cap: memory cannot hold this file, so the rest
+               * streams straight to disk through the worker, chunk by chunk,
+               * and this page never holds it. */
+              const port = await startSWDownload(plan.filename, plan.mime_type, opened.totalBytes, 'row');
+              if (port) {
+                setBusy(true);
+                try {
+                  await pipeReaderToPort(handle, port, {
+                    signal: controller.signal,
+                    totalBytes: opened.totalBytes,
+                    onChunk: hooks.onChunk,
+                    parts: prefixParts,
+                  });
+                } catch (err) {
+                  /* A browser-side cancel has already stopped the bytes; abort
+                   * the SDK stream too so no chunk fetch is left in flight. */
+                  if (
+                    err.name === 'DownloadCancelled' &&
+                    !controller.signal.aborted
+                  ) {
+                    controller.abort();
+                  }
+                  throw err;
+                } finally {
+                  setBusy(false);
+                }
+                if (tab) tab.close();
+                setStatus(
+                  statusEl,
+                  `Downloaded as ${plan.filename} \u2014 ${why}.`,
+                  'ok'
+                );
+                return;
+              }
+              /* No worker to stream through (an older browser, or a
+               * registration this page was refused): fall through and buffer
+               * — a memory-heavy save beats no save. */
+            }
+            setBusy(true);
+            let blob;
+            try {
+              blob = await restToBlob(handle, prefixParts, received, opened);
+            } finally {
+              setBusy(false);
+            }
+            if (controller.signal.aborted) throw new DownloadCancelled();
+            downloadBlob(blob, plan.filename);
+            if (tab) tab.close();
+            setStatus(
+              statusEl,
+              `Downloaded as ${plan.filename} \u2014 ${why}.`,
+              'ok'
+            );
+            return;
+          }
         }
-
-        setStatus(statusEl, 'Opening\u2026', '');
-        view = await postBlob('/api/view/blob', result.location, blob);
       } catch (err) {
+        /* Our signal is the only source of truth for "the user stopped this".
+         * `openAutonomi` throws `DownloadCancelled` at its own entry checks,
+         * but an abort mid-connect or mid-stream arrives with the SDK's wording
+         * instead — and every other error is what routes a failed fetch to the
+         * daemon fallback. So anything thrown while our signal is aborted is
+         * recast as a stop here, or Stop starts a second download that has no
+         * Stop of its own. */
+        if (controller && controller.signal.aborted)
+          throw new DownloadCancelled();
         if (err.name === 'DownloadCancelled') throw err;
+        /* A refusal is not a routing decision: the daemon would be asked the
+         * same question by the same `refuse_if_blocked` and refuse identically,
+         * so falling through would only add a round trip and a misleading
+         * "trying the local daemon" line to a block the user chose. */
+        if (err.code === 'blocked' || err.code === 'block_check_failed') throw err;
         /* The daemon fetches and serves the record itself, so the oversize case
          * that just fell through to a download above can instead be opened —
          * which is the point of having it. The tab keeps showing progress
@@ -910,9 +1985,20 @@ function wireFetch(node, result, statusEl) {
         cutOpener(tab);
         tab.location.replace(view.url);
       } else {
+        /* Reaching the display hand-off without a tab means one of two things:
+         * the browser blocked the popup (an environment problem — allow
+         * pop-ups), or this open skipped the tab because the row claimed media
+         * and the file still needed a tab (a row problem). The skip splits
+         * two ways: the player was attempted and failed, or the stored mime was
+         * simply wrong and no player was ever started. Both drop the belief so
+         * the next click opens the tab as usual; a blocked popup teaches the row
+         * nothing and does not. */
+        if (likelyMedia) trustStoredMime = false;
         setStatus(
           statusEl,
-          'The file was fetched but not opened. Allow pop-ups for this page, then try Open again.',
+          playerFailed
+            ? 'The player could not open this file, so it was fetched for a tab instead. Allow pop-ups for this page, then try Open again.'
+            : 'The file was fetched but not opened. Allow pop-ups for this page, then try Open again.',
           'warn'
         );
       }
@@ -923,6 +2009,12 @@ function wireFetch(node, result, statusEl) {
       if (err.name === 'DownloadCancelled') {
         if (tab) tab.close();
         setStatus(statusEl, 'Stopped.', '');
+      } else if (err.code === 'blocked' || err.code === 'block_check_failed') {
+        /* A refusal, not a fetch failure: the row's status line says so and the
+         * progress tab — which only ever describes an attempt — goes away rather
+         * than being pointed at an error page for something never started. */
+        if (tab) tab.close();
+        setStatus(statusEl, err.message, 'warn');
       } else {
         toTab(tab, { type: 'error', message: err.message });
         if (tab) {
@@ -939,6 +2031,11 @@ function wireFetch(node, result, statusEl) {
         }
         setStatus(statusEl, `Could not fetch that file: ${err.message}`, 'bad');
       }
+    } finally {
+      /* Stop has nothing left to stop once the open is over — and a live
+       * controller from a finished run would make a later click's Stop abort
+       * the wrong transfer. */
+      controller = null;
     }
   };
 
@@ -970,20 +2067,25 @@ function wireFetch(node, result, statusEl) {
     loc.setAttribute('role', 'button');
     loc.setAttribute('tabindex', '0');
     loc.title = 'Open this file from the Autonomi network';
-    /* Warm the library while the user is still deciding.
+    /* Warm the library *and the connection* while the user is still deciding.
      *
-     * The first `loadSdk()` compiles and instantiates 5.4 MB of WASM, and that
-     * compile is the single longest stretch of a first fetch — long enough to read
-     * as "broken" if it is triggered by the click. Hovering or tabbing onto the
-     * location is free intent that arrives before the click, so start it there and
-     * the wait overlaps with the user's decision instead of following it.
+     * `loadSdk()` only imports and caches the package — the 5.4 MB WASM core is
+     * compiled and instantiated *inside* `AutonomiClient.connect`, along with the
+     * seed dial and authentication, and together those are the longest stretch of
+     * a first fetch. Triggered by the click they read as "broken"; started here
+     * they overlap with the user's decision instead of following it, so a click
+     * lands on a client that is already up and pays only the DataMap lookup.
      *
-     * `loadSdk()` caches its promise *including its failure*, so this costs nothing
-     * if the click never comes and duplicates nothing if it does — the click awaits
-     * the same in-flight promise. A pointerenter is not fired by touch, so the
-     * focus case is what covers a phone. */
+     * Both promises are cached *including their failure* (`loadSdk` directly,
+     * `getSharedClient` by clearing its slot), so this costs nothing if the click
+     * never comes and duplicates nothing if it does. The connect deliberately
+     * gets no `onProgress`: a hover has no status line to report to, and the
+     * click that follows announces its own steps regardless. A pointerenter is
+     * not fired by touch, so the focus case is what covers a phone. */
     const warm = () => {
-      loadSdk().catch(() => {});
+      loadSdk()
+        .then(() => getSharedClient())
+        .catch(() => {});
     };
     loc.addEventListener('pointerenter', warm, { once: true });
     loc.addEventListener('focus', warm, { once: true });
@@ -1410,9 +2512,11 @@ function wireBlock(node, result, statusEl, button) {
       }
 
       /* A blocked resource is never served again, and never reappears from a
-       * peer, so the row is not merely stale \u2014 it is wrong. Drop it. The
+       * peer, so the row is not merely stale — it is wrong. Drop it. The
        * local copy may still exist ("Block, keep local copy"), but this page
-       * is showing what a search returns, and this will not be in it. */
+       * is showing what a search returns, and this will not be in it. If the
+       * player is streaming this very file, its bytes stop with the block. */
+      closePlayerIf(result.location);
       dropResult(
         node,
         data.removed_local
@@ -1563,6 +2667,9 @@ function wireRemove(node, result, statusEl, button) {
     try {
       const data = await postJSON('/api/purge', { resource_id: result.resource_id });
       const n = data.deleted.resources;
+      /* Removing frees the local rows; a player streaming this file is a
+       * reader of them, so it stops with the removal. */
+      closePlayerIf(result.location);
       dropResult(
         node,
         n > 0
@@ -1778,6 +2885,13 @@ async function indexAutonomiInBrowser(uri, tags) {
   const address = autonomiAddress(uri);
   if (!address) return null;
 
+  /* Ask before the fetch, and before capability: a WebRTC transfer reaches no
+   * route of ours, so this is the only chance to refuse before bytes move. A
+   * plain error, deliberately *not* a `DaemonFallback` — the daemon route
+   * refuses too, so offering it would only produce a second identical refusal
+   * after the user has watched "Using the local daemon" flash past. */
+  await checkBlocked(uri);
+
   const cap = await autonomiCapability();
   if (!cap.available) throw new DaemonFallback(cap.reason);
 
@@ -1798,8 +2912,8 @@ async function indexAutonomiInBrowser(uri, tags) {
   /* Checked before the upload, not after: the server rejects an oversized body
    * rather than truncating it, so the bytes are already here and the size is
    * known. Sending them anyway would waste the transfer to learn nothing. */
-  if (blob.size > MAX_UPLOAD) {
-    const msg = `it is ${formatBytes(blob.size)}, and this page holds at most ${formatBytes(MAX_UPLOAD)}`;
+  if (blob.size > MAX_INDEX_UPLOAD) {
+    const msg = `it is ${formatBytes(blob.size)}, and this page indexes at most ${formatBytes(MAX_INDEX_UPLOAD)}`;
     indexProgressLine('ERROR: ' + msg);
     throw new DaemonFallback(msg);
   }
@@ -1903,6 +3017,12 @@ async function runIndex(uri, tags) {
         (err.body && err.body.command) || '',
         { uri, tags }
       );
+    } else if (err.code === 'blocked' || err.code === 'block_check_failed') {
+      /* A refusal, stated plainly rather than as a failure to add the link —
+       * the block list is a choice the user made, and hiding it inside
+       * "Could not add that link" would read as the feature being broken. The
+       * daemon route answers identically, so there is nothing left to try. */
+      indexProgressLine(`ERROR: ${err.message}`);
     } else {
       indexProgressLine(`ERROR: Could not add that link: ${err.message}`);
     }
@@ -2303,6 +3423,10 @@ ui.dialog.addEventListener('close', () => {
 /* ----------------------------------------------------------------- boot -- */
 
 applyTheme(document.documentElement.dataset.theme || 'retro');
+/* Before anything that speaks to the worker: the player needs a page the
+ * worker already controls, and the reload-once remedy has to happen before
+ * a click can walk into the SDK's 10 s wait. */
+ensureWorkerControlAtBoot();
 refreshDeps();
 
 /* One poll at a time, on a chain rather than `setInterval`: a down server is

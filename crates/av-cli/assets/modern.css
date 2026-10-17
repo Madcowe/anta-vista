@@ -373,6 +373,30 @@ input[type="text"] {
   margin: 16px 0 0;
 }
 
+/* The media player gets a wider dialog than the confirmations (34rem is a
+ * prompt's width, not a film's) and a video that fits the viewport in both
+ * dimensions. It is shown *non-modally* (listen while browsing), so unlike
+ * the modal dialogs it gets no centered fixed positioning from the user
+ * agent and needs its own — `inset: 0` + `margin: auto` centers a fixed
+ * box in every engine. Unscoped on purpose: retro recolours but does not
+ * lay out, so scoping this under the modern theme would leave the
+ * default's player unsized and stuck in a corner. */
+#media-dialog {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  height: fit-content;
+  max-width: min(46rem, calc(100% - 32px));
+}
+
+#media-dialog video {
+  display: block;
+  margin: 0 auto;
+  max-width: 100%;
+  max-height: 56vh;
+  background: #000;
+}
+
 .command {
   overflow-x: auto;
   white-space: pre-wrap;

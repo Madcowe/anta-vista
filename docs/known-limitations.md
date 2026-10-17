@@ -193,13 +193,27 @@ tab that has fallen behind shows a jump rather than a stall), and progress is lo
 if the server restarts mid-fetch, while the record itself is not — the fetch can
 simply be retried.
 
-### Everything is held in memory
+### Most files are held in memory; the streaming save is the exception
 
-Both the browser route and the daemon fallback read the whole file into memory
-before storing or serving it. The browser path additionally refuses anything
-over `MAX_BODY` (32 MiB) and sends it to the daemon instead, which has the same
-characteristic. There is no streaming path in either direction, so indexing a
-large file costs roughly its size in RAM.
+When the browser can display a record (and it fits under the viewer cap of
+32 MiB), the whole file is fetched into memory, uploaded to the server's viewer
+and held as a Blob — the viewer path is a whole-file viewer by design.
+
+Large files the browser *cannot* display are different: the download now streams
+to disk through a service worker, one chunk at a time, so the page never holds
+the file. Audio and video likewise stream through the same worker into the
+inline player. A browser without service-worker support (or one that refused the
+registration) falls back to the buffered path for both.
+
+Indexing still costs roughly the file's size in RAM: the upload spools to a
+temporary file on the server side so the body cap is enforced without reading
+the whole request into memory, but `index_resource_from_bytes` then reads the
+file to build the descriptor and the embedding. The daemon fallback has the same
+characteristic — it reads the whole file before storing it.
+
+One part of the transfer can never be bounded: a record whose DataMap covers a
+large seed set still has to finish fetching before anything can be saved or
+displayed, so a very large file can time out even though a small one succeeds.
 
 ### Filenames come from the location, not the record
 

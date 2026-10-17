@@ -1,4 +1,5 @@
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -27,6 +28,17 @@ const WORKERS: usize = 4;
 
 /// Largest request body we will buffer, to bound memory from a stray upload.
 const MAX_BODY: usize = 32 * 1024 * 1024;
+
+/// Cap on `POST /api/index/bytes` — the whole file, not a prefix.
+///
+/// Deliberately far above [`MAX_BODY`]: the viewer endpoints take a copy the
+/// browser wants *displayed*, and displayable files are small, while indexing
+/// takes the record itself, which can be a movie. The body is spooled to a
+/// temp file rather than held in a `Vec`, so the cap is a disk question rather
+/// than a memory one on the way in. Mirrors the client's `MAX_INDEX_UPLOAD`;
+/// past this, indexing falls back to the local daemon, which fetches the
+/// record itself and never crosses this server's body limit at all.
+const INDEX_BODY: usize = 512 * 1024 * 1024;
 
 /// How many leading bytes `POST /api/view/plan` will accept.
 ///
@@ -160,6 +172,11 @@ fn route(
         (_, "/assets/modern.css") => Ok(render::modern_css()),
         (_, "/assets/app.js") => Ok(render::app_js()),
         (_, "/assets/retro.js") => Ok(render::retro_js()),
+        // The streaming service worker, registered by app.js on first use.
+        // Its URL is the scope's root, so it can answer downloads anywhere on
+        // this origin; `no-store` (from `own_asset`) is what lets a rebuilt
+        // worker replace the one the browser is already running.
+        (_, "/autonomi-stream-sw.js") => Ok(render::stream_sw()),
         // The header logo, one per theme; the page references both and CSS
         // shows the one matching <html data-theme>.
         (_, "/assets/wordmark-retro.jpeg") => Ok(render::wordmark_retro()),
@@ -182,6 +199,9 @@ fn route(
             query,
         )),
         (Method::Get, "/api/blocks") => Ok(handlers::blocks_list(state)),
+        // The bytes-free question the page asks before its WebRTC fetch, which
+        // reaches no route of ours; same gate, same answers, one code path.
+        (Method::Get, "/api/blocked") => Ok(handlers::blocked(state, query)),
         // Stands alone on its own origin: no app.js, no API access, and the only
         // input is an enum, so an SDK error string can never be reflected here.
         (Method::Get, "/view/error") => Ok(render::view_error_page(query)),
@@ -214,7 +234,15 @@ fn route(
                     let uri = header(request, URI_HEADER).unwrap_or_default();
                     let tags = header(request, TAGS_HEADER).unwrap_or_default();
                     let force = header(request, FORCE_HEADER).as_deref() == Some("1");
-                    let body = read_body_bytes(request).map_err(RouteError::ready)?;
+                    let (path, _) =
+                        read_body_to_temp(request, index_body_cap()).map_err(RouteError::ready)?;
+                    // The temp file is ours alone and does not outlive this
+                    // request, whichever way the read goes. `index_resource_-
+                    // from_bytes` wants the bytes in memory anyway (descriptor
+                    // plus embedding), so the file is a way *in*, not a store.
+                    let read = std::fs::read(&path);
+                    let _ = std::fs::remove_file(&path);
+                    let body = read.map_err(|e| RouteError::Internal(e.to_string()))?;
                     Ok(handlers::index_bytes(state, &uri, &tags, force, &body))
                 }
                 "/api/view/blob" => {
@@ -365,6 +393,95 @@ fn read_body_capped(request: &mut Request, cap: usize) -> Result<Vec<u8>, WebRes
         ));
     }
     Ok(buf)
+}
+
+/// Stream a request body into a fresh temp file, refusing anything over `cap`.
+///
+/// Same rule as [`read_body_bytes`] — refused, never clamped — but the body
+/// goes to disk 64 KB at a time instead of accumulating in a `Vec`, so an
+/// upload near the cap is a file rather than half a gigabyte of live buffer.
+/// Over the cap the file is removed and the same `body_too_large` 400 comes
+/// back, so the browser's branch to the daemon route is unchanged.
+///
+/// The caller owns the returned path and must delete it; on any refusal this
+/// function deletes it before returning the error.
+fn read_body_to_temp(request: &mut Request, cap: usize) -> Result<(PathBuf, usize), WebResponse> {
+    let path = std::env::temp_dir().join(format!(
+        "av-index-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    copy_capped_to_path(request.as_reader(), &path, cap)
+        .map(|n| (path, n))
+        .map_err(|(code, msg)| {
+            let status = if code == "temp_file_failed" { 500 } else { 400 };
+            json_error(status, code, &msg)
+        })
+}
+
+/// Core of [`read_body_to_temp`]: stream `reader` into `path`, which is
+/// created fresh, stopping — and removing the file — the moment the running
+/// total passes `cap`.
+///
+/// Split out so the refusal rule can be pinned against a plain `Cursor`
+/// without a real HTTP request. The `Err` carries the error code and message
+/// the HTTP layer turns into its response.
+fn copy_capped_to_path(
+    reader: &mut dyn Read,
+    path: &PathBuf,
+    cap: usize,
+) -> Result<usize, (&'static str, String)> {
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| ("temp_file_failed", e.to_string()))?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0usize;
+    let outcome: Result<(), (&'static str, String)> = loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break Ok(()),
+            Ok(n) => n,
+            Err(e) => break Err(("read_failed", e.to_string())),
+        };
+        total += n;
+        if total > cap {
+            break Err((
+                "body_too_large",
+                format!(
+                    "request body is larger than the {cap} byte limit; \
+                     this file has to be fetched by the local daemon instead"
+                ),
+            ));
+        }
+        if let Err(e) = file.write_all(&buf[..n]) {
+            break Err(("write_failed", e.to_string()));
+        }
+    };
+    let _ = file.flush();
+    drop(file);
+    outcome.map_err(|(code, msg)| {
+        let _ = std::fs::remove_file(path);
+        (code, msg)
+    })?;
+    Ok(total)
+}
+
+/// The index upload cap, overridable for tests.
+///
+/// A dedicated server can be spawned with a small `ANTA_VISTA_INDEX_BODY_CAP`
+/// so a refusal test does not have to post half a gigabyte; the default is
+/// [`INDEX_BODY`]. A value that does not parse, or is zero, is ignored — a
+/// typo must not turn into a server that refuses every upload.
+fn index_body_cap() -> usize {
+    std::env::var("ANTA_VISTA_INDEX_BODY_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(INDEX_BODY)
 }
 
 /// Read one request header by name.
@@ -535,4 +652,69 @@ pub fn binary_response(status: u16, mime: &str, body: Vec<u8>) -> WebResponse {
 
 pub(crate) fn content_type(mime: &str) -> Header {
     Header::from_bytes("Content-Type", mime).expect("static content type is a valid header")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("av-server-test-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn an_index_body_exactly_at_the_cap_is_kept() {
+        let path = scratch("at-cap");
+        let _ = std::fs::remove_file(&path);
+        let data = vec![7u8; 4096];
+        let n = copy_capped_to_path(&mut &data[..], &path, 4096).expect("at the cap is allowed");
+        assert_eq!(n, 4096);
+        assert_eq!(std::fs::read(&path).expect("file kept"), data);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn one_byte_over_the_cap_is_refused_and_the_file_is_removed() {
+        // Truncating would hand the indexer a corrupt prefix of a large file
+        // and report success, so "over" is a refusal — and the partial file
+        // must not linger, or a later request's `create_new` starts colliding
+        // with the debris of every refused upload before it.
+        let path = scratch("over-cap");
+        let _ = std::fs::remove_file(&path);
+        let data = vec![7u8; 4097];
+        let (code, msg) =
+            copy_capped_to_path(&mut &data[..], &path, 4096).expect_err("one over must refuse");
+        assert_eq!(code, "body_too_large");
+        assert!(msg.contains("larger than"), "{msg}");
+        assert!(
+            !path.exists(),
+            "a refused upload left its partial file behind"
+        );
+    }
+
+    #[test]
+    fn an_empty_index_body_is_allowed() {
+        // An empty file is still a file: indexing decides what to make of it,
+        // and the cap's job is only to bound the request.
+        let path = scratch("empty");
+        let _ = std::fs::remove_file(&path);
+        let n = copy_capped_to_path(&mut &[][..], &path, 4096).expect("empty is allowed");
+        assert_eq!(n, 0);
+        assert_eq!(std::fs::read(&path).expect("file kept"), b"");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_index_cap_defaults_to_512_mib_and_sits_above_the_viewer_cap() {
+        // The seam exists for tests; what must hold in a normal run is the
+        // default itself (the client's `MAX_INDEX_UPLOAD` mirrors it, pinned
+        // in web_tests) and that indexing is allowed to take more than the
+        // viewer ever will.
+        assert_eq!(index_body_cap(), INDEX_BODY);
+        assert_eq!(INDEX_BODY, 512 * 1024 * 1024);
+        assert!(
+            INDEX_BODY > MAX_BODY,
+            "the index cap must sit above the viewer cap"
+        );
+    }
 }

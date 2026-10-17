@@ -512,6 +512,20 @@ fn the_static_label_matches_the_default_so_the_header_does_not_flash_a_wrong_one
 }
 
 #[test]
+fn the_page_declares_an_empty_favicon_so_the_browser_stops_asking() {
+    // Browsers request /favicon.ico on their own; without a declaration
+    // every load left a 404 in the console — noise that looked like a
+    // failed route of ours, and one click away from being read as one
+    // (clicking it shows the server's "Not found: /favicon.ico"). An empty
+    // data: URL answers the question without a file.
+    let page = server().get("/").body;
+    assert!(
+        page.contains(r#"<link rel="icon" href="data:,"#),
+        "the page still invites a /favicon.ico 404"
+    );
+}
+
+#[test]
 fn the_scroll_banner_does_not_outlive_the_theme_that_gives_it_a_reason_to_exist() {
     let js = js_code(&server().get("/assets/retro.js").body);
     /* The banner is a second, `aria-hidden` copy of `#results-count` and it is
@@ -1422,31 +1436,47 @@ fn opening_severs_the_opener_and_saving_never_uploads_the_file() {
         "the noopener feature returns null and would break the redirect"
     );
 
-    // The download path — now the branch of `openView` taken when the browser
-    // cannot display the type; it used to live under a separate Save button —
-    // used to POST the record to /api/view/blob to read back a filename, so
-    // saving anything over MAX_BODY failed after downloading it fine. Bounded
-    // by the navigation to `postBlob` below, so an unrelated later block
-    // cannot satisfy or break the assertions.
-    let save = js
-        .split("const plan = await postPlan(")
-        .nth(1)
-        .expect("nothing asks the server for the filename")
-        .split("view = await postBlob")
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    // The download path — now the branch of `runOpen` taken when the browser
+    // cannot display the type (or the file is over the viewer cap); it used to
+    // live under a separate Save button — used to POST the record to
+    // /api/view/blob to read back a filename, so saving anything over
+    // MAX_BODY failed after downloading it fine.
     assert!(
-        save.contains("downloadBlob(blob, plan.filename)"),
-        "an undisplayable file is fetched but never saved: {save}"
+        js.contains("startSWDownload(plan.filename, plan.mime_type, opened.totalBytes, 'row')"),
+        "an over-cap file headed for disk must stream through the worker"
     );
-    // Exactly one whole-file upload exists in the page: opening a copy the
-    // browser will display, after the plan has said it can be. Learning a
-    // filename must never be it.
+    assert!(
+        js.contains("downloadBlob(blob, plan.filename)"),
+        "an undisplayable file is fetched but never saved"
+    );
+    // Exactly two whole-file uploads exist in the page, one per open path
+    // (a reopen of bytes already here, and a fresh fetch), and both open a
+    // displayable copy for the viewer. Learning a filename must never be one.
     assert_eq!(
         js.matches("await postBlob(").count(),
-        1,
+        2,
         "the file must be uploaded only to open a displayable copy, never to learn its name"
+    );
+    // The streamed save itself cannot slip one in: the region between starting
+    // the worker download and the buffered fallback's first read holds the
+    // pipe and the success report, and nothing that talks to /api/view/blob.
+    // Bounded on `plan.filename` so the media player's own Save — which also
+    // calls startSWDownload, for a dialog that is not this flow — cannot be
+    // mistaken for it, and on code rather than the fallback's comment
+    // (`js_code` strips those, so a comment boundary would let the region run
+    // to end of file and trip over the indexing helper's own `postBlob`).
+    let streamed = js
+        .split(
+            "const port = await startSWDownload(plan.filename, plan.mime_type, opened.totalBytes, 'row');",
+        )
+        .nth(1)
+        .expect("the download branch no longer starts a worker download")
+        .split("blob = await restToBlob(handle, prefixParts, received, opened);")
+        .next()
+        .expect("the buffered fallback is gone");
+    assert!(
+        !streamed.contains("postBlob"),
+        "streaming a download must not upload the file: {streamed}"
     );
 
     // Asking the server now means sending *some* bytes, because the Autonomi SDK
@@ -1590,15 +1620,52 @@ fn an_oversized_upload_is_refused_rather_than_truncated() {
     // Truncating here would index a corrupt prefix of a large file and report
     // success, so over-cap must be a refusal with a code the browser can branch
     // on to take the daemon route instead.
+    //
+    // The real cap is 512 MiB — far too big to post in a test — so a dedicated
+    // server is spawned with the cap lowered through the same env seam the
+    // route reads it from. What is pinned here is the refusal mechanism and
+    // its code; the number lives in the two-constant pin below.
+    let s = TestServer::spawn_with(false, &[("ANTA_VISTA_INDEX_BODY_CAP", "65536")]);
     let uri = test_address("oversize");
-    let over = vec![b'a'; 32 * 1024 * 1024 + 1];
-    let res = server().post_binary("/api/index/bytes", &over, &[("X-Anta-Uri", uri.as_str())]);
+    let over = vec![b'a'; 65536 + 1];
+    let res = s.post_binary("/api/index/bytes", &over, &[("X-Anta-Uri", uri.as_str())]);
     assert_eq!(
         res.status, 400,
         "oversized body was not refused: {}",
         res.status
     );
     assert_eq!(res.json()["error"], "body_too_large");
+
+    // Exactly at the cap is allowed — the cap is "at most", not "under" — and
+    // the file really lands in the index rather than being acknowledged and
+    // dropped.
+    let uri = test_address("at-cap");
+    let at = vec![b'a'; 65536];
+    let out = s
+        .post_binary("/api/index/bytes", &at, &[("X-Anta-Uri", uri.as_str())])
+        .json();
+    assert_eq!(
+        out["ok"], true,
+        "a body exactly at the cap was refused: {out}"
+    );
+    let found = s.json("/api/search?q=aaaaaa");
+    assert!(
+        found["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .any(|r| r["location"] == uri.as_str()),
+        "an at-cap upload was acknowledged but not indexed: {found}"
+    );
+
+    // The two caps live in two languages and must agree: the page refuses the
+    // upload before the server would refuse the body, so a disagreement is a
+    // fetch the page will not start for a file the server would have taken.
+    let js = s.get("/assets/app.js").body;
+    assert!(
+        js.contains("MAX_INDEX_UPLOAD = 512 * 1024 * 1024"),
+        "the page's index cap no longer matches the server's INDEX_BODY"
+    );
 }
 
 #[test]
@@ -1624,6 +1691,669 @@ fn the_vendored_sdk_is_served_with_types_the_browser_accepts() {
     assert!(
         page.body.contains("/assets/vendor/autonomi-sdk/0.1.2/"),
         "page does not name the sdk base"
+    );
+}
+
+#[test]
+fn the_streaming_service_worker_is_served_as_a_script_it_can_register() {
+    // The download route for large non-displayable records: the page pipes
+    // chunks to this worker and the browser spools them straight to disk.
+    // Registration is by this exact path (a rename strands every download
+    // click on a 404), the MIME must be a script type or the browser refuses
+    // to register it, and `no-store` is what lets a rebuilt worker replace
+    // the one the browser is already running across navigations.
+    let s = server();
+    let sw = s.get("/autonomi-stream-sw.js");
+    assert_eq!(sw.status, 200, "worker script missing: {}", sw.body);
+    assert!(sw.headers.contains("javascript"), "{}", sw.headers);
+    assert!(
+        sw.headers.contains("no-store"),
+        "a cached worker outlives the code it was compiled from: {}",
+        sw.headers
+    );
+
+    // Both halves of the handshake must exist, or the click and the worker
+    // never meet: the page names the script, mints tokens and speaks the
+    // download route; the worker answers the same route with a pull protocol.
+    let js = s.get("/assets/app.js").body;
+    for needle in [
+        "/autonomi-stream-sw.js",
+        "av-download",
+        "MessageChannel",
+        "serviceWorker",
+    ] {
+        assert!(js.contains(needle), "app.js is missing {needle}");
+    }
+    for needle in ["av-download", "pull", "Content-Disposition"] {
+        assert!(sw.body.contains(needle), "the worker is missing {needle}");
+    }
+}
+
+#[test]
+fn the_media_route_is_the_patched_upstream_worker() {
+    // The player streams through the same worker, on upstream's
+    // `__autonomi_stream` route — merged *patched*, and the patches are the
+    // whole reason it is merged rather than copied: `nosniff` on every
+    // response and an audio/video-only Content-Type allowlist, so a
+    // same-origin route can never serve peer-supplied bytes as a document.
+    // The page teaches the worker the MIME our sniffing decided
+    // (`av-media-type`) because the SDK reports octet-stream for most
+    // records — and octet-stream is exactly what the allowlist must refuse.
+    let sw = server().get("/autonomi-stream-sw.js").body;
+    for needle in [
+        "/__autonomi_stream/",
+        "autonomi-file-range",
+        "av-media-type",
+        "X-Content-Type-Options",
+        "parseRange",
+        "audio|video",
+    ] {
+        assert!(sw.contains(needle), "the worker is missing {needle}");
+    }
+    // The refused answer exists, or the allowlist is decoration.
+    assert!(
+        sw.contains("serves audio and video only"),
+        "a non-media type has no refusal on the media route"
+    );
+    // Seeks and teardown cancel the stream while a range fetch is in
+    // flight; enqueuing into the cancelled stream throws Chrome's
+    // "Cannot enqueue a chunk into a closed readable stream", which looked
+    // like a fault in the console and was not one. The cancel flag keeps
+    // that noise out without silencing real failures.
+    let media = sw
+        .split("async function handleStreamRequest(")
+        .nth(1)
+        .expect("the media route is gone")
+        .split("function parseRange(")
+        .next()
+        .expect("the media route is unbounded");
+    assert!(
+        media.contains("cancelled"),
+        "a cancelled media stream still logs its wasted range as a failure: {media}"
+    );
+}
+
+#[test]
+fn the_inline_media_player_streams_and_saves_through_the_worker() {
+    // Audio and video play in the main page, streamed by the SDK's media
+    // source through the worker's range route — never uploaded, never held
+    // as a Blob. Save to disk reuses the download route from the same
+    // worker. The controls live in the dialog, not the result row: the
+    // row's fetch group holds only Stop while bytes move.
+    let s = server();
+    let page = s.get("/");
+    for needle in [
+        "id=\"media-dialog\"",
+        "id=\"media-player\"",
+        "id=\"media-save\"",
+    ] {
+        assert!(page.body.contains(needle), "the page is missing {needle}");
+    }
+
+    let js = js_code(&s.get("/assets/app.js").body);
+    for needle in [
+        "createMediaSource",
+        "av-media-type",
+        "teachMediaType",
+        "mediaSessionId",
+        "closePlayerIf",
+        "isMediaMime",
+    ] {
+        assert!(js.contains(needle), "app.js is missing {needle}");
+    }
+    // Non-modal on purpose: listening while browsing is the point, and a
+    // modal dialog would hide the row's own Block button while its file
+    // plays — which the close-on-block hook exists to honour.
+    assert!(
+        js.contains("ui.mediaDialog.show()"),
+        "the player must not block the page behind it"
+    );
+    assert!(
+        !js.contains("ui.mediaDialog.showModal()"),
+        "a modal player makes block-while-playing unreachable"
+    );
+}
+
+#[test]
+fn the_worker_is_kept_awake_for_the_whole_length_of_a_transfer() {
+    // Firefox terminates a service worker that has heard nothing for ~30
+    // seconds — even one that is mid-stream, spooling a download to disk
+    // (StreamSaver's README states the timeout outright; immich #21490
+    // reproduces the kill failing large saves). The dead worker takes the
+    // response body with it, and Firefox reports the half-written `.part`
+    // file as one whose "source file could not be read" — which reads as
+    // the file being broken, not as the worker being killed. Chrome counts
+    // an open response body as activity and waits minutes, so the same
+    // save works there. A message event *is* activity at the worker, so
+    // the page pings while anything of ours rides it: the save, from
+    // starting the download to the pipe settling, and a playing session
+    // for as long as it exists — the worker holds the session's taught
+    // MIME, and a paused player resumed after the kill would get a 400
+    // instead of its bytes.
+    let s = server();
+    let js = js_code(&s.get("/assets/app.js").body);
+    let sw = s.get("/autonomi-stream-sw.js").body;
+
+    assert!(
+        js.contains("type: 'av-ping'"),
+        "the page never pings the worker"
+    );
+    assert!(sw.contains("av-ping"), "the worker has no keepalive arm");
+
+    // The ping must outrun the clock: an interval at or past Firefox's
+    // window would be a ping that arrives after the kill it exists to
+    // prevent.
+    let keepalive = js
+        .split("function keepaliveAdd(")
+        .nth(1)
+        .expect("no keepaliveAdd")
+        .split("function keepaliveRemove(")
+        .next()
+        .expect("keepaliveAdd has no end");
+    let interval: u64 = keepalive
+        .rsplit("}, ")
+        .next()
+        .and_then(|tail| tail.split(')').next())
+        .and_then(|ms| ms.trim().parse().ok())
+        .expect("the keepalive interval is not a plain number of milliseconds");
+    assert!(
+        interval < 30_000,
+        "a ping every {interval}ms cannot outrun Firefox's ~30s idle kill"
+    );
+
+    // Both lifetimes are wired: the save is added where the download
+    // starts and released when the pipe settles; the playing session is
+    // added where the session is set and released in teardown, which every
+    // exit path (close, block, replacement) goes through.
+    for needle in [
+        "keepaliveAdd('download')",
+        "keepaliveRemove('download')",
+        "keepaliveAdd('media')",
+        "keepaliveRemove('media')",
+    ] {
+        assert!(js.contains(needle), "app.js is missing {needle}");
+    }
+}
+
+#[test]
+fn the_media_save_opens_the_file_before_it_starts_the_download() {
+    // The player's Save used to start the browser download first and open
+    // the Autonomi stream second, so every save began with seconds of a
+    // `.part` file receiving nothing while the lookup ran — the exact
+    // silence in which Firefox's idle clock kills the worker — and a
+    // failure to open left that hungry download hung behind it. Open
+    // first: the first chunk follows the click, a failed open starts no
+    // download at all, and the no-worker fallback drains the reader that
+    // is open rather than fetching the whole file a second time.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let save = js
+        .split("ui.mediaSave.addEventListener(")
+        .nth(1)
+        .expect("the player's Save handler is gone")
+        .split("function wireFetch(")
+        .next()
+        .expect("the save region is unbounded");
+    let open = save
+        .find("await openAutonomi(session.address")
+        .expect("the save never opens the file");
+    let start = save
+        .find("await startSWDownload(")
+        .expect("the save never starts a worker download");
+    let pipe = save
+        .find("await pipeReaderToPort(")
+        .expect("the save never pipes the bytes it opened");
+    assert!(
+        open < start && start < pipe,
+        "the save must open the file before starting the download: {save}"
+    );
+    assert!(
+        !save.contains("fetchAutonomi("),
+        "the fallback re-fetches a file whose reader is already open: {save}"
+    );
+    assert!(
+        save.contains("drainRest(handle"),
+        "the fallback does not drain the open reader: {save}"
+    );
+    // A cancel has to be said out loud here: this Save offers no Stop of its
+    // own, so a `DownloadCancelled` reaching the catch is the browser's
+    // download UI (or the worker reporting it) dropping the transfer — the
+    // silent return it used to take read as a finished save that produced
+    // no file, with nothing in the console to paste into a report either.
+    // The frozen progress line stays in front of the sentence: the count of
+    // chunks delivered is the datum that shows how far the transfer got.
+    assert!(
+        save.contains("console.warn('the media save was cancelled")
+            && save.contains("nothing was saved")
+            && save.contains("lastProgress"),
+        "a cancelled media save hides its progress: {save}"
+    );
+}
+
+#[test]
+fn the_saved_file_is_named_by_the_server_not_by_the_sdk() {
+    // `file.name` is always the SDK's synthetic `public-file-<8hex>.bin`,
+    // and the player session's filename is the one the Save button downloads
+    // under and every console line about the save quotes. SDK-first put that
+    // placeholder on the user's disk and named the failure reports after it —
+    // so a dialog save and a row save of the same file could not be matched
+    // to their console lines by name at all. The server's `plan.filename`
+    // (suggest_filename) wins; the synthetic name is only a last resort.
+    let js = js_code(&server().get("/assets/app.js").body);
+    assert!(
+        js.contains("filename: plan.filename || source.file.name || 'file'"),
+        "the saved file is named from the SDK's synthetic name first"
+    );
+}
+
+#[test]
+fn the_download_declares_the_length_the_datamap_already_knows() {
+    // `openFile` exposes the record's size before a single chunk moves, and
+    // the page hands it to the worker with the token: the browser's
+    // download UI then shows a total instead of an anonymous crawl, and a
+    // body that stops short of the declared length fails loudly rather than
+    // leaving a silent hole in a file that looks complete. Unknown (-1)
+    // means no header — still a valid response, never a wrong one.
+    let s = server();
+    let js = js_code(&s.get("/assets/app.js").body);
+    assert!(
+        js.contains("startSWDownload(plan.filename, plan.mime_type, opened.totalBytes, 'row')"),
+        "the row's save does not pass the size it knows to the worker"
+    );
+    assert!(
+        js.contains("size: Number.isSafeInteger(size) && size >= 0 ? size : -1"),
+        "the size travels with the token unvalidated"
+    );
+    let sw = s.get("/autonomi-stream-sw.js").body;
+    let download = sw
+        .split("function streamDownload(")
+        .nth(1)
+        .expect("the download route is gone")
+        .split("/* -----")
+        .next()
+        .expect("the download route is unbounded");
+    assert!(
+        download.contains("'Content-Length'"),
+        "the worker does not declare the length it was given: {download}"
+    );
+}
+
+#[test]
+fn the_streamed_row_save_delivers_the_bytes_the_plan_already_read() {
+    // The plan reads the file's leading bytes before the verdict is known
+    // (the first 1 MiB read covers the 16 KiB prefix cap), and the streaming
+    // save then pipes the *rest* while the worker declares the DataMap's
+    // full length. Those prefix bytes have to go down the same pipe: with
+    // `received` starting at 0, every streamed save ended in
+    // `received !== totalBytes` — small files failing on the spot ("0 of N")
+    // and large ones after minutes ("N-minus-a-chunk of N") — and the
+    // resulting `controller.error` against a body short of its own
+    // Content-Length is exactly the interrupted-download symptom in the
+    // browser's download UI. The player's Save reads no prefix and must
+    // stay a plain pipe.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let row = js
+        .split(
+            "const port = await startSWDownload(plan.filename, plan.mime_type, opened.totalBytes, 'row');",
+        )
+        .nth(1)
+        .expect("the row's save no longer starts a worker download")
+        .split("blob = await restToBlob(handle, prefixParts, received, opened);")
+        .next()
+        .expect("the buffered fallback is gone");
+    assert!(
+        row.contains("parts: prefixParts"),
+        "the pipe never receives the bytes the plan already read: {row}"
+    );
+    let pipe = js
+        .split("function pipeReaderToPort(")
+        .nth(1)
+        .expect("the pipe is gone")
+        .split("const downloadWhy = ")
+        .next()
+        .expect("the pipe region is unbounded");
+    for needle in ["parts = []", "pending.shift()", "received !== totalBytes"] {
+        assert!(
+            pipe.contains(needle),
+            "the pipe is missing {needle}: {pipe}"
+        );
+    }
+    let save = js
+        .split("ui.mediaSave.addEventListener(")
+        .nth(1)
+        .expect("the player's Save handler is gone")
+        .split("function wireFetch(")
+        .next()
+        .expect("the save region is unbounded");
+    assert!(
+        !save.contains("parts: prefixParts"),
+        "the player's Save has no plan prefix to seed: {save}"
+    );
+    // A failed save names its error in the page console as well as on the
+    // status line: the dialog's status is easy to overlook once the attempt
+    // is over, and the console line is what gets pasted into a report.
+    assert!(
+        save.contains("console.error('the media save failed'"),
+        "a failed media save leaves nothing in the console: {save}"
+    );
+}
+
+#[test]
+fn saves_through_memory_unless_the_file_is_past_the_cap() {
+    // Buffering is the save route every browser completes: the bytes
+    // assemble into a Blob and an object URL downloads them, with no
+    // service worker in the path at all. It is now the default, and the
+    // worker's stream — whose download body Firefox tears down before a
+    // byte — is reserved for a file too large to hold in memory, which is
+    // the one thing buffering cannot do. Both flows gate the worker behind
+    // SAVE_BUFFER_CAP and fall through to the buffered save underneath it,
+    // so the order in each is: decide from the size, stream only past the
+    // cap, buffer otherwise (and when no worker answers).
+    let js = js_code(&server().get("/assets/app.js").body);
+    assert!(
+        js.contains("const SAVE_BUFFER_CAP = 512 * 1024 * 1024"),
+        "the line between buffering and streaming is not drawn"
+    );
+    let row = js
+        .split("const why = downloadWhy(plan.renderable, opened.totalBytes, playerFailed);")
+        .nth(1)
+        .expect("the row's download branch is gone")
+        .split("await fetchViaDaemon(")
+        .next()
+        .expect("the row's download branch is unbounded");
+    let gate = row
+        .find("opened.totalBytes > SAVE_BUFFER_CAP")
+        .expect("the row's save is not gated on the cap");
+    let stream = row
+        .find(
+            "const port = await startSWDownload(plan.filename, plan.mime_type, opened.totalBytes, 'row');",
+        )
+        .expect("the over-cap stream is gone");
+    let buffer = row
+        .find("downloadBlob(blob, plan.filename)")
+        .expect("the buffered save is gone");
+    assert!(
+        gate < stream && stream < buffer,
+        "the row must decide from the size, then stream past the cap, then buffer: {row}"
+    );
+    let save = js
+        .split("ui.mediaSave.addEventListener(")
+        .nth(1)
+        .expect("the player's Save handler is gone")
+        .split("function wireFetch(")
+        .next()
+        .expect("the save region is unbounded");
+    let gate = save
+        .find("opened.totalBytes > SAVE_BUFFER_CAP")
+        .expect("the player's save is not gated on the cap");
+    let stream = save
+        .find("await startSWDownload(")
+        .expect("the over-cap stream is gone");
+    let buffer = save
+        .find("drainRest(handle")
+        .expect("the buffered save is gone");
+    assert!(
+        gate < stream && stream < buffer,
+        "the player's save must decide from the size, then stream past the cap, then buffer: {save}"
+    );
+}
+
+#[test]
+fn the_worker_logs_why_a_transfer_failed() {
+    // The only console line Firefox gives for an errored worker body is the
+    // generic "a ServiceWorker intercepted the request" one — no route, no
+    // reason — and a download interrupted in the browser's own UI logs
+    // nothing at all in the page, so this failure class was invisible. The
+    // worker says what happened: a fresh realm (the length and the taught
+    // MIME died with the previous one), a page-reported failure with its
+    // message, a token that raced the registration or was spent, and a
+    // media range that timed out or was refused. Each failure is also
+    // *announced* to every window client, because Firefox shows no worker
+    // console in the page console: the worker posts, the page repeats.
+    let s = server();
+    let sw = s.get("/autonomi-stream-sw.js").body;
+    for needle in [
+        "av-stream worker started",
+        "av-stream: download failed",
+        "av-stream: unknown download token",
+        "av-stream: media range request failed",
+        "av-stream: the browser cancelled this download",
+        // The cancel report says how far it got and which flow started it:
+        // "cancelled at 0 bytes" versus "cancelled at 40 MB" are different
+        // bugs, and a dialog save and a row save failing in one session are
+        // two downloads that filename alone cannot tell apart.
+        "bytes delivered",
+        "source: typeof msg.source === 'string' ? msg.source : ''",
+    ] {
+        assert!(sw.contains(needle), "the worker is missing {needle}");
+    }
+    assert!(
+        sw.contains("av-stream-failure"),
+        "the worker's failures die in a console Firefox never shows"
+    );
+    let js = js_code(&s.get("/assets/app.js").body);
+    assert!(
+        js.contains("av-stream-failure"),
+        "the page never hears the worker's announced failures"
+    );
+    // Lifecycle lines reach the page as logs, not errors: a realm restart
+    // (the idle-kill signature) must show in the console the user pastes,
+    // and at log level so an error filter does not hide the restart that
+    // explains the errors.
+    assert!(
+        js.contains("av-stream-log") && js.contains("console.log(msg.label"),
+        "the worker's realm restarts never reach the page console"
+    );
+    // Every download attempt is logged before anything can fail: which
+    // file, which flow — without it a session with two downloads under two
+    // names is undecidable from the failure lines alone.
+    assert!(
+        js.contains("console.log('av-download started'"),
+        "a download starts with no trace of which file or flow asked for it"
+    );
+}
+
+#[test]
+fn the_worker_confirms_a_download_registration_before_the_click() {
+    // The token reaches the worker by postMessage and the download by a
+    // navigation — two routes with no guaranteed arrival order. A fetch that
+    // wins gets the worker's empty 404 (a failed entry in the browser's
+    // download manager — Chrome's "file wasn't available", Firefox's
+    // `.part` that could not be read), while the page's pipe waits forever
+    // on pulls that can never come, because the 404 branch starts no stream.
+    // So the worker answers on the port it was handed, the page clicks only
+    // after that answer, and a worker that never answers gets no click at
+    // all — the caller's buffered fallback needs no worker, so the save
+    // degrades instead of breaking. Pipe failures are also named in the page
+    // console, because Firefox shows no worker logs there.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let start = js
+        .split("async function startSWDownload(")
+        .nth(1)
+        .expect("the worker download entry point is gone")
+        .split("function pipeReaderToPort(")
+        .next()
+        .expect("the startSWDownload region is unbounded");
+    let ready = start
+        .find("await confirmed")
+        .expect("the page never waits for the worker's confirmation");
+    let click = start
+        .find("downloadUrl(")
+        .expect("the download click is gone");
+    assert!(
+        ready < click,
+        "the click must wait for the confirmation: {start}"
+    );
+    assert!(
+        start.contains("return null"),
+        "a worker that never confirms must not be clicked anyway: {start}"
+    );
+    // A registration update activating between the handshake and the click
+    // starts a fresh realm whose token map is empty — the click would land
+    // on that realm's 404, which is exactly the failure the confirm exists
+    // to prevent, arriving from the other side. So the controller is
+    // re-checked after the confirm and the token re-registered with
+    // whoever will actually answer the navigation.
+    assert!(
+        start.contains("active !== controller"),
+        "a controller replaced mid-flow is not re-registered: {start}"
+    );
+    let sw = server().get("/autonomi-stream-sw.js").body;
+    assert!(
+        sw.contains("type: 'ready'"),
+        "the worker never confirms the registration"
+    );
+    assert!(
+        js.contains("console.error('the download pipe failed'"),
+        "a pipe failure is invisible in Firefox's page console"
+    );
+    // Silence after the click is a failure too: a worker that confirmed and
+    // then never asks for a byte (the fetch 404'd on a realm that never saw
+    // the token, and Firefox's download UI reports that on its own schedule)
+    // used to leave the pipe waiting forever, with the save looking hung
+    // rather than broken.
+    let pipe = js
+        .split("function pipeReaderToPort(")
+        .nth(1)
+        .expect("the pipe is gone")
+        .split("const downloadWhy = ")
+        .next()
+        .expect("the pipe region is unbounded");
+    assert!(
+        pipe.contains("FIRST_PULL_TIMEOUT_MS"),
+        "a worker that never pulls is waited on forever: {pipe}"
+    );
+    assert!(
+        pipe.contains("the worker never asked for any data"),
+        "the silent-worker failure has no name: {pipe}"
+    );
+}
+
+#[test]
+fn every_phase_of_a_streaming_save_names_the_side_that_went_silent() {
+    // A transfer that died mid-file froze the dialog on its last count: the
+    // browser's download UI reports an interrupted body only when the
+    // download is inspected, Firefox shows no worker logs in the page
+    // console, and the pipe had exactly one deadline — armed once for the
+    // first pull and cleared only by `finish` — so its 15 s window fired
+    // into every healthy download that outlived it (killing it with a
+    // message about a pull that had long since arrived) while a genuinely
+    // dead one sat waiting out the same window with no name for what
+    // stopped. Each phase now arms one shared timer with its own message
+    // — the first pull, the network's next chunk, the worker's next ask —
+    // and re-arming replaces the previous deadline, so a window can never
+    // outlive its phase. A controller swap (a registration update
+    // terminating the serving realm mid-save, whose body then dies under
+    // the browser) fails at once with that named instead of waiting the
+    // silence out; the listener exists only while a pipe runs.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let pipe = js
+        .split("function pipeReaderToPort(")
+        .nth(1)
+        .expect("the pipe is gone")
+        .split("const downloadWhy = ")
+        .next()
+        .expect("the pipe region is unbounded");
+    for needle in [
+        "arm(FIRST_PULL_TIMEOUT_MS",
+        "the worker never asked for any data",
+        "arm(STALL_TIMEOUT_MS",
+        "the network did not deliver the next chunk",
+        "the worker stopped asking for data",
+        "controllerchange",
+        "the streaming worker was replaced mid-save",
+        "removeEventListener('controllerchange'",
+    ] {
+        assert!(
+            pipe.contains(needle),
+            "the pipe is missing {needle}: {pipe}"
+        );
+    }
+    // Exactly one timer exists in the pipe, inside `arm`: every phase goes
+    // through it, so arming a new phase always clears the old deadline.
+    assert_eq!(
+        pipe.matches("setTimeout(").count(),
+        1,
+        "a phase owns a timer outside the shared arm: {pipe}"
+    );
+    // Both live phases re-arm the stall window: after a pull the network
+    // owes a chunk, after a chunk the worker owes a pull.
+    assert_eq!(
+        pipe.matches("arm(STALL_TIMEOUT_MS").count(),
+        2,
+        "a running transfer is not watched in both directions: {pipe}"
+    );
+}
+
+#[test]
+fn the_page_makes_itself_controlled_by_the_worker_before_anything_needs_it() {
+    // The media route hard-requires a *controlled* page: the SDK's bridge
+    // waits for `navigator.serviceWorker.controller` to become ours, and
+    // `clients.claim()` is known to skip the very document that called
+    // `register()` — the browser's and the SDK's shared remedy, and the
+    // SDK's own error text, is a single reload. Without one, every player
+    // click paid the SDK's 10 s wait twice and fell through to a fallback,
+    // while saves merely degraded to the buffered path — which is why the
+    // failure looked media-only. So the page settles control at boot:
+    // register, give claim its chance, and reload exactly once if the
+    // controller still has not arrived; after that reload the active
+    // worker controls the page at load, by ordinary rules.
+    let js = js_code(&server().get("/assets/app.js").body);
+
+    assert_eq!(
+        js.matches("location.reload()").count(),
+        1,
+        "the reload-once must be one site, reachable only from the boot handshake"
+    );
+    assert_eq!(
+        js.matches("ensureWorkerControlAtBoot();").count(),
+        1,
+        "the handshake must exist and be called exactly once"
+    );
+    let boot = js
+        .split("applyTheme(document.documentElement.dataset.theme || 'retro');")
+        .nth(1)
+        .expect("the boot line is gone")
+        .split("refreshDeps();")
+        .next()
+        .expect("the boot section is unbounded");
+    assert!(
+        boot.contains("ensureWorkerControlAtBoot();"),
+        "the handshake must run at boot, before any click can need the worker: {boot}"
+    );
+
+    let handshake = js
+        .split("function ensureWorkerControlAtBoot(")
+        .nth(1)
+        .expect("there is no boot control handshake")
+        .split("let keepaliveReasons = new Set();")
+        .next()
+        .expect("the handshake is unbounded");
+    assert!(
+        handshake.contains("if (navigator.serviceWorker.controller) return;"),
+        "a page the worker already controls must not register or reload: {handshake}"
+    );
+    let guard = handshake
+        .find("sessionStorage.getItem")
+        .expect("the handshake has no reload guard");
+    let flag = handshake
+        .find("sessionStorage.setItem")
+        .expect("the handshake sets no flag");
+    let refused = handshake
+        .find("catch (_)")
+        .expect("storage that cannot hold the flag is unguarded");
+    let register = handshake
+        .find("ensureServiceWorker()")
+        .expect("the handshake never registers");
+    let reload = handshake
+        .find("location.reload()")
+        .expect("the handshake never reloads");
+    assert!(
+        guard < flag && flag < refused && refused < register && register < reload,
+        "the flag must be spent before any reload, refused storage must skip both, and claim must get its chance first: {handshake}"
+    );
+    assert!(
+        handshake.contains("if (controller) return;"),
+        "claim that worked must not reload: {handshake}"
     );
 }
 
@@ -3761,6 +4491,33 @@ fn a_blocked_location_is_refused_before_any_route_reaches_the_network() {
     assert_eq!(download.status, 403, "download: {}", download.body);
     assert_eq!(download.json()["error"], "blocked");
 
+    // The plan is asked *before* the bytes are in hand — it is the browser's
+    // own pre-fetch refusal — so a blocked location must be turned away here
+    // too, or the guard only exists on paths the page has already stopped
+    // taking. And indexing writes rows, so it refuses before any store write.
+    let plan = s.post_binary(
+        "/api/view/plan",
+        b"prefix bytes",
+        &[("X-Anta-Uri", uri.as_str()), ("X-Anta-Mime", "text/plain")],
+    );
+    assert_eq!(plan.status, 403, "view/plan: {}", plan.body);
+    assert_eq!(plan.json()["error"], "blocked");
+
+    let index = s.post_binary(
+        "/api/index/bytes",
+        b"more bytes for a blocked location",
+        &[("X-Anta-Uri", uri.as_str())],
+    );
+    assert_eq!(index.status, 403, "index/bytes: {}", index.body);
+    assert_eq!(index.json()["error"], "blocked");
+
+    // The page's pre-fetch check asks this before any byte moves. A blocked
+    // location gets the *same* 403 every fetching route would have answered —
+    // one refusal shape, so the page and the server cannot disagree.
+    let ask = s.get(&format!("/api/blocked?location={}", urlencode(&uri)));
+    assert_eq!(ask.status, 403, "blocked?: {}", ask.body);
+    assert_eq!(ask.json()["error"], "blocked");
+
     // Unblocking lifts it, so the guard is not just refusing everything.
     let unblocked = s.post(
         "/api/unblock",
@@ -3772,6 +4529,13 @@ fn a_blocked_location_is_refused_before_any_route_reaches_the_network() {
             .status,
         403,
         "the block outlived the unblock"
+    );
+    let ask = s.get(&format!("/api/blocked?location={}", urlencode(&uri)));
+    assert_eq!(ask.status, 200, "blocked?: {}", ask.body);
+    assert_eq!(
+        ask.json()["blocked"],
+        false,
+        "blocked? outlived the unblock"
     );
 }
 
@@ -3920,14 +4684,14 @@ fn the_tab_is_told_the_library_load_before_the_sdk_can_report_it() {
     // without waiting for a third-party callback that cannot report yet.
     let js = js_code(&server().get("/assets/app.js").body);
     let body = js
-        .split("async function fetchAutonomi")
+        .split("async function openAutonomi")
         .nth(1)
-        .and_then(|rest| rest.split("\nfunction wireFetch").next())
-        .expect("fetchAutonomi is gone");
+        .and_then(|rest| rest.split("\nasync function drainRest").next())
+        .expect("openAutonomi is gone");
 
     let step_at = body
         .find("onStep")
-        .expect("fetchAutonomi never announces the library load");
+        .expect("the open never announces the library load");
     let load_at = body.find("await loadSdk()").expect("loadSdk is gone");
     assert!(
         step_at < load_at,
@@ -3936,23 +4700,71 @@ fn the_tab_is_told_the_library_load_before_the_sdk_can_report_it() {
 }
 
 #[test]
-fn connect_receives_its_abort_signal() {
+fn the_client_is_connected_once_and_the_abort_stays_with_the_reader() {
     // `AutonomiClient.connect(bootstrap, options)` treats a plain object in the
     // first argument as a network profile and takes its settings from a rest-spread
     // of *that object*; the second argument is only read for the string form (one
-    // explicit WebRTC multiaddress).
+    // explicit WebRTC multiaddress). So `connect({ onProgress }, { signal })` looks
+    // right and silently drops the signal — that rule now lives in `getSharedClient`,
+    // which passes one object and no second argument at all.
     //
-    // So `connect({ onProgress }, { signal })` looks right and silently discards
-    // the signal: connect succeeds and Stop cannot cancel it. Both belong in the
-    // first argument.
+    // The per-operation signal is gone from `connect` on purpose: the client is
+    // shared by every open, save and index on the page, so no one operation owns
+    // the connection. Stop reaches its own work where it always did — on `openFile`
+    // and on the stream — and a shared client whose connection has died is replaced
+    // by an invalidate-and-retry rather than kept until the next page load.
     let js = js_code(&server().get("/assets/app.js").body);
+
+    assert_eq!(
+        js.matches("AutonomiClient.connect(").count(),
+        1,
+        "there must be exactly one connect on the page, behind the shared helper: {js}"
+    );
+
+    let shared = js
+        .split("async function getSharedClient")
+        .nth(1)
+        .and_then(|rest| rest.split("\nasync function openAutonomi").next())
+        .expect("getSharedClient is gone");
     assert!(
-        js.contains("AutonomiClient.connect({ onProgress: progress, signal })"),
-        "connect must take one object carrying both: {js}"
+        shared.contains("AutonomiClient.connect({ onProgress })"),
+        "the connect must take its settings in the single options object: {shared}"
     );
     assert!(
-        !js.contains("connect({ onProgress: progress }, { signal })"),
-        "this drops the abort signal, because the second argument is not read"
+        !shared.contains(", { signal }"),
+        "a shared connection is not one operation's to abort: {shared}"
+    );
+    // A failed connect must not be cached, or one bad minute condemns the
+    // browser route until the next page load.
+    assert!(
+        shared.contains("sharedClientPromise = null"),
+        "a failed connect must clear the slot so the next operation retries: {shared}"
+    );
+
+    let open = js
+        .split("async function openAutonomi")
+        .nth(1)
+        .and_then(|rest| rest.split("\nasync function drainRest").next())
+        .expect("openAutonomi is gone");
+    assert!(
+        open.contains("openFile(address, { onProgress: progress, signal })"),
+        "the per-operation abort lives at openFile: {open}"
+    );
+    assert!(
+        open.contains("invalidateSharedClient()"),
+        "a dead shared client must be replaceable, or every later open falls back to the daemon: {open}"
+    );
+    // A stop is never what spends the reconnect: the abort check throws before
+    // the invalidate can run.
+    let stop_at = open
+        .find("if (signal && signal.aborted) throw err;")
+        .expect("the catch does not rethrow a stop");
+    let invalidate_at = open
+        .find("invalidateSharedClient()")
+        .expect("the retry does not invalidate");
+    assert!(
+        stop_at < invalidate_at,
+        "Stop must be answered before the reconnect, or stopping starts a connect: {open}"
     );
 }
 
@@ -3962,39 +4774,169 @@ fn stopping_a_browser_fetch_never_falls_back_to_the_daemon() {
     // its own error wording — while an unrecognised fetch failure is exactly
     // what routes to the daemon fallback. Left untranslated, Stop therefore
     // started a *second* download with no Stop of its own. Two things must
-    // hold: `obtain` decides "stopped" from our own signal, whatever was
-    // thrown, and `runOpen` rethrows a stop before it can reach the fallback.
+    // hold: the catch around the browser path decides "stopped" from our own
+    // signal, whatever was thrown, and it rethrows a stop before the fallback
+    // can run. (The fetch helper this used to sit in, `obtain`, was folded
+    // into `runOpen` when the open path learned to stream; the guard moved
+    // with it and did not weaken.)
     let js = js_code(&server().get("/assets/app.js").body);
-
-    let obtain = js
-        .split("const obtain = async")
-        .nth(1)
-        .expect("obtain is gone")
-        .split("const runOpen")
-        .next()
-        .expect("obtain is unbounded");
-    assert!(
-        obtain.contains("controller.signal.aborted"),
-        "a stop must be recognised by our own signal, not the SDK's wording: {obtain}"
-    );
-    assert!(
-        obtain.contains("throw new DownloadCancelled()"),
-        "obtain does not recast the abort into a stop: {obtain}"
-    );
 
     let open = js
         .split("const runOpen = async")
         .nth(1)
         .expect("runOpen is gone");
+    assert!(
+        open.contains("controller.signal.aborted"),
+        "a stop must be recognised by our own signal, not the SDK's wording: {open}"
+    );
+    assert!(
+        open.contains("throw new DownloadCancelled()"),
+        "an abort is not recast into a stop: {open}"
+    );
+
+    let recast_at = open
+        .find("controller && controller.signal.aborted")
+        .expect("the catch does not decide stopped from our signal");
     let fallback_at = open
         .find("fetchViaDaemon")
         .expect("the daemon fallback is gone");
+    assert!(
+        recast_at < fallback_at,
+        "the stop check must come before the daemon fallback, or Stop starts the fallback: {open}"
+    );
     let stop_at = open
         .find("err.name === 'DownloadCancelled'")
         .expect("runOpen does not recognise a stop");
     assert!(
         stop_at < fallback_at,
         "the stop check must come before the daemon fallback, or Stop starts the fallback: {open}"
+    );
+}
+
+#[test]
+fn a_media_row_opens_no_progress_tab_and_reports_on_its_own_line() {
+    // Audio and video play in this page's player dialog, so for a row that says
+    // so the progress tab was pure choreography: it appeared for the loading
+    // phases, closed again, and a small window reappeared in the main tab — two
+    // surfaces taking turns over one click. The row's own status line already
+    // carries every phase (a `toTab` of a null tab is a no-op), so a known-media
+    // row opens no tab at all. The decision has to be made *before any await* —
+    // a `window.open` after an await has no user gesture and is blocked — which
+    // is exactly why it comes from the row's stored mime rather than from the
+    // plan, whose first byte is already past a lookup.
+    let js = js_code(&server().get("/assets/app.js").body);
+    let open = js
+        .split("const runOpen = async")
+        .nth(1)
+        .expect("runOpen is gone");
+
+    assert!(
+        open.contains("const tab = likelyMedia ? null : openProgressTab();"),
+        "the tab must be gated on the row's stored media type: {open}"
+    );
+    let gate_at = open
+        .find("isMediaMime(result.mime_type)")
+        .expect("the media decision is not made from the row");
+    let open_tab_at = open
+        .find("openProgressTab()")
+        .expect("the tab open is gone");
+    assert!(
+        gate_at < open_tab_at,
+        "the decision must precede the open, or it belongs to a moment too late for a popup: {open}"
+    );
+
+    // The blocked-popup warning must not fire for a deliberate skip: a tab we
+    // chose not to open is not a tab the browser refused.
+    assert!(
+        open.contains("if (!tab && !likelyMedia)"),
+        "the popup warning must be gated on having actually tried: {open}"
+    );
+
+    // A stored mime that turns out to need a display is dropped at the hand-off
+    // below — the one place where a skipped tab is distinguishable from a
+    // blocked one — so "Allow pop-ups … try Open again" can never deadlock: the
+    // next click opens the tab normally. A popup the browser blocked teaches the
+    // row nothing, so it must not flip.
+    let flip_at = open
+        .find("trustStoredMime = false")
+        .expect("a row whose mime turned out wrong is never corrected");
+    let retry_at = open
+        .find("try Open again")
+        .expect("the null-tab hand-off message is gone");
+    assert!(
+        flip_at < retry_at,
+        "the belief must be dropped where the missing tab is reported: {open}"
+    );
+}
+
+#[test]
+fn a_failed_media_open_retries_once_and_the_fallback_names_it() {
+    // The media route is a *second* network reader on the same connection —
+    // random access, a different wasm path from the sequential open that already
+    // fetched the plan's prefix — and this network fails transiently per attempt.
+    // One bad lookup here used to surrender the whole route: a 52 MB video fell
+    // through to a full download and reported only the size limit, and an mp3
+    // fell through to the viewer and reported a popup block that never happened.
+    // Both endings hid the thing the click actually wanted — playing the file.
+    let js = js_code(&server().get("/assets/app.js").body);
+
+    let player = js
+        .split("async function startPlayer")
+        .nth(1)
+        .and_then(|rest| rest.split("\nui.mediaSave.addEventListener").next())
+        .expect("startPlayer is gone");
+    assert!(
+        player.contains("invalidateSharedClient()"),
+        "a failed media open must be replaceable, or one transient lookup ends playback: {player}"
+    );
+    assert!(
+        player.contains("if (err.name === 'DownloadCancelled') throw err;"),
+        "a stop must never be spent on a reconnect: {player}"
+    );
+    let first_open = player
+        .find("source = await client.createMediaSource")
+        .expect("the media open is gone");
+    let logged = player
+        .find("console.error('the media reader could not be opened'")
+        .expect("the real failure must be logged — the fallback messages describe the route, never the cause");
+    let retry_open = player
+        .rfind("source = await client.createMediaSource")
+        .expect("the retry does not exist");
+    assert!(
+        first_open < logged && logged < retry_open,
+        "the order is open, log, retry — and the second failure propagates: {player}"
+    );
+    assert!(
+        player.contains("console.error('the media worker did not take the session'"),
+        "a post-reader failure (the type ack, the session URL) is logged too, and is not retried: {player}"
+    );
+
+    // The endings must carry the failure forward, or the fallback reports only
+    // its own reason and hides what broke.
+    assert!(
+        js.contains("playerFailed && 'the player could not open'"),
+        "the download reason must include the player failure: {js}"
+    );
+    let open = js
+        .split("const runOpen = async")
+        .nth(1)
+        .expect("runOpen is gone");
+    assert!(
+        open.contains("downloadWhy(plan.renderable, opened.totalBytes, playerFailed)"),
+        "the fresh-open download must pass the failure on: {open}"
+    );
+    assert!(
+        open.contains("The player could not open this file, so it was fetched for a tab instead."),
+        "the null-tab hand-off must name the player failure, not blame pop-ups: {open}"
+    );
+    // `startPlayer`'s own logging cannot cover everything that can reach this
+    // fall-through — a throw from the shared connect, or from the retry's
+    // connect or second attempt, bypasses it — so the catch itself logs.
+    // Without this the failure behind every fallback was invisible, and the
+    // messages, which describe the route taken, were all anyone had.
+    assert!(
+        open.contains("console.error('the player could not open', err)"),
+        "a player failure must reach the console from the fall-through too: {open}"
     );
 }
 
@@ -4126,11 +5068,14 @@ fn a_record_is_streamed_rather_than_downloaded_so_chunks_can_be_counted() {
     // `size` from the DataMap before any chunk moves, so "N chunks, X of Y" is
     // counted rather than guessed.
     let js = js_code(&server().get("/assets/app.js").body);
+    // The open path was split (`openAutonomi` opens, `drainRest` counts, the
+    // worker pipe streams to disk) but every assertion below still holds of
+    // the whole region between the open and the row wiring.
     let body = js
-        .split("async function fetchAutonomi")
+        .split("async function openAutonomi")
         .nth(1)
         .and_then(|rest| rest.split("\nfunction wireFetch").next())
-        .expect("fetchAutonomi is gone");
+        .expect("openAutonomi is gone");
 
     assert!(
         !body.contains(".download("),
@@ -4288,10 +5233,14 @@ fn the_vendored_sdk_is_cacheable_because_its_url_carries_the_version() {
 #[test]
 fn hovering_an_autonomi_location_starts_the_wasm_compile_before_the_click() {
     // Compiling and instantiating 5.4 MB of WASM is the longest single stretch of a
-    // first fetch. Triggered by the click it reads as "broken"; triggered by hover it
-    // overlaps the user's decision. `loadSdk()` caches its promise including failure,
-    // so warming it is free when the click never comes and duplicates nothing when
-    // it does. Touch fires no pointerenter, which is why focus is wired too.
+    // first fetch — and it happens *inside* `AutonomiClient.connect`, along with the
+    // seed dial, not in `loadSdk()` (which only imports the package). Triggered by
+    // the click they read as "broken"; triggered by hover they overlap the user's
+    // decision. So the warm must reach the shared connect, or every click still
+    // pays the compile. Both promises are cached — `loadSdk` including its failure,
+    // `getSharedClient` by clearing its slot — so warming is free when the click
+    // never comes and duplicates nothing when it does. Touch fires no pointerenter,
+    // which is why focus is wired too.
     let js = js_code(&server().get("/assets/app.js").body);
     let warm = js
         .split("const warm = () => {")
@@ -4301,6 +5250,10 @@ fn hovering_an_autonomi_location_starts_the_wasm_compile_before_the_click() {
     assert!(
         warm.contains("loadSdk()"),
         "warming must reuse the cached promise rather than import again: {warm}"
+    );
+    assert!(
+        warm.contains("getSharedClient()"),
+        "the compile and the seed dial live in the connect — the warm must start those too: {warm}"
     );
     assert!(
         js.contains("loc.addEventListener('pointerenter', warm, { once: true })"),
@@ -4359,9 +5312,17 @@ fn one_counter_shows_progress_because_two_sources_would_flicker() {
 
     // And our own counts go on the channel the ant CLI already uses, so both
     // transports render through one element instead of each having its own.
+    // Bounded inside `hooksFor`: the media player's Save has its own onChunk
+    // writing to the dialog's status line, which is a different read-out for
+    // a different operation on purpose — the row's counter is the one this
+    // pin is about.
     let chunk = js
-        .split("onChunk: ({ chunks, bytes, totalBytes })")
+        .split("const hooksFor = (tab) => ({")
         .nth(1)
+        .and_then(|rest| {
+            rest.split("onChunk: ({ chunks, bytes, totalBytes })")
+                .nth(1)
+        })
         .and_then(|rest| rest.split("\n        },").next())
         .expect("onChunk is gone");
     assert!(
@@ -4450,24 +5411,23 @@ fn an_sdk_operation_boundary_is_not_reported_as_the_users_download_finishing() {
         "the filter has to run before anything is sent: {report}"
     );
 
-    // What replaces it: *we* say the transfer started, at the moment it does, and
-    // only then is the line true.
-    let fetch = js
-        .split("const reader = await client.openFile")
-        .nth(1)
-        .and_then(|rest| {
-            rest.split("\n")
-                .take(6)
-                .collect::<Vec<_>>()
-                .join("\n")
-                .split("const totalBytes")
-                .next()
-                .map(str::to_string)
-        })
+    // What replaces it: *we* say the transfer started, at the moment it does —
+    // after the reader exists and before the size is read — and only then is the
+    // line true. Anchored as three ordered positions rather than a line window
+    // after one call site: `openFile` now has two attempts (the shared client's
+    // retry) and the announcement belongs after both of them.
+    let open_at = js
+        .find("await client.openFile")
         .expect("openFile call is gone");
+    let announce_at = js
+        .find("if (onStep) onStep(PHASE_LABELS.downloading)")
+        .expect("the transfer is never announced by us");
+    let size_at = js
+        .find("const totalBytes = Number(reader.size)")
+        .expect("the size read is gone");
     assert!(
-        fetch.contains("onStep(PHASE_LABELS.downloading)"),
-        "the transfer is never announced by us: {fetch}"
+        open_at < announce_at && announce_at < size_at,
+        "the announcement must follow the open and precede the size: open={open_at} announce={announce_at} size={size_at}"
     );
 
     // Terminal states remain the page's own two, so a user still knows when the

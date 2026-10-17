@@ -42,6 +42,10 @@ const PAGE: &str = r##"<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Anta-Vista</title>
+<!-- An empty data: icon, so the browser's automatic /favicon.ico request
+     never leaves a 404 in the console (and never gets clicked as though it
+     were a failed route of ours). -->
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="/assets/retro.css">
 <link rel="stylesheet" href="/assets/modern.css">
 <script>__BOOT__</script>
@@ -250,6 +254,28 @@ const PAGE: &str = r##"<!doctype html>
   </form>
 </dialog>
 
+<!-- The inline media player: audio and video play here, in the main page,
+     streamed from the network through the service worker rather than held in
+     memory — the same worker route that saves large files to disk, pointed
+     the other way. Save to disk is the durable action and lives here rather
+     than in the result row, which holds nothing but Stop while bytes move.
+     Closing the dialog stops playback and closes the worker session. -->
+<dialog id="media-dialog" class="dialog">
+  <form method="dialog">
+    <h2 id="media-title">Playing</h2>
+    <!-- One element for both kinds: a <video> plays audio files too, and one
+         element means one set of controls and one cleanup path. -->
+    <video id="media-player" controls preload="metadata"></video>
+    <p id="media-status" class="hint" aria-live="polite"></p>
+    <menu>
+      <button value="close" class="btn btn-quiet">Close</button>
+      <!-- type="button": saving runs while the dialog stays open, and reports
+           on the status line above. -->
+      <button type="button" id="media-save" class="btn btn-primary">Save to disk</button>
+    </menu>
+  </form>
+</dialog>
+
 <template id="result-template">
   <li class="result">
     <div class="result-head">
@@ -344,6 +370,23 @@ pub fn retro_js() -> WebResponse {
         200,
         JS_MIME,
         include_str!("../../assets/retro.js"),
+    ))
+}
+
+/// The streaming service worker: the download route a large Autonomi record
+/// rides to disk without being assembled in page memory.
+///
+/// An [`own_asset`] like the rest of the app's own code, and `no-store`
+/// matters most here: a browser holds a service worker across navigations and
+/// only replaces it on a registration update, so a cached copy would keep
+/// running yesterday's worker against today's page — with nothing on screen
+/// admitting the mismatch. The page registers it by this exact path, so a
+/// rename here strands every download click on a 404.
+pub fn stream_sw() -> WebResponse {
+    own_asset(text_response(
+        200,
+        JS_MIME,
+        include_str!("../../assets/autonomi-stream-sw.js"),
     ))
 }
 

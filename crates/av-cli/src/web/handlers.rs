@@ -283,13 +283,17 @@ pub fn download(state: &Arc<AppState>, query: &str) -> WebResponse {
 }
 
 /// Refuse to fetch a location the user has blocked, on any route that reaches the
-/// network on their behalf.
+/// network on their behalf — or, for [`view_plan`] and [`blocked`], on any route
+/// the page consults *before* it reaches the network itself.
 ///
-/// Shared by [`download`] and [`view_fetch`] so a new egress path cannot come up
-/// without it, which is the failure this exists to prevent: both routes take a
-/// *location* rather than a `resources.id`, so neither can use
-/// `blocks::is_blocked` and both were reading the network first and deciding
-/// afterwards — or, in `download`'s case, not at all.
+/// Shared by [`download`], [`view_fetch`], [`view_plan`], [`index`] and
+/// [`blocked`] so a new egress path cannot come up without it, which is the
+/// failure this exists to prevent: these routes take a *location* rather than a
+/// `resources.id`, so none can use `blocks::is_blocked`, and the browser's own
+/// WebRTC transfer goes through no server route at all — which is why the page
+/// asks [`blocked`] first and why `view_plan` (the one server call every open
+/// makes) re-checks. Reading the network first and deciding afterwards — or not
+/// at all — is the bug; failing closed on a `blocks` read error is the rule.
 ///
 /// Fails closed. A `blocks` read that errors is not evidence that nothing is
 /// blocked, so this returns the error rather than allowing the fetch; see
@@ -626,6 +630,14 @@ pub fn view_plan(state: &Arc<AppState>, uri: &str, mime_hint: &str, prefix: &[u8
         );
     }
 
+    // The page calls this before *any* bytes move — a browser WebRTC fetch goes
+    // through no other server route, so this is where an open learns the user
+    // has blocked the location. Naming a file for it would be work done on the
+    // way to serving it, and the check fails closed like every other block read.
+    if let Err(err) = refuse_if_blocked(state, &uri) {
+        return err;
+    }
+
     // A hint we cannot place is treated as absent, which makes the verdict
     // "download it" — the outcome that always works. Guessing "renderable" from
     // an unknown type is how this path produced a blank window.
@@ -666,6 +678,31 @@ pub fn view_plan(state: &Arc<AppState>, uri: &str, mime_hint: &str, prefix: &[u8
     )
 }
 
+/// `GET /api/blocked?location=...` — the bytes-free gate the page asks before it
+/// lets the SDK touch the network.
+///
+/// A browser WebRTC fetch goes through no server route, so the open and index
+/// flows ask this first: `200 {"ok":true,"blocked":false}` means go ahead, and
+/// the `403 blocked` / `503 block_check_failed` refusals come straight from
+/// [`refuse_if_blocked`], identical to what every fetching route would have
+/// answered. One code path, so the page and the server cannot disagree about
+/// what is blocked.
+pub fn blocked(state: &Arc<AppState>, query: &str) -> WebResponse {
+    let params = parse_query(query);
+    let Some(location) = param(&params, "location") else {
+        return json_error(400, "validation_error", "missing 'location'");
+    };
+    let location = location.trim();
+    if location.is_empty() {
+        return json_error(400, "validation_error", "missing 'location'");
+    }
+    let uri = av_ingest::location::normalize_uri(location);
+    if let Err(err) = refuse_if_blocked(state, &uri) {
+        return err;
+    }
+    json_response(json!({ "ok": true, "blocked": false }).to_string())
+}
+
 /// `POST /api/index/bytes` — raw body is the file; metadata arrives in headers.
 ///
 /// The browser half of indexing: the SDK has already fetched the bytes over
@@ -681,6 +718,16 @@ pub fn index_bytes(
     let uri = av_ingest::location::normalize_uri(uri.trim());
     if uri.is_empty() {
         return json_error(400, "validation_error", "missing 'X-Anta-Uri'");
+    }
+    // Before the provider loads and before any store write: a blocked
+    // location is refused here exactly as the JSON `/api/index` route and
+    // every fetch route refuse it. The content-hash check inside
+    // `index_resource_from_bytes` cannot stand in for this one — a block is
+    // keyed by location (the row it deleted is gone, so its id cannot match
+    // the id new bytes would compute), and re-indexing the address the user
+    // blocked would write the very row the block removed.
+    if let Err(err) = refuse_if_blocked(state, &uri) {
+        return err;
     }
 
     let tags: Vec<String> = tags
@@ -894,6 +941,13 @@ pub fn index(state: &Arc<AppState>, body: &str) -> WebResponse {
         return json_error(400, "validation_error", "missing 'uri'");
     }
     let uri = av_ingest::location::normalize_uri(&raw_uri);
+
+    // Indexing reaches the network on the user's behalf — `index_resource`
+    // verifies the URI and downloads it — so it refuses here, before any
+    // dependency probing, exactly as the browser half refuses before its fetch.
+    if let Err(err) = refuse_if_blocked(state, &uri) {
+        return err;
+    }
 
     // Autonomi locations are only reachable with ant tooling. Unlike the CLI we
     // cannot prompt, so report the missing dependency and let the setup banner
