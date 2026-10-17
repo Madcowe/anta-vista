@@ -277,6 +277,34 @@ input[type="text"] {
   gap: 6px;
 }
 
+/* The row's spinner while an open is in flight. The status line beside it can
+ * sit on one sentence for the seconds an Autonomi lookup takes — the progress
+ * tab carries its own copy of this spinner for the same reason — so the row
+ * needs something visibly doing something in the meantime. Decorative: it is
+ * `aria-hidden` in the markup and the status line says what is happening.
+ *
+ * `display` here is exactly the case the `[hidden]` guard at the top of this
+ * file exists for: app.js flips `hidden` for the length of one open. Reduced
+ * motion needs no block of its own — this file's global `*` rule already takes
+ * every animation, spinner included. Unscoped on purpose: retro recolours but
+ * does not lay out, and a spinner only one theme shows would be a different
+ * app in each. */
+.row-spin {
+  display: inline-block;
+  width: 0.85em;
+  height: 0.85em;
+  margin-right: 0.45em;
+  vertical-align: -0.125em;
+  border: 2px solid color-mix(in srgb, currentColor 35%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: av-row-spin 0.75s linear infinite;
+}
+
+@keyframes av-row-spin {
+  to { transform: rotate(360deg); }
+}
+
 /* Groups the two "make this go away" actions so they stay together at the end
  * of the row, whichever of them is present. */
 .result-deny {

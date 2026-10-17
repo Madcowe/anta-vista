@@ -272,6 +272,10 @@ const PAGE: &str = r##"<!doctype html>
       <!-- type="button": saving runs while the dialog stays open, and reports
            on the status line above. -->
       <button type="button" id="media-save" class="btn btn-primary">Save to disk</button>
+      <!-- Send playback to a tab of its own. Disabled until a session exists,
+           like Save — app.js opens `/media-view` synchronously in the click (a
+           popup after an await is blocked) and only then closes this dialog. -->
+      <button type="button" id="media-open-tab" class="btn btn-quiet" disabled>Open in another tab</button>
     </menu>
   </form>
 </dialog>
@@ -321,6 +325,14 @@ const PAGE: &str = r##"<!doctype html>
         <button type="button" class="btn btn-quiet btn-fetch-stop" data-role="fetch-stop"
           title="Stop fetching this file">Stop</button>
       </span>
+      <!-- Beside the fetch status while an open is in flight: the status line
+           can sit on one sentence for the seconds an Autonomi lookup takes, and
+           a line of text alone reads as nothing happening. Decorative, so it is
+           `aria-hidden` — the status line carries the meaning — and it is shown
+           and hidden once per open by `openView` in app.js. It starts `hidden`,
+           and the `[hidden]` guard in modern.css is what keeps the author
+           `display` rule there from painting it from first paint. -->
+      <span class="row-spin" hidden aria-hidden="true"></span>
       <!-- Fetch progress and outcome get their own line rather than reusing
            rate-status: rating, blocking and removing all report there, and a
            fetch that overwrites their message would lose it. -->
@@ -768,6 +780,46 @@ pub fn view_progress_page() -> WebResponse {
     )
 }
 
+/// `GET /media-view` — the media player's own tab.
+///
+/// A standalone page like [`view_error_page`], but one that *does* talk to the
+/// network: it loads the vendored SDK, asks the local block list the same
+/// question the row asks (`/api/blocked`, and every failure — the refusal
+/// itself, an unreadable list, a server that is gone — ends the run), and opens
+/// its own media source through the worker's session route. The tab is
+/// self-sufficient by construction — its own SDK client, its own worker
+/// session, its own `av-ping` keepalive — so it outlives the Anta-Vista tab
+/// that opened it and closing that tab costs the player nothing.
+///
+/// **A `const`, not a `format!`.** The server reflects nothing from the query:
+/// `address`, `type` and `name` are read by the page's own script and validated
+/// there before use, and `name` reaches the DOM as `document.title` only — a
+/// hostile query cannot become markup, so there is no escaping question here to
+/// get wrong. The only substituted value is [`SDK_BASE`], a trusted constant.
+///
+/// Deliberately **no `Content-Security-Policy`** like [`view_progress_page`]'s
+/// `connect-src 'none'`: this page's entire purpose is to make requests — a
+/// same-origin block question and the WebRTC transfer — so locking requests
+/// down would lock the feature down. What keeps it safe is structural: it
+/// renders no peer bytes as markup (`textContent` only, error text bounded to
+/// the same 240 characters the progress page clamps to), and the worker's
+/// media route serves `audio/*` and `video/*` only, `nosniff`ed. It also needs
+/// the worker's `/media-view` passthrough to be controlled at load: an
+/// uncontrolled document's media URL falls through to the server's 404 and the
+/// SDK bridge gives up waiting for control after ten seconds.
+pub fn media_view_page() -> WebResponse {
+    text_response_with(
+        200,
+        HTML_MIME,
+        &MEDIA_VIEW_HTML.replace("__SDK_BASE__", SDK_BASE),
+        &[
+            Header::from_bytes("Cache-Control", "no-store").expect("static header"),
+            Header::from_bytes("Referrer-Policy", "no-referrer").expect("static header"),
+            Header::from_bytes("X-Content-Type-Options", "nosniff").expect("static header"),
+        ],
+    )
+}
+
 /// A `const`, not a `format!`: the page takes no input at all, so there is
 /// nothing to interpolate and no reason to own an escaping question it does not
 /// need. The only text that ever appears in it arrives by message.
@@ -990,6 +1042,312 @@ const PROGRESS_PAGE_HTML: &str = r##"<!doctype html>
      * just cannot be handed off to. */
   }
 })();
+</script>
+</body>
+</html>
+"##;
+
+/// The media player's tab. Written as a `const` for the same reason as
+/// [`PROGRESS_PAGE_HTML`] — it reflects nothing — with only [`SDK_BASE`]
+/// substituted by [`media_view_page`].
+const MEDIA_VIEW_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Playing — Anta-Vista</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh; box-sizing: border-box;
+    padding: 2rem 1.5rem;
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+    background: Canvas; color: CanvasText;
+  }
+  main { max-width: 56rem; margin: 0 auto; }
+  h1 { font-size: 1.1rem; margin: 0 0 .25rem; font-weight: 600; }
+  .sub { margin: 0 0 1rem; opacity: .8; font-size: .9375rem; min-height: 1.4em; }
+  video { width: 100%; max-height: 72vh; background: #000; border-radius: 6px; }
+  video[hidden] { display: none; }
+  .note { font-size: .8125rem; opacity: .75; margin-top: 1rem; }
+  .note[hidden] { display: none; }
+  .failed h1 { color: #b3261e; }
+  /* The spinner, the progress page's pattern: decorative, `aria-hidden` in the
+   * markup, headline carries the meaning. */
+  .spin {
+    display: inline-block; vertical-align: -0.125em;
+    width: 0.85em; height: 0.85em; margin-right: 0.45em;
+    border: 2px solid color-mix(in srgb, CanvasText 22%, transparent);
+    border-top-color: currentColor; border-radius: 50%;
+    animation: spin 0.75s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .spin { animation: none; border-top-color: color-mix(in srgb, CanvasText 22%, transparent); }
+  }
+  /* Load-bearing: `.spin`, `video` and `.note` set `display`, and any author
+   * display rule outranks the user-agent's own `[hidden]`. */
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main id="main">
+  <h1 id="phase" role="status" aria-live="polite"><span class="spin" id="spin" aria-hidden="true"></span><span id="phase-text">Opening from Autonomi…</span></h1>
+  <p class="sub" id="sub" role="status" aria-live="polite"></p>
+  <video id="player" controls autoplay playsinline hidden></video>
+  <p class="note" id="note" hidden>This tab plays on its own — the Anta-Vista tab can be closed.</p>
+</main>
+<script type="module">
+  window.__AV_SDK_BASE__ = "__SDK_BASE__";
+
+  const params = new URLSearchParams(location.search);
+  const address = params.get('address') || '';
+  const type = params.get('type') || '';
+  const name = (params.get('name') || 'media file').slice(0, 200);
+  const main = document.getElementById('main');
+  const spin = document.getElementById('spin');
+  const phaseText = document.getElementById('phase-text');
+  const sub = document.getElementById('sub');
+  const note = document.getElementById('note');
+  const player = document.getElementById('player');
+
+  /* Every message shown here is bounded: error text can carry a network peer's
+   * words, and an unbounded one would let a peer grow this page without limit —
+   * the progress page's clamp, for the same reason. `textContent` throughout. */
+  const msg = (err) => String((err && err.message) || err).slice(0, 240);
+  const fail = (message) => {
+    main.classList.add('failed');
+    spin.hidden = true;
+    phaseText.textContent = 'Playback could not start';
+    sub.textContent = String(message).slice(0, 240);
+  };
+  const step = (message) => {
+    phaseText.textContent = message;
+  };
+
+  const PHASES = {
+    initializing: 'Loading the Autonomi library',
+    connecting: 'Connecting to nodes',
+    lookup: 'Finding the nodes holding this file',
+    preparing: 'Preparing to fetch',
+    downloading: 'Transferring the file',
+  };
+  const fmt = (n) => {
+    if (!Number.isFinite(n)) return '';
+    if (n < 1024) return `${n} B`;
+    if (n < 1048576) return `${(n / 1024).toFixed(0)} KB`;
+    return `${(n / 1048576).toFixed(1)} MB`;
+  };
+  const onProgress = (event) => {
+    /* `complete` / `failed` are SDK *operation* boundaries, not the transfer the
+     * user is waiting for — letting one through would announce arrival while
+     * bytes are still moving. The SDK's own `message` is never shown: it is
+     * built from a peer's answers and narrates synthetic filenames. */
+    if (!event || event.phase === 'complete' || event.phase === 'failed') return;
+    const label = PHASES[event.phase] || 'Opening from Autonomi…';
+    const completed = Number(event.completed);
+    const total = Number(event.total);
+    step(
+      Number.isFinite(completed) && Number.isFinite(total) && total > 0
+        ? `${label} \u2014 ${fmt(completed)} of ${fmt(total)}`
+        : label
+    );
+  };
+
+  /* Teach the worker the MIME this link carries, before the first range request:
+   * the SDK reports application/octet-stream for most records and the worker
+   * serves audio/* and video/* only, so without this the route answers 400 and
+   * nothing plays. Acknowledged on the reply port, awaited before `video.src`. */
+  const teach = (sessionId, mime) =>
+    new Promise((resolve, reject) => {
+      const controller = navigator.serviceWorker.controller;
+      if (!controller) {
+        reject(new Error('the media worker is not controlling this page'));
+        return;
+      }
+      const channel = new MessageChannel();
+      const timer = setTimeout(() => {
+        reject(new Error('the media worker did not acknowledge the type'));
+      }, 5000);
+      channel.port1.onmessage = (event) => {
+        clearTimeout(timer);
+        try {
+          channel.port1.close();
+        } catch (_) {}
+        const reply = event.data;
+        if (reply && reply.ok) resolve();
+        else
+          reject(
+            new Error((reply && reply.error) || 'the media worker refused the type')
+          );
+      };
+      channel.port1.start();
+      controller.postMessage(
+        { type: 'av-media-type', sessionId, mime },
+        [channel.port2]
+      );
+    });
+
+  async function run() {
+    document.title = `${name} \u2014 Anta-Vista`;
+
+    if (!('serviceWorker' in navigator) || window.isSecureContext !== true) {
+      fail('This browser cannot stream media through a service worker.');
+      return;
+    }
+    /* The worker must control this page before anything can play: its media URL
+     * only exists inside an intercepted request. One reload, once — the same
+     * once-only guard the app's boot handshake uses, for a profile where control
+     * never lands. */
+    if (!navigator.serviceWorker.controller) {
+      if (sessionStorage.getItem('av-media-view-reloaded')) {
+        fail('The media worker is not controlling this tab. Reload it once by hand.');
+        return;
+      }
+      sessionStorage.setItem('av-media-view-reloaded', '1');
+      location.reload();
+      return;
+    }
+
+    /* The block list before any bytes, asked exactly as the row asks it: a
+     * browser WebRTC fetch reaches no route of ours, so this question cannot be
+     * answered from inside the transfer. Every failure — the refusal itself, an
+     * unreadable list, a server that is gone — ends the run: a fetch fails
+     * closed, and this one is about to fetch. */
+    try {
+      const res = await fetch(
+        '/api/blocked?location=' + encodeURIComponent('autonomi://' + address)
+      );
+      const body = await res.json().catch(() => null);
+      if (!res.ok || !body || body.ok === false) {
+        fail((body && body.detail) || 'The local block list could not be checked.');
+        return;
+      }
+    } catch (err) {
+      fail('The Anta-Vista server did not answer, so nothing will be fetched.');
+      return;
+    }
+
+    step('Loading the Autonomi library (about 5 MB, once)');
+    let mod;
+    try {
+      mod = await import(window.__AV_SDK_BASE__ + 'index.js');
+    } catch (err) {
+      fail(`The Autonomi browser library could not be loaded: ${msg(err)}`);
+      return;
+    }
+
+    let client;
+    try {
+      client = await mod.AutonomiClient.connect({ onProgress });
+    } catch (err) {
+      fail(`Could not connect to the Autonomi network: ${msg(err)}`);
+      return;
+    }
+
+    const openStream = () =>
+      client.createMediaSource(address, {
+        serviceWorkerUrl: '/autonomi-stream-sw.js',
+        onProgress,
+      });
+    let source;
+    try {
+      source = await openStream();
+    } catch (err) {
+      /* One retry on a fresh connection: a connection can outlive the link under
+       * it, exactly as the dialog's player retries once — and a stop still beats
+       * the retry, because this page has no stop of its own to get in front of it. */
+      step('The player could not connect; trying once more…');
+      try {
+        client = await mod.AutonomiClient.connect({ onProgress });
+        source = await openStream();
+      } catch (err2) {
+        fail(`The player could not open this file: ${msg(err2)}`);
+        return;
+      }
+    }
+
+    const match = /__autonomi_stream\/([0-9a-f]{32})\//.exec(
+      String(source.url || '')
+    );
+    if (!match) {
+      try {
+        source.close();
+      } catch (_) {}
+      fail('The media URL was not recognised.');
+      return;
+    }
+    try {
+      await teach(match[1], type);
+    } catch (err) {
+      try {
+        source.close();
+      } catch (_) {}
+      fail(`The worker did not accept this file type: ${msg(err)}`);
+      return;
+    }
+
+    /* This page owns its session now, so it keeps the worker's idle clock itself:
+     * a silent worker mid-playback is a Firefox kill that takes the stream with
+     * it. The dialog in the Anta-Vista tab pings for itself; neither page knows
+     * about the other, and neither needs to. */
+    const ping = setInterval(() => {
+      const controller = navigator.serviceWorker.controller;
+      if (!controller) return;
+      try {
+        controller.postMessage({ type: 'av-ping' });
+      } catch (_) {}
+    }, 10000);
+    window.addEventListener('pagehide', () => clearInterval(ping), { once: true });
+
+    player.addEventListener(
+      'loadedmetadata',
+      () => {
+        player.hidden = false;
+        note.hidden = false;
+      },
+      { once: true }
+    );
+    player.addEventListener(
+      'playing',
+      () => {
+        spin.hidden = true;
+        step('Playing');
+        sub.textContent = '';
+      },
+      { once: true }
+    );
+    player.addEventListener(
+      'error',
+      () => {
+        main.classList.add('failed');
+        spin.hidden = true;
+        phaseText.textContent = 'Playback hit an error';
+        sub.textContent =
+          'The network stopped delivering this file. Close this tab and open it again from Anta-Vista.';
+      },
+      { once: true }
+    );
+
+    player.src = source.url;
+    try {
+      await player.play();
+    } catch (_) {
+      /* Autoplay without a fresh gesture is not owed to anyone. The controls are
+       * right there, and the video shows itself once its metadata arrives. */
+      spin.hidden = true;
+      sub.textContent = 'Press play to start.';
+    }
+  }
+
+  if (!/^[0-9a-f]{64}$/u.test(address)) {
+    fail('This link does not contain a valid Autonomi address.');
+  } else if (!/^(audio|video)\//i.test(type)) {
+    fail('This link does not name an audio or video file.');
+  } else {
+    run();
+  }
 </script>
 </body>
 </html>

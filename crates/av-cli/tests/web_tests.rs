@@ -1786,6 +1786,7 @@ fn the_inline_media_player_streams_and_saves_through_the_worker() {
         "id=\"media-dialog\"",
         "id=\"media-player\"",
         "id=\"media-save\"",
+        "id=\"media-open-tab\"",
     ] {
         assert!(page.body.contains(needle), "the page is missing {needle}");
     }
@@ -5752,5 +5753,214 @@ fn an_install_triggered_by_an_index_offers_to_finish_that_index() {
     assert!(
         js[open..run].contains("ui.dialogClose.textContent = 'Cancel'"),
         "opening the dialog again restores Cancel for the consent phase"
+    );
+}
+
+#[test]
+fn the_row_spinner_marks_a_fetch_that_has_not_landed_yet() {
+    // The status line beside it can sit on one sentence for the seconds an
+    // Autonomi lookup takes, and a line of text alone reads as nothing
+    // happening — the progress tab carries its own copy of this spinner for
+    // the same reason. Decorative (`aria-hidden`; the status line carries the
+    // meaning), shown and hidden exactly once per open from `openView` — not
+    // from setBusy, which blinks off during the plan phase while bytes are
+    // very much still to come.
+    let s = server();
+
+    // Every row template carries it, starting hidden.
+    assert!(
+        s.get("/")
+            .body
+            .contains(r#"<span class="row-spin" hidden aria-hidden="true"></span>"#),
+        "the row template must carry a spinner that starts hidden"
+    );
+
+    // An author `display` rule — which is exactly why the global [hidden]
+    // guard has to stay `!important` — plus the animation, and the file's
+    // existing global reduced-motion rule taking it back.
+    let css = &s.get("/assets/modern.css").body;
+    let rule = css_rule(css, ".row-spin").expect("modern.css needs a .row-spin rule");
+    assert!(
+        rule.contains("display: inline-block") && rule.contains("animation: av-row-spin"),
+        ".row-spin must set both display and animation, or it is either invisible \
+         while shown or never moves; got: {rule}"
+    );
+    let guard = css_rule(css, "[hidden]").expect("modern.css needs a [hidden] rule");
+    assert!(
+        guard.contains("display: none") && guard.contains("!important"),
+        "the [hidden] guard is what hides .row-spin against its own display rule; \
+         got: {guard}"
+    );
+    assert!(
+        css.contains(
+            "@media (prefers-reduced-motion: reduce) {\n  * {\n    animation: none !important;"
+        ),
+        "the global reduced-motion rule already stops every animation; a second \
+         block for the row spinner would be redundant — unless this one is gone"
+    );
+
+    // One show before the open, one hide once it settles, both in openView —
+    // the inFlight promise is already exactly "an open is running".
+    let js = js_code(&s.get("/assets/app.js").body);
+    let view = js
+        .split("const openView = (statusEl)")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("const loc = node.querySelector('.result-loc')")
+                .next()
+        })
+        .expect("openView is gone");
+    assert_eq!(
+        view.matches("rowSpin.hidden = false").count(),
+        1,
+        "the spinner must be shown from exactly one site"
+    );
+    assert_eq!(
+        view.matches("rowSpin.hidden = true").count(),
+        1,
+        "and hidden from exactly one site"
+    );
+    let show = view
+        .find("rowSpin.hidden = false")
+        .expect("show site missing");
+    let settle = view
+        .find("inFlight = runOpen(statusEl).finally(() => {")
+        .expect("openView no longer settles through runOpen's finally");
+    assert!(
+        show < settle,
+        "the spinner must start with the open it belongs to: {view}"
+    );
+    assert!(
+        view.contains("inFlight = null;\n      rowSpin.hidden = true;"),
+        "the hide must be inside the same finally that clears inFlight, or a \
+         later open inherits a spinner from the last one: {view}"
+    );
+}
+
+#[test]
+fn the_media_dialog_can_send_playback_to_another_tab() {
+    // The tab is opened *synchronously in the click* (a popup after an await
+    // has no gesture and browsers block it), the dialog closes only once the
+    // tab exists (a blocked popup leaves the player right here with the reason
+    // on its status line), and the opener is severed by hand — `noopener`
+    // would return null and lose the handle we just asked for.
+    let s = server();
+    let js = js_code(&s.get("/assets/app.js").body);
+
+    let handler = js
+        .split("ui.mediaOpenTab.addEventListener('click'")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfunction wireFetch").next())
+        .expect("the open-in-another-tab handler is gone");
+    let open = handler
+        .find("window.open('/media-view?'")
+        .expect("the handler must open the player page");
+    let blocked = handler
+        .find("if (!tab)")
+        .expect("the popup must be checked");
+    let sever = handler
+        .find("tab.opener = null")
+        .expect("the opener must be severed by hand");
+    let close = handler
+        .find("ui.mediaDialog.close()")
+        .expect("the dialog must close after the tab exists");
+    assert!(
+        open < blocked && blocked < sever && sever < close,
+        "open, popup check, sever, close — in that order; got: {handler}"
+    );
+    assert!(
+        handler[blocked..sever].contains("return;"),
+        "a blocked popup must leave this dialog open: {handler}"
+    );
+    assert!(
+        handler.contains("if (!session || ui.mediaOpenTab.disabled) return;"),
+        "the button must do nothing without a session: {handler}"
+    );
+
+    // Like Save, it lights up only when a session lands.
+    let player = js
+        .split("async function startPlayer")
+        .nth(1)
+        .and_then(|rest| rest.split("\nui.mediaSave.addEventListener").next())
+        .expect("startPlayer is gone");
+    assert!(
+        player.contains("ui.mediaOpenTab.disabled = false;"),
+        "the tab button must be enabled with the session it opens: {player}"
+    );
+}
+
+#[test]
+fn the_media_player_page_reflects_nothing_and_plays_on_its_own() {
+    // `/media-view` is the tab's whole world: it loads the vendored SDK, asks
+    // the block list the same question the row asks (fail closed), teaches the
+    // worker its type, pings for the life of the session, and plays from its
+    // own stream — so it survives the Anta-Vista tab being closed. The server
+    // reflects *nothing* from the query: the page takes every value from its
+    // own script, which is why a hostile query must not change a byte.
+    let s = server();
+    let hostile = s.get(
+        "/media-view?address=0000000000000000000000000000000000000000000000000000000000000000\
+         &type=video/mp4&name=%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+    );
+    assert_eq!(hostile.status, 200, "the player page is missing");
+    let page = s.get("/media-view").body;
+    assert_eq!(
+        hostile.body, page,
+        "a query must not change one byte of this page — it reflects nothing"
+    );
+    assert!(
+        !page.contains("/assets/app.js"),
+        "the player is standalone: no app.js, no app shell"
+    );
+    for needle in [
+        // The boot global, substituted with the trusted constant — the same
+        // pin the vendored-SDK test keeps on the main page.
+        r#"window.__AV_SDK_BASE__ = "/assets/vendor/autonomi-sdk/0.1.2/";"#,
+        // The flow itself: block check, SDK, session, teach, keepalive.
+        "'/api/blocked?location='",
+        "AutonomiClient.connect",
+        "createMediaSource",
+        "'av-media-type'",
+        "'av-ping'",
+        // Validation before use: a bare address, and a media type.
+        r"/^[0-9a-f]{64}$/u.test(address)",
+        r"/^(audio|video)\//i.test(type)",
+        // The once-only reload that gets a stray page under worker control.
+        "'av-media-view-reloaded'",
+        // Its own spinner and its own player.
+        r#"id="player""#,
+        "class=\"spin\"",
+    ] {
+        assert!(page.contains(needle), "the player page is missing {needle}");
+    }
+}
+
+#[test]
+fn the_worker_lets_its_own_player_page_load_controlled() {
+    // The media route only exists for a *controlled* document — an
+    // uncontrolled `/media-view` would fall through to the server's 404 and
+    // the SDK bridge would give up waiting for control after ten seconds. So
+    // the worker answers that one navigation with the request itself, byte
+    // for byte (Host guard and all), and nothing else about the page comes
+    // near the worker: its script and assets pass to the network as usual.
+    let js = js_code(&server().get("/autonomi-stream-sw.js").body);
+    let fetch_start = js
+        .find("addEventListener('fetch'")
+        .expect("the worker's fetch listener is gone");
+    let listener = &js[fetch_start..];
+    let passthrough = listener
+        .find("url.pathname === '/media-view'")
+        .expect("the player page's navigation arm is gone");
+    let marker = listener
+        .find("STREAM_MARKER")
+        .expect("the media route arm is gone");
+    assert!(
+        passthrough < marker,
+        "the player-page arm must come before the media arm it exists to feed"
+    );
+    assert!(
+        listener.contains("event.respondWith(fetch(event.request));"),
+        "the arm must answer with the request itself so the document lands \
+         controlled"
     );
 }

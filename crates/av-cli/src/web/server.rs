@@ -210,6 +210,11 @@ fn route(
         // and it holds no peer bytes — those stay on the viewer port, so a second
         // origin still separates them from `/api/*`.
         (Method::Get, "/view/progress") => Ok(render::view_progress_page()),
+        // The media player's own tab. Static like `/view/error` — it reflects
+        // nothing from the query — but it loads the vendored SDK and opens its
+        // own stream, so it needs the worker (same origin) to control it at load
+        // via the `/media-view` passthrough in `autonomi-stream-sw.js`.
+        (Method::Get, "/media-view") => Ok(render::media_view_page()),
 
         (Method::Post, p) => {
             // Binary bodies are dispatched *before* the UTF-8 read below, which

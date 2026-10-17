@@ -199,11 +199,16 @@ When the browser can display a record (and it fits under the viewer cap of
 32 MiB), the whole file is fetched into memory, uploaded to the server's viewer
 and held as a Blob — the viewer path is a whole-file viewer by design.
 
-Large files the browser *cannot* display are different: the download now streams
-to disk through a service worker, one chunk at a time, so the page never holds
-the file. Audio and video likewise stream through the same worker into the
-inline player. A browser without service-worker support (or one that refused the
-registration) falls back to the buffered path for both.
+Large files the browser *cannot* display are different: the click assembles a
+Blob and downloads it through an object URL whenever the file fits under a
+512 MiB cap (`SAVE_BUFFER_CAP`) — the flow every browser completes, because
+Firefox tears a service-worker download body down before a byte arrives. Past
+the cap — the case memory cannot survive — the download streams to disk through
+a service worker instead, one chunk at a time, and a browser without
+service-worker support (or one that refused the registration) buffers anyway
+rather than failing the save. Audio and video play through the same worker into
+the inline player; without it, they fall through to the save and viewer paths
+above.
 
 Indexing still costs roughly the file's size in RAM: the upload spools to a
 temporary file on the server side so the body cap is enforced without reading

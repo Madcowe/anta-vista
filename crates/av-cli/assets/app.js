@@ -107,6 +107,7 @@ const ui = {
   mediaPlayer: el('media-player'),
   mediaStatus: el('media-status'),
   mediaSave: el('media-save'),
+  mediaOpenTab: el('media-open-tab'),
   dialogRun: el('install-run'),
 };
 
@@ -1446,6 +1447,7 @@ async function startPlayer({ address, location, plan, onProgress, statusEl }) {
   ui.mediaTitle.textContent = mediaSession.filename;
   ui.mediaStatus.textContent = '';
   ui.mediaSave.disabled = false;
+  ui.mediaOpenTab.disabled = false;
   ui.mediaPlayer.src = source.url;
   if (!ui.mediaDialog.open) ui.mediaDialog.show();
   setStatus(
@@ -1574,6 +1576,38 @@ ui.mediaSave.addEventListener('click', async () => {
     if (waiting !== null) clearInterval(waiting);
     ui.mediaSave.disabled = false;
   }
+});
+
+/* Send playback to a tab of its own — `/media-view`, a standalone player that
+ * opens its *own* stream: its own SDK client, its own worker session, its own
+ * `av-ping` keepalive. That is what makes closing this dialog (and everything
+ * behind it) cost the tab nothing: it re-fetches the file like any fresh open,
+ * rather than borrowing bytes from this page, so it can outlive us — and it
+ * plays while this page is used for something else.
+ *
+ * Order is load-bearing. `window.open` runs first, synchronously in the click,
+ * because a popup after an await has no gesture and browsers block it; the
+ * dialog closes only once the tab exists, so a blocked popup leaves the player
+ * right here with the reason on its status line. The opener is severed by hand
+ * afterwards — `noopener` would make `window.open` return `null` and lose the
+ * handle we just asked for — and the tab never needs it: it plays from its own
+ * session, unlike the progress tab's one-way handshake (cutOpener). */
+ui.mediaOpenTab.addEventListener('click', () => {
+  const session = mediaSession;
+  if (!session || ui.mediaOpenTab.disabled) return;
+  const query = new URLSearchParams({
+    address: session.address,
+    type: session.mime || session.source.file.contentType || '',
+    name: session.filename,
+  });
+  const tab = window.open('/media-view?' + query.toString(), '_blank');
+  if (!tab) {
+    ui.mediaStatus.textContent =
+      'Your browser blocked the new tab. Allow pop-ups for this page, then try again.';
+    return;
+  }
+  tab.opener = null;
+  ui.mediaDialog.close();
 });
 
 /* Wire the fetch/open flow for one Autonomi result row: the location is the
@@ -2045,10 +2079,19 @@ function wireFetch(node, result, statusEl) {
    * download. A repeat after the fetch finishes is a fresh open, as it should
    * be. */
   let inFlight = null;
+  /* The row's spinner for the length of one open. The status line can sit on
+   * one sentence while the network is looked up, and a line of text alone
+   * reads as nothing happening. Shown once when the open starts and hidden
+   * once when it settles — `inFlight` already means "an open is running", so
+   * a repeat click returns the same promise and cannot double-toggle it.
+   * Decorative: `aria-hidden` in the markup, status line carries the meaning. */
+  const rowSpin = node.querySelector('.row-spin');
   const openView = (statusEl) => {
     if (inFlight) return inFlight;
+    rowSpin.hidden = false;
     inFlight = runOpen(statusEl).finally(() => {
       inFlight = null;
+      rowSpin.hidden = true;
     });
     return inFlight;
   };

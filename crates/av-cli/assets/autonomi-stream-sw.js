@@ -201,6 +201,16 @@ self.addEventListener('message', (event) => {
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
+  /* The standalone media-player page. Responding to its navigation — with the
+   * request itself, byte for byte — is what lands the new document as *our*
+   * client: an uncontrolled page's media URL falls through to the server's 404,
+   * and the SDK's bridge then spends ten seconds waiting for control that never
+   * comes. Nothing else about the page comes near here; its script and assets
+   * pass to the network below as usual, Host guard included. */
+  if (url.pathname === '/media-view') {
+    event.respondWith(fetch(event.request));
+    return;
+  }
   if (url.pathname.startsWith('/av-download/')) {
     if (event.request.method !== 'GET') return;
     const token = url.pathname.slice('/av-download/'.length);
