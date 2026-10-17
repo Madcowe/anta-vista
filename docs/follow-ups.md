@@ -115,3 +115,68 @@ treat the 0.15 slot as reserved until identity cost exists.
 - If origins are captured on propagate only, is a resource the user never acted
   on permanently unattributable? That seems acceptable, but it should be
   documented rather than discovered.
+
+---
+
+## Propagation adopts a peer's content hash without ever seeing the content
+
+**Status:** open
+**Affects:** `av-cli` propagate/reinforce, `av listen` serving, resource blocks
+
+### Problem
+
+`propagate_resource` (`crates/av-cli/src/cmd/propagate.rs`) stores a
+`ResourceDescriptor` whose `id` is the caller's `resource_id` — and for the
+interactive search prompt, the web rating handler and `av propagate` alike,
+that id is the one a peer advertised alongside its search response. The
+bytes are never fetched, so nothing ever checks the claim:
+`resources.id` is documented as a SHA-256 content hash (`av-store`'s blocks
+repo), but the only place a hash is actually computed from content is
+`ingest_bytes` (`crates/av-ingest/src/ingest.rs`), which the propagate path
+does not use. The stored row then carries embeddings, so
+`to_publishable_resources` (`crates/av-cli/src/cmd/listen.rs`) serves it:
+the unverified id and description leave this node re-stamped as local
+knowledge.
+
+Consequences today:
+
+- A single peer — or one already-propagated row — can inject an id that does
+  not match the bytes at the location, and every node that reinforces the
+  result adopts the same claim. No point in the pipeline can notice, because
+  no point ever sees the content.
+- A later `av index` of the real bytes dedups by location (`cmd/index.rs`,
+  Step 4) and reports `duplicate: true` without touching the id, so the
+  wrong hash sticks at that location until `av index --force`.
+- The id-keyed half of the block system keys on the same unverifiable value.
+  The location-keyed walk-around — a peer advertising a blocked location
+  under a different id — is now closed inside `propagate_resource` (it
+  checks `blocked_locations` as well as the id, fail-closed), but a block
+  placed on a propagated id still corresponds to no content hash.
+
+### Proposed direction
+
+Either verify or mark-and-withhold, not silence:
+
+1. **Verify on propagation.** Download the bytes before adopting the id and
+   recompute the hash; a mismatch is a peer lying and should be treated as
+   one (drop the result, and consider the location suspect). This makes
+   propagate expensive — it is deliberately a local metadata copy today —
+   and it needs the daemon/browser fetch machinery at rating time.
+2. **Mark rows as unverified and withhold them from the responder.**
+   `metadata_json` already records `"propagated": true`; teach
+   `to_publishable_resources` to leave those rows out of search responses
+   until a real `av index` of the location has replaced the id with a hash
+   computed from bytes. Keeps the local copy for search and rating, and
+   stops the unverifiable claim from being re-stamped by us.
+
+The second is the cheaper of the two and preserves the metadata-copy design
+of reinforce; the first is the only one that ever turns a propagated id into
+a verified one without requiring the user to re-index.
+
+### Open questions
+
+- Should the interactive search prompt and the web rating button say that a
+  reinforced network result stays unverified until it is indexed?
+- If verification-on-propagate is chosen, should it reuse the browser-side
+  Autonomi fetch that indexing already has, or refuse to propagate
+  Autonomi-only when no daemon is available?

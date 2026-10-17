@@ -655,6 +655,53 @@ fn propagate_still_works_for_an_unblocked_resource() {
 }
 
 #[test]
+fn a_blocked_location_cannot_be_reintroduced_under_a_different_id() {
+    let _guard = env_lock();
+    let (_dir, conn) = setup_with_populated_resource("res-real");
+    let provider = MockEmbeddingProvider::new();
+    let state = offline_state();
+
+    // Delete the local copy, as `av block` does by default: the id the next
+    // check would consult is now gone from `resources`, and the peer's
+    // advertised id is a different string entirely.
+    block::block_subject(
+        &conn,
+        &state,
+        BlockKind::Resource,
+        "res-real",
+        None,
+        /* keep_local = */ false,
+        false,
+        "test",
+    )
+    .unwrap();
+
+    // Same location the block recorded, different (peer-claimed) id. An
+    // id-only guard sails straight past this; the location check must not,
+    // or the resource is back in the index and back on `av listen`.
+    let err = av_cli::cmd::propagate::propagate_resource(
+        &conn,
+        &provider,
+        "res-peer-claimed",
+        "autonomi://deadbeef",
+        "A description that would re-embed this resource.",
+        "text/plain",
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("blocked"),
+        "the error should say the location is blocked, got: {msg}"
+    );
+    assert!(
+        av_store::repo::resources::get(&conn, "res-peer-claimed")
+            .unwrap()
+            .is_none(),
+        "nothing may be inserted for a blocked location"
+    );
+}
+
+#[test]
 fn the_block_and_unblock_commands_run_offline_end_to_end() {
     let _guard = env_lock();
     let (_dir, conn) = setup_with_populated_resource("res-e2e");

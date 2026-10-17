@@ -88,6 +88,33 @@ pub fn propagate_resource(
         )));
     }
 
+    // The id check above is not enough on its own. A resource block deletes
+    // the local row by default and keys on the resource id — and the id a
+    // peer advertises here may not be the blocked one (propagate adopts the
+    // peer's claimed content hash verbatim, and nothing has verified it
+    // against the bytes). A block also records the location in
+    // `blocked_locations` for exactly this reason, so check the location
+    // spellings too, the canonical one included for the same reason
+    // `record_blocked_locations` writes both. Without this, rating a result
+    // whose location was blocked but whose advertised id differs would
+    // re-insert the resource and put it back on `av listen`.
+    //
+    // Fails closed like every other block read on a serving path: an
+    // unreadable list is not evidence that the location is allowed.
+    let canonical = av_ingest::location::analyze_location(location).canonical;
+    let spellings = std::iter::once(location)
+        .chain(canonical.as_deref().filter(|c| *c != location));
+    for spelling in spellings {
+        if av_store::repo::blocks::is_location_blocked(conn, spelling).map_err(|e| {
+            CliError::Database(format!("could not read the location block list: {e}"))
+        })? {
+            return Err(CliError::Validation(format!(
+                "location {location} is blocked on this machine; lift the block with \
+                 'av unblock --resource <id>' for the blocked resource first"
+            )));
+        }
+    }
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
