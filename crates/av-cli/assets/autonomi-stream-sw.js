@@ -104,6 +104,20 @@ const MAX_STREAM_FILE_BYTES = 1000000000;
 const mediaTypes = new Map();
 const MEDIA_TYPES_MAX = 32;
 
+/* The page that owns each media session — the one whose MediaBridge answers
+ * range requests. Recorded from the `av-media-type` teach, whose sender is
+ * that page. A playback tab handed the session (the dialog's "Open in
+ * another tab") asks *this* client for bytes, not itself: the tab has no
+ * bridge of its own, so asking it would time out against a page that cannot
+ * answer. Bounded with mediaTypes, evicted in step with it. */
+const mediaHosts = new Map();
+
+/* Sessions a page retired mid-playback (`av-media-drop`): its reader is
+ * closed, so the next range request would wait out the 45 s range timeout
+ * against silence. A retired session 404s at once instead. */
+const retiredSessions = new Map();
+const RETIRED_MAX = 64;
+
 /* The only Content-Types this worker will ever serve on the media route.
  * Deliberately narrow: same-origin bytes with a document type would be an
  * XSS hole the peer controls. */
@@ -191,22 +205,45 @@ self.addEventListener('message', (event) => {
       return;
     }
     if (!mediaTypes.has(sessionId) && mediaTypes.size >= MEDIA_TYPES_MAX) {
-      mediaTypes.delete(mediaTypes.keys().next().value);
+      const oldest = mediaTypes.keys().next().value;
+      mediaTypes.delete(oldest);
+      mediaHosts.delete(oldest);
     }
     mediaTypes.set(sessionId, mime);
+    /* The teach's sender is the page whose reader feeds this session — the
+     * host. Recorded so a handed-off player tab's range requests are routed
+     * back here rather than at the tab, which has no bridge. */
+    if (event.source && event.source.id) {
+      mediaHosts.set(sessionId, event.source.id);
+    }
     reply(true);
+  }
+  if (msg.type === 'av-media-drop') {
+    /* The page that owns a session is retiring it — the row was blocked or
+     * removed, or a replacement landed. Forget the session here so the next
+     * range request fails at once with a named reason instead of waiting out
+     * the range timeout against a reader that is already closed. */
+    const sessionId = typeof msg.sessionId === 'string' ? msg.sessionId : '';
+    if (!/^[0-9a-f]{32}$/u.test(sessionId)) return;
+    mediaTypes.delete(sessionId);
+    mediaHosts.delete(sessionId);
+    if (!retiredSessions.has(sessionId) && retiredSessions.size >= RETIRED_MAX) {
+      retiredSessions.delete(retiredSessions.keys().next().value);
+    }
+    retiredSessions.set(sessionId, true);
   }
 });
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
-  /* The standalone media-player page. Responding to its navigation — with the
-   * request itself, byte for byte — is what lands the new document as *our*
-   * client: an uncontrolled page's media URL falls through to the server's 404,
-   * and the SDK's bridge then spends ten seconds waiting for control that never
-   * comes. Nothing else about the page comes near here; its script and assets
-   * pass to the network below as usual, Host guard included. */
+  /* The standalone media-player page — the tab the dialog's "Open in another
+   * tab" sends playback to. Responding to its navigation — with the request
+   * itself, byte for byte — is what lands the new document as *our* client:
+   * an uncontrolled page's media URL falls through to the server's 404, and
+   * the player would find nothing to play. Nothing else about the page comes
+   * near here; its script and assets pass to the network below as usual, Host
+   * guard included. */
   if (url.pathname === '/media-view') {
     event.respondWith(fetch(event.request));
     return;
@@ -384,6 +421,12 @@ async function handleStreamRequest(event, url) {
   ) {
     return new Response('Invalid Autonomi stream URL', { status: 400 });
   }
+  if (retiredSessions.has(sessionId)) {
+    /* The page retired this session (`av-media-drop`): its reader is gone,
+     * so there are no more bytes to ask for. Fail at once rather than
+     * starting a stream whose first pull times out. */
+    return new Response('This media session has been retired', { status: 404 });
+  }
   if (!contentType) {
     /* Patched: this route serves audio and video, and nothing else — a
      * document type here would be same-origin bytes a peer controls. */
@@ -498,13 +541,36 @@ function parseRange(header, size) {
 }
 
 async function requestRangeFromPage(clientId, sessionId, start, length) {
-  let client = clientId ? await self.clients.get(clientId) : undefined;
-  if (!client) {
-    const candidates = await self.clients.matchAll({
-      type: 'window',
-      includeUncontrolled: true,
-    });
-    client = candidates[0];
+  let client;
+  const hostId = mediaHosts.get(sessionId);
+  if (hostId) {
+    /* A handed-off session: the bytes come from the host page that owns the
+     * reader, not from whoever is asking. If that page is gone — closed,
+     * crashed, navigated — there is nothing to ask: say so at once, and say
+     * it *to the player tab*, whose own error handler cannot tell a dead
+     * host from any other stream failure and whose user will ask exactly
+     * that question. */
+    client = await self.clients.get(hostId);
+    if (!client) {
+      if (clientId) {
+        try {
+          const requester = await self.clients.get(clientId);
+          if (requester) {
+            requester.postMessage({ type: 'av-media-host-gone', sessionId });
+          }
+        } catch (_) {}
+      }
+      throw new Error('The Anta-Vista tab that was feeding this media has closed');
+    }
+  } else {
+    client = clientId ? await self.clients.get(clientId) : undefined;
+    if (!client) {
+      const candidates = await self.clients.matchAll({
+        type: 'window',
+        includeUncontrolled: true,
+      });
+      client = candidates[0];
+    }
   }
   if (!client) throw new Error('No browser page is available to serve the file range');
 

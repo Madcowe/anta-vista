@@ -1338,16 +1338,100 @@ function teachMediaType(sessionId, mime) {
  * unreachable while its file plays. */
 let mediaSession = null;
 
+/* The session the player tab is feeding from, once the dialog has handed it
+ * over. Distinct from `mediaSession` — the handoff clears that, because the
+ * tab is now the consumer and the dialog's element has let go of the stream
+ * — and this is what keeps the reader, the keepalive and the worker's idle
+ * clock alive across the dialog's close. One at a time: handing a second tab
+ * retires the first's session, exactly as a second `startPlayer` replaces the
+ * dialog's own. */
+let handedSession = null;
+
+/* The browser's own "Leave site?" prompt, armed only while a handoff is
+ * live: closing or refreshing *this* page stops playback in the tab, and the
+ * prompt — no custom text, the browser forbids any — is the only warning a
+ * closing page gets to give. Never installed at rest, so it never nags a
+ * page with nothing to lose. */
+let beforeUnloadWhileHandoff = null;
+
+/* How the player tab says goodbye. `window.opener` is severed by rule, so
+ * this is the one channel between the two pages: the tab posts `closed` on
+ * its pagehide — closing it, refreshing it, navigating away — and that is
+ * what lets the reader and the keepalive go without waiting for the block
+ * path to notice. */
+let handoffChannel = null;
+
+const HANDOFF_CHANNEL = 'av-media-view';
+
+/* Retire a handed-off session: close the reader, tell the worker it is
+ * retired (so the tab's next range request 404s at once instead of waiting
+ * out the 45 s timeout against a silent host), take down the leave-prompt,
+ * and — only when nothing else is playing — release the keepalive. */
+function dropHandoff() {
+  const handed = handedSession;
+  handedSession = null;
+  if (beforeUnloadWhileHandoff) {
+    window.removeEventListener('beforeunload', beforeUnloadWhileHandoff);
+    beforeUnloadWhileHandoff = null;
+  }
+  if (!handed) return;
+  try {
+    handed.source.close();
+  } catch (_) {}
+  const controller =
+    navigator.serviceWorker && navigator.serviceWorker.controller;
+  if (controller && handed.sid) {
+    try {
+      controller.postMessage({ type: 'av-media-drop', sessionId: handed.sid });
+    } catch (_) {}
+  }
+  if (!mediaSession) keepaliveRemove('media');
+}
+
+/* Hear the player tab's goodbye, and arm the leave-prompt for as long as a
+ * handoff is live. BroadcastChannel is broadcast to every same-origin context
+ * that has one open, so the host and the tab find each other without ever
+ * holding a handle to one another. */
+function armHandoff() {
+  if (!handoffChannel && 'BroadcastChannel' in window) {
+    handoffChannel = new BroadcastChannel(HANDOFF_CHANNEL);
+    handoffChannel.onmessage = (event) => {
+      const msg = event.data;
+      if (
+        msg &&
+        msg.type === 'closed' &&
+        handedSession &&
+        msg.sid === handedSession.sid
+      ) {
+        dropHandoff();
+      }
+    };
+  }
+  if (!beforeUnloadWhileHandoff) {
+    beforeUnloadWhileHandoff = (event) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', beforeUnloadWhileHandoff);
+  }
+}
+
 /* Synchronous teardown, idempotent: null the session first so a second call
- * (or a late close event) finds nothing to close. */
+ * (or a late close event) finds nothing to close.
+ *
+ * A session that has been handed to the player tab is *spared* — the tab is
+ * feeding from its reader right now, and closing it here would stop playback
+ * in the other tab. The keepalive stays too while any handoff is live, for
+ * the same reason; `dropHandoff` releases both when the tab lets go. */
 function teardownPlayer() {
   const session = mediaSession;
   mediaSession = null;
-  keepaliveRemove('media');
   ui.mediaPlayer.pause();
   ui.mediaPlayer.removeAttribute('src');
   ui.mediaPlayer.load(); // releases the fetch behind the old src
   ui.mediaStatus.textContent = '';
+  if (session && session.handedOff) return;
+  if (!handedSession) keepaliveRemove('media');
   if (session) {
     try {
       session.source.close();
@@ -1376,8 +1460,12 @@ ui.mediaPlayer.addEventListener('error', () => {
 
 /* Stop playback of `location` if that is what is playing. Blocking or
  * removing a resource out from under a player that is streaming it would
- * otherwise keep the bytes arriving after the row is gone. */
+ * otherwise keep the bytes arriving after the row is gone. A handed-off
+ * session is not spared here: the block is the user saying this file stops
+ * now, wherever it is playing — the player tab hears it as the worker's
+ * retired-session 404 and says so on its own line. */
 function closePlayerIf(location) {
+  if (handedSession && handedSession.location === location) dropHandoff();
   if (!mediaSession || mediaSession.location !== location) return;
   if (ui.mediaDialog.open) ui.mediaDialog.close(); // → 'close' → teardown
   else teardownPlayer();
@@ -1578,20 +1666,22 @@ ui.mediaSave.addEventListener('click', async () => {
   }
 });
 
-/* Send playback to a tab of its own — `/media-view`, a standalone player that
- * opens its *own* stream: its own SDK client, its own worker session, its own
- * `av-ping` keepalive. That is what makes closing this dialog (and everything
- * behind it) cost the tab nothing: it re-fetches the file like any fresh open,
- * rather than borrowing bytes from this page, so it can outlive us — and it
- * plays while this page is used for something else.
+/* Send playback to a tab of its own — `/media-view`, a standalone player
+ * that rides *this page's* live session: the worker is taught to route its
+ * range requests back to the host's MediaBridge, so the tab plays the
+ * transfer already in flight rather than paying for a second one. That is
+ * what makes closing this dialog cost the tab nothing — but the Anta-Vista
+ * tab itself must stay open while the tab plays, and both pages say so: the
+ * prompt below on close, the worker's fail-fast if the close happens anyway.
  *
- * Order is load-bearing. `window.open` runs first, synchronously in the click,
- * because a popup after an await has no gesture and browsers block it; the
- * dialog closes only once the tab exists, so a blocked popup leaves the player
- * right here with the reason on its status line. The opener is severed by hand
- * afterwards — `noopener` would make `window.open` return `null` and lose the
- * handle we just asked for — and the tab never needs it: it plays from its own
- * session, unlike the progress tab's one-way handshake (cutOpener). */
+ * Order is load-bearing. `window.open` runs first, synchronously in the
+ * click, because a popup after an await has no gesture and browsers block
+ * it; the dialog closes only once the tab exists, so a blocked popup leaves
+ * the player right here with the reason on its status line — and nothing has
+ * been detached yet at that point, so the restore is free. The opener is
+ * severed by hand afterwards — `noopener` would make `window.open` return
+ * `null` and lose the handle we just asked for — and the tab never needs it:
+ * the session reaches it through the worker, not through us. */
 ui.mediaOpenTab.addEventListener('click', () => {
   const session = mediaSession;
   if (!session || ui.mediaOpenTab.disabled) return;
@@ -1599,6 +1689,7 @@ ui.mediaOpenTab.addEventListener('click', () => {
     address: session.address,
     type: session.mime || session.source.file.contentType || '',
     name: session.filename,
+    url: session.source.url,
   });
   const tab = window.open('/media-view?' + query.toString(), '_blank');
   if (!tab) {
@@ -1606,8 +1697,25 @@ ui.mediaOpenTab.addEventListener('click', () => {
       'Your browser blocked the new tab. Allow pop-ups for this page, then try again.';
     return;
   }
+  /* Hand the live session over. The tab is now the consumer, so the dialog's
+   * element must let go of the stream — two consumers on one reader
+   * interleave badly — and the session survives the dialog closing, which is
+   * what makes this a handoff rather than a second transfer. A previous
+   * handoff, if one is still live, retires first: one handed tab at a time,
+   * exactly as one dialog session at a time. */
+  dropHandoff();
+  handedSession = {
+    source: session.source,
+    location: session.location,
+    sid: mediaSessionId(session.source.url),
+  };
+  session.handedOff = true;
+  armHandoff();
+  ui.mediaPlayer.pause();
+  ui.mediaPlayer.removeAttribute('src');
+  ui.mediaPlayer.load();
   tab.opener = null;
-  ui.mediaDialog.close();
+  ui.mediaDialog.close(); // → 'close' → teardown → spares the handed session
 });
 
 /* Wire the fetch/open flow for one Autonomi result row: the location is the

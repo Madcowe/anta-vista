@@ -5841,9 +5841,13 @@ fn the_row_spinner_marks_a_fetch_that_has_not_landed_yet() {
 fn the_media_dialog_can_send_playback_to_another_tab() {
     // The tab is opened *synchronously in the click* (a popup after an await
     // has no gesture and browsers block it), the dialog closes only once the
-    // tab exists (a blocked popup leaves the player right here with the reason
-    // on its status line), and the opener is severed by hand — `noopener`
-    // would return null and lose the handle we just asked for.
+    // tab exists (a blocked popup leaves the player right here with the
+    // reason on its status line — and nothing detached yet, so the restore is
+    // free), and the opener is severed by hand — `noopener` would return null
+    // and lose the handle we just asked for. The session is handed over
+    // between the popup check and the close: flagged, detached from the
+    // dialog's element, armed with the leave-prompt and the goodbye channel —
+    // all before the close that spares it in teardown.
     let s = server();
     let js = js_code(&s.get("/assets/app.js").body);
 
@@ -5858,6 +5862,12 @@ fn the_media_dialog_can_send_playback_to_another_tab() {
     let blocked = handler
         .find("if (!tab)")
         .expect("the popup must be checked");
+    let handed = handler
+        .find("handedSession = {")
+        .expect("the session must be recorded for the tab");
+    let detach = handler
+        .find("ui.mediaPlayer.pause();")
+        .expect("the dialog's element must let go of the stream");
     let sever = handler
         .find("tab.opener = null")
         .expect("the opener must be severed by hand");
@@ -5865,16 +5875,28 @@ fn the_media_dialog_can_send_playback_to_another_tab() {
         .find("ui.mediaDialog.close()")
         .expect("the dialog must close after the tab exists");
     assert!(
-        open < blocked && blocked < sever && sever < close,
-        "open, popup check, sever, close — in that order; got: {handler}"
+        open < blocked && blocked < handed && handed < detach && detach < sever && sever < close,
+        "open, popup check, handoff, detach, sever, close — in that order; got: {handler}"
     );
     assert!(
-        handler[blocked..sever].contains("return;"),
-        "a blocked popup must leave this dialog open: {handler}"
+        handler[blocked..handed].contains("return;"),
+        "a blocked popup must leave this dialog open, nothing detached: {handler}"
     );
     assert!(
         handler.contains("if (!session || ui.mediaOpenTab.disabled) return;"),
         "the button must do nothing without a session: {handler}"
+    );
+    assert!(
+        handler.contains("url: session.source.url"),
+        "the tab rides this page's live stream, so the stream URL must travel: {handler}"
+    );
+    assert!(
+        handler.contains("session.handedOff = true;"),
+        "the handoff must be marked, or teardown closes the reader under the tab: {handler}"
+    );
+    assert!(
+        handler.contains("dropHandoff();") && handler.contains("armHandoff()"),
+        "a previous handoff must retire first, and the new one must be armed: {handler}"
     );
 
     // Like Save, it lights up only when a session lands.
@@ -5890,17 +5912,21 @@ fn the_media_dialog_can_send_playback_to_another_tab() {
 }
 
 #[test]
-fn the_media_player_page_reflects_nothing_and_plays_on_its_own() {
-    // `/media-view` is the tab's whole world: it loads the vendored SDK, asks
-    // the block list the same question the row asks (fail closed), teaches the
-    // worker its type, pings for the life of the session, and plays from its
-    // own stream — so it survives the Anta-Vista tab being closed. The server
-    // reflects *nothing* from the query: the page takes every value from its
-    // own script, which is why a hostile query must not change a byte.
+fn the_media_player_page_rides_the_hosts_transfer_and_says_who_stops_it() {
+    // `/media-view` is a handoff consumer: the dialog hands it the live
+    // worker session by URL, the worker routes the tab's range requests back
+    // to the Anta-Vista tab's MediaBridge, and the page just plays — no SDK,
+    // no connect, no second transfer. The flip side it states itself: the
+    // Anta-Vista tab must stay open, and when it closes anyway the worker's
+    // `av-media-host-gone` names the cause on screen (the media element's
+    // own error cannot). The goodbye rides BroadcastChannel, autoplay
+    // refusals arm one click anywhere, and the server reflects *nothing*
+    // from the query: every value is read by the page's own script, so a
+    // hostile query must not change a byte.
     let s = server();
     let hostile = s.get(
         "/media-view?address=0000000000000000000000000000000000000000000000000000000000000000\
-         &type=video/mp4&name=%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+         &type=video/mp4&name=%3Cscript%3Ealert(1)%3C%2Fscript%3E&url=%2Fevil",
     );
     assert_eq!(hostile.status, 200, "the player page is missing");
     let page = s.get("/media-view").body;
@@ -5913,25 +5939,46 @@ fn the_media_player_page_reflects_nothing_and_plays_on_its_own() {
         "the player is standalone: no app.js, no app shell"
     );
     for needle in [
-        // The boot global, substituted with the trusted constant — the same
-        // pin the vendored-SDK test keeps on the main page.
-        r#"window.__AV_SDK_BASE__ = "/assets/vendor/autonomi-sdk/0.1.2/";"#,
-        // The flow itself: block check, SDK, session, teach, keepalive.
+        // The flow itself: block check, the handed stream, the worker
+        // keepalive, the goodbye, and the precise death notice.
         "'/api/blocked?location='",
-        "AutonomiClient.connect",
-        "createMediaSource",
-        "'av-media-type'",
         "'av-ping'",
-        // Validation before use: a bare address, and a media type.
+        "'av-media-host-gone'",
+        "'BroadcastChannel'",
+        "channel.postMessage({ type: 'closed', sid })",
+        "player.src = streamUrl",
+        // Validation before use: a bare address, a media type, and the
+        // stream URL — same origin, our worker's route, nothing else.
         r"/^[0-9a-f]{64}$/u.test(address)",
         r"/^(audio|video)\//i.test(type)",
+        "u.pathname.startsWith('/__autonomi_stream/')",
         // The once-only reload that gets a stray page under worker control.
         "'av-media-view-reloaded'",
-        // Its own spinner and its own player.
+        // Autoplay refusals arm one gesture anywhere, not a hunt for the
+        // video's own control.
+        "'pointerdown'",
+        "'touchstart'",
+        "'keydown'",
+        "'pointerup'",
+        // Its own spinner, its own player, and the honest dependency note.
         r#"id="player""#,
         "class=\"spin\"",
+        "keep that tab open",
     ] {
         assert!(page.contains(needle), "the player page is missing {needle}");
+    }
+    // No self-sufficient SDK path remains: the host tab feeds this page now.
+    for absent in [
+        "AutonomiClient",
+        "createMediaSource",
+        "__AV_SDK_BASE__",
+        "av-media-type",
+        "import(",
+    ] {
+        assert!(
+            !page.contains(absent),
+            "the handoff page must not contain {absent}"
+        );
     }
 }
 
@@ -5963,4 +6010,173 @@ fn the_worker_lets_its_own_player_page_load_controlled() {
         "the arm must answer with the request itself so the document lands \
          controlled"
     );
+}
+
+#[test]
+fn the_handoff_rides_the_dialogs_session_and_lets_go_when_the_tab_closes() {
+    // The tab plays the dialog's live session, not a second transfer: the
+    // teardown spares a handed session (the tab is feeding from it), a block
+    // or remove still retires it, and the tab's own goodbye — BroadcastChannel
+    // on its pagehide — releases the reader and the keepalive. The
+    // leave-prompt rides only while a handoff is live, never at rest.
+    let js = js_code(&server().get("/assets/app.js").body);
+
+    // Closing the dialog clears the dialog's own state and leaves the handed
+    // session — and its keepalive — alone.
+    let teardown = js
+        .split("function teardownPlayer")
+        .nth(1)
+        .and_then(|rest| rest.split("\nui.mediaDialog.addEventListener").next())
+        .expect("teardownPlayer is gone");
+    let spare = teardown
+        .find("if (session && session.handedOff) return;")
+        .expect("a handed session must be spared when the dialog closes");
+    let remove = teardown
+        .find("keepaliveRemove('media')")
+        .expect("teardown must still release the keepalive for a plain session");
+    assert!(
+        spare < remove,
+        "the spare must come before the keepalive is released, or a closed \
+         dialog kills the tab's stream: {teardown}"
+    );
+    assert!(
+        !teardown[spare..remove].contains("source.close()"),
+        "the spare branch must not close the reader the tab is feeding from: {teardown}"
+    );
+
+    // Retiring a handoff closes the reader, retires the session in the
+    // worker (so the tab 404s at once instead of timing out), takes the
+    // leave-prompt down, and releases the keepalive only when nothing else
+    // is playing.
+    let drop = js
+        .split("function dropHandoff")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfunction armHandoff").next())
+        .expect("dropHandoff is gone");
+    for needle in [
+        "handed.source.close()",
+        "'av-media-drop'",
+        "if (!mediaSession) keepaliveRemove('media');",
+        "removeEventListener('beforeunload'",
+    ] {
+        assert!(
+            drop.contains(needle),
+            "dropHandoff is missing {needle}: {drop}"
+        );
+    }
+
+    // The goodbye channel hears only the live tab's sid, and the
+    // leave-prompt is armed here — nowhere else — so it exists exactly while
+    // a handoff does.
+    let arm = js
+        .split("function armHandoff")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfunction teardownPlayer").next())
+        .expect("armHandoff is gone");
+    for needle in [
+        "new BroadcastChannel(HANDOFF_CHANNEL)",
+        "msg.sid === handedSession.sid",
+        "dropHandoff();",
+        "addEventListener('beforeunload'",
+        "event.preventDefault()",
+    ] {
+        assert!(
+            arm.contains(needle),
+            "armHandoff is missing {needle}: {arm}"
+        );
+    }
+
+    // A block or remove is the user saying this file stops now, wherever it
+    // is playing — the handed tab included.
+    let close_if = js
+        .split("function closePlayerIf")
+        .nth(1)
+        .and_then(|rest| rest.split("\nasync function startPlayer").next())
+        .expect("closePlayerIf is gone");
+    assert!(
+        close_if.contains("handedSession && handedSession.location === location")
+            && close_if.contains("dropHandoff();"),
+        "a block or remove must retire the tab's session too: {close_if}"
+    );
+}
+
+#[test]
+fn the_worker_serves_the_player_tab_from_the_host_and_says_when_it_is_gone() {
+    // A handed-off session's bytes come from the page that owns the reader —
+    // the host — not from the tab asking: the tab has no bridge of its own.
+    // A host that is gone fails at once, with no 45 s range timeout, and the
+    // reason is posted to the player tab, whose own media error cannot name
+    // it. A session the page retired (`av-media-drop`) 404s at the next
+    // request instead of streaming from a closed reader.
+    let js = js_code(&server().get("/autonomi-stream-sw.js").body);
+
+    // The host is recorded from the teach, whose sender owns the session.
+    let teach = js
+        .split("msg.type === 'av-media-type'")
+        .nth(1)
+        .and_then(|rest| rest.split("msg.type === 'av-media-drop'").next())
+        .expect("the teach handler is gone");
+    assert!(
+        teach.contains("mediaHosts.set(sessionId, event.source.id)"),
+        "the teach's sender is the host page: {teach}"
+    );
+
+    // The drop arm forgets the session's type and host, and retires it.
+    let drop = js
+        .split("msg.type === 'av-media-drop'")
+        .nth(1)
+        .and_then(|rest| rest.split("addEventListener('fetch'").next())
+        .expect("the drop arm is gone");
+    for needle in [
+        "mediaTypes.delete(sessionId)",
+        "mediaHosts.delete(sessionId)",
+        "retiredSessions.set(sessionId, true)",
+    ] {
+        assert!(
+            drop.contains(needle),
+            "the drop arm is missing {needle}: {drop}"
+        );
+    }
+
+    // A retired session is refused at the route, before any body is built.
+    let stream = js
+        .split("async function handleStreamRequest")
+        .nth(1)
+        .expect("the media route is gone");
+    let retired = stream
+        .find("retiredSessions.has(sessionId)")
+        .expect("a retired session must be refused at the route");
+    let serve = stream
+        .find("return new Response(body,")
+        .expect("the media route no longer streams");
+    assert!(
+        retired < serve,
+        "the refusal must come before any body is built"
+    );
+
+    // Range requests prefer the host, fall back to the requester only when
+    // no host is recorded, and say so to the tab that asked when it is gone.
+    let ranges = js
+        .split("async function requestRangeFromPage")
+        .nth(1)
+        .expect("range requests no longer come from a page");
+    let host = ranges
+        .find("mediaHosts.get(sessionId)")
+        .expect("the host must be looked up");
+    let fallback = ranges
+        .find("client = clientId ? await self.clients.get(clientId)")
+        .expect("the non-host fallback is gone");
+    assert!(
+        host < fallback,
+        "the host path must win over the requester fallback: {ranges}"
+    );
+    for needle in [
+        "'av-media-host-gone'",
+        "The Anta-Vista tab that was feeding this media has closed",
+    ] {
+        assert!(
+            ranges.contains(needle),
+            "the host-gone path is missing {needle}: {ranges}"
+        );
+    }
 }
