@@ -4891,8 +4891,9 @@ fn a_failed_media_open_retries_once_and_the_fallback_names_it() {
         "a failed media open must be replaceable, or one transient lookup ends playback: {player}"
     );
     assert!(
-        player.contains("if (err.name === 'DownloadCancelled') throw err;"),
-        "a stop must never be spent on a reconnect: {player}"
+        player.contains("if (err.name === 'DownloadCancelled' || (signal && signal.aborted))"),
+        "a stop must never be spent on a reconnect — nor invalidating the \
+         shared client the rest of the page rides: {player}"
     );
     let first_open = player
         .find("source = await client.createMediaSource")
@@ -5863,7 +5864,7 @@ fn the_media_dialog_can_send_playback_to_another_tab() {
         .find("if (!tab)")
         .expect("the popup must be checked");
     let handed = handler
-        .find("handedSession = {")
+        .find("handedSessions.set(mediaSessionId(session.source.url)")
         .expect("the session must be recorded for the tab");
     let detach = handler
         .find("ui.mediaPlayer.pause();")
@@ -5883,8 +5884,9 @@ fn the_media_dialog_can_send_playback_to_another_tab() {
         "a blocked popup must leave this dialog open, nothing detached: {handler}"
     );
     assert!(
-        handler.contains("if (!session || ui.mediaOpenTab.disabled) return;"),
-        "the button must do nothing without a session: {handler}"
+        handler.contains("if (!session || session.handedOff || ui.mediaOpenTab.disabled) return;"),
+        "the button must do nothing without a session, and never hand a \
+         session twice — two consumers on one reader interleave badly: {handler}"
     );
     assert!(
         handler.contains("url: session.source.url"),
@@ -5895,8 +5897,13 @@ fn the_media_dialog_can_send_playback_to_another_tab() {
         "the handoff must be marked, or teardown closes the reader under the tab: {handler}"
     );
     assert!(
-        handler.contains("dropHandoff();") && handler.contains("armHandoff()"),
-        "a previous handoff must retire first, and the new one must be armed: {handler}"
+        handler.contains("armHandoff()"),
+        "the new handoff must be armed: {handler}"
+    );
+    assert!(
+        !handler.contains("dropHandoff"),
+        "handing a second tab must not retire the first — several tabs play \
+         at once, each on its own session: {handler}"
     );
 
     // Like Save, it lights up only when a session lands.
@@ -5908,6 +5915,55 @@ fn the_media_dialog_can_send_playback_to_another_tab() {
     assert!(
         player.contains("ui.mediaOpenTab.disabled = false;"),
         "the tab button must be enabled with the session it opens: {player}"
+    );
+    // Last click wins the dialog: a superseded loser closes its own reader
+    // and reports `SupersededOpen` *before* teardown — after it, the loser
+    // would have torn down the winner it raced — and `runOpen` stops on
+    // that report instead of falling through to viewer/save. A stop wired
+    // through the same signal aborts the open without retrying or
+    // invalidating the shared client.
+    let generation = player
+        .find("const generation = ++playerGeneration;")
+        .expect("startPlayer must claim a generation");
+    let aborted = player
+        .find("if (signal && signal.aborted) {")
+        .expect("startPlayer must honour the stop before claiming the dialog");
+    let superseded = player
+        .find("if (generation !== playerGeneration)")
+        .expect("a superseded start must be detected");
+    let teardown_claim = player
+        .find("teardownPlayer();")
+        .expect("startPlayer no longer claims the dialog's session");
+    assert!(
+        generation < aborted && aborted < superseded && superseded < teardown_claim,
+        "claim, stop check, supersede check, teardown — in that order: {player}"
+    );
+    assert!(
+        player.contains("SupersededOpen"),
+        "a superseded loser must name itself: {player}"
+    );
+    assert!(
+        player.matches("...(signal ? { signal } : {}),").count() >= 2,
+        "both media-source attempts must ride the stop signal: {player}"
+    );
+    assert!(
+        player.contains("err.name === 'DownloadCancelled' || (signal && signal.aborted)"),
+        "a stop must not retry or invalidate the shared client: {player}"
+    );
+    let run_open = js
+        .split("const runOpen = async")
+        .nth(1)
+        .and_then(|rest| rest.split("\nconst openView").next())
+        .expect("runOpen is gone");
+    assert!(
+        run_open.contains("signal: controller.signal,"),
+        "the media open must be abortable from the row's Stop: {run_open}"
+    );
+    assert!(
+        run_open.contains("err.name === 'SupersededOpen'")
+            && run_open.contains("'Another file is already playing"),
+        "runOpen must stop on a superseded media open without racing the \
+         winner through viewer or save: {run_open}"
     );
 }
 
@@ -5940,12 +5996,19 @@ fn the_media_player_page_rides_the_hosts_transfer_and_says_who_stops_it() {
     );
     for needle in [
         // The flow itself: block check, the handed stream, the worker
-        // keepalive, the goodbye, and the precise death notice.
+        // keepalive, the goodbye, and the precise death notices — the host
+        // gone, the session dropped from the Anta-Vista tab, the worker's
+        // own realm restarted underneath the playback.
         "'/api/blocked?location='",
         "'av-ping'",
         "'av-media-host-gone'",
         "'BroadcastChannel'",
         "channel.postMessage({ type: 'closed', sid })",
+        "msg.type === 'dropped'",
+        "SESSION_DROPPED",
+        "data.label === 'av-stream worker started'",
+        "WORKER_RESTARTED",
+        "preciseNotice",
         "player.src = streamUrl",
         // Validation before use: a bare address, a media type, and the
         // stream URL — same origin, our worker's route, nothing else.
@@ -6019,6 +6082,8 @@ fn the_handoff_rides_the_dialogs_session_and_lets_go_when_the_tab_closes() {
     // or remove still retires it, and the tab's own goodbye — BroadcastChannel
     // on its pagehide — releases the reader and the keepalive. The
     // leave-prompt rides only while a handoff is live, never at rest.
+    // Several sessions may be handed at once — each tab keeps its own — so
+    // retiring one must leave the others playing.
     let js = js_code(&server().get("/assets/app.js").body);
 
     // Closing the dialog clears the dialog's own state and leaves the handed
@@ -6043,31 +6108,53 @@ fn the_handoff_rides_the_dialogs_session_and_lets_go_when_the_tab_closes() {
         !teardown[spare..remove].contains("source.close()"),
         "the spare branch must not close the reader the tab is feeding from: {teardown}"
     );
+    assert!(
+        teardown.contains("if (!handedSessions.size) keepaliveRemove('media');"),
+        "the keepalive must survive the dialog while any tab is fed: {teardown}"
+    );
 
-    // Retiring a handoff closes the reader, retires the session in the
-    // worker (so the tab 404s at once instead of timing out), takes the
-    // leave-prompt down, and releases the keepalive only when nothing else
-    // is playing.
+    // Retiring one handoff announces the drop to its tab first (so it stops
+    // with a named reason), retires the session in the worker — failing any
+    // in-flight range at once — closes that reader, and releases the
+    // prompt/keepalive only when no other handoff is live.
     let drop = js
         .split("function dropHandoff")
         .nth(1)
         .and_then(|rest| rest.split("\nfunction armHandoff").next())
         .expect("dropHandoff is gone");
     for needle in [
-        "handed.source.close()",
+        "handedSessions.get(sid)",
+        "handedSessions.delete(sid)",
+        "type: 'dropped'",
         "'av-media-drop'",
-        "if (!mediaSession) keepaliveRemove('media');",
+        "handed.source.close()",
+        "if (!handedSessions.size && beforeUnloadWhileHandoff)",
         "removeEventListener('beforeunload'",
+        "if (!mediaSession && !handedSessions.size) keepaliveRemove('media');",
     ] {
         assert!(
             drop.contains(needle),
             "dropHandoff is missing {needle}: {drop}"
         );
     }
+    let announced = drop
+        .find("type: 'dropped'")
+        .expect("the drop must be announced to the tab");
+    let retired = drop
+        .find("'av-media-drop'")
+        .expect("the drop must reach the worker");
+    let closed = drop
+        .find("handed.source.close()")
+        .expect("the reader must still close");
+    assert!(
+        announced < retired && retired < closed,
+        "announce, retire in the worker, then close the reader — the other \
+         way leaves in-flight ranges waiting on a closed stream: {drop}"
+    );
 
-    // The goodbye channel hears only the live tab's sid, and the
-    // leave-prompt is armed here — nowhere else — so it exists exactly while
-    // a handoff does.
+    // The goodbye channel hears each live tab's sid and retires only that
+    // one, and the leave-prompt is armed here — nowhere else — so it exists
+    // exactly while a handoff does.
     let arm = js
         .split("function armHandoff")
         .nth(1)
@@ -6075,8 +6162,8 @@ fn the_handoff_rides_the_dialogs_session_and_lets_go_when_the_tab_closes() {
         .expect("armHandoff is gone");
     for needle in [
         "new BroadcastChannel(HANDOFF_CHANNEL)",
-        "msg.sid === handedSession.sid",
-        "dropHandoff();",
+        "handedSessions.has(msg.sid)",
+        "dropHandoff(msg.sid)",
         "addEventListener('beforeunload'",
         "event.preventDefault()",
     ] {
@@ -6087,16 +6174,16 @@ fn the_handoff_rides_the_dialogs_session_and_lets_go_when_the_tab_closes() {
     }
 
     // A block or remove is the user saying this file stops now, wherever it
-    // is playing — the handed tab included.
+    // is playing — every handed tab playing it, included.
     let close_if = js
         .split("function closePlayerIf")
         .nth(1)
-        .and_then(|rest| rest.split("\nasync function startPlayer").next())
+        .and_then(|rest| rest.split("\nlet playerGeneration").next())
         .expect("closePlayerIf is gone");
     assert!(
-        close_if.contains("handedSession && handedSession.location === location")
-            && close_if.contains("dropHandoff();"),
-        "a block or remove must retire the tab's session too: {close_if}"
+        close_if.contains("Array.from(handedSessions)")
+            && close_if.contains("handed.location === location) dropHandoff(sid)"),
+        "a block or remove must retire every tab playing that location: {close_if}"
     );
 }
 
@@ -6121,13 +6208,17 @@ fn the_worker_serves_the_player_tab_from_the_host_and_says_when_it_is_gone() {
         "the teach's sender is the host page: {teach}"
     );
 
-    // The drop arm forgets the session's type and host, and retires it.
+    // The drop arm fails any in-flight range at once (a request already
+    // waiting on the host must not sit out the range timeout against a
+    // reader that is about to close), then forgets the session's type and
+    // host and retires it.
     let drop = js
         .split("msg.type === 'av-media-drop'")
         .nth(1)
         .and_then(|rest| rest.split("addEventListener('fetch'").next())
         .expect("the drop arm is gone");
     for needle in [
+        "failPendingRanges(sessionId,",
         "mediaTypes.delete(sessionId)",
         "mediaHosts.delete(sessionId)",
         "retiredSessions.set(sessionId, true)",
@@ -6137,6 +6228,16 @@ fn the_worker_serves_the_player_tab_from_the_host_and_says_when_it_is_gone() {
             "the drop arm is missing {needle}: {drop}"
         );
     }
+    let failed = drop
+        .find("failPendingRanges(sessionId,")
+        .expect("in-flight ranges must be failed");
+    let forgotten = drop
+        .find("mediaTypes.delete(sessionId)")
+        .expect("the session's type must be forgotten");
+    assert!(
+        failed < forgotten,
+        "in-flight ranges fail before the session is forgotten: {drop}"
+    );
 
     // A retired session is refused at the route, before any body is built.
     let stream = js
@@ -6179,4 +6280,30 @@ fn the_worker_serves_the_player_tab_from_the_host_and_says_when_it_is_gone() {
             "the host-gone path is missing {needle}: {ranges}"
         );
     }
+    // Every in-flight request registers its rejection so the drop arm can
+    // settle it at once; success, failure, timeout and the drop all funnel
+    // through one guarded settle, so a late answer after a fail cannot
+    // settle twice.
+    for needle in [
+        "pendingRanges.set(sessionId, new Set())",
+        "pendingRanges.get(sessionId).add(settleReject)",
+        "const settle = (fn, value) => {",
+        "if (settled) return;",
+    ] {
+        assert!(
+            ranges.contains(needle),
+            "range requests must be retire-able, not just timed: {ranges}"
+        );
+    }
+    let registered = ranges
+        .find("pendingRanges.get(sessionId).add(settleReject)")
+        .expect("the request must register for retirement");
+    let posted = ranges
+        .find("client.postMessage(")
+        .expect("the request must still be posted");
+    assert!(
+        registered < posted,
+        "registration must precede the post — a drop landing in between \
+         would otherwise find nothing to fail: {ranges}"
+    );
 }

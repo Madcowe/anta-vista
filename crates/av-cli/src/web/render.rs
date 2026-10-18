@@ -1133,14 +1133,26 @@ const MEDIA_VIEW_HTML: &str = r##"<!doctype html>
     phaseText.textContent = message;
   };
 
-  /* The one reason this page cannot keep playing, named precisely: the
-   * Anta-Vista tab that owns the reader feeding this stream is gone. The
-   * media element's own error cannot tell this from any other stream failure,
-   * and "why did it stop" is exactly the question the user will have — so the
-   * worker says it directly (`av-media-host-gone`), and this is the line. */
+  /* The precise death notices — the reasons this page cannot keep playing
+   * that the media element's own error cannot tell: the Anta-Vista tab that
+   * owns the reader is gone; the host retired this session on purpose; the
+   * worker restarted and took the session's route with it. Each path calls
+   * `notice`, which also arms the flag the error handler checks so a
+   * generic stream error never overwrites the answer with a shrug. */
+  let preciseNotice = false;
   const HOST_CLOSED =
     'The Anta-Vista tab that was feeding this player has closed \u2014 playback stopped here. Re-open the file from Anta-Vista to start again.';
-  let hostGone = false;
+  const SESSION_DROPPED =
+    'Playback was stopped from the Anta-Vista tab \u2014 this file is no longer being shared. Re-open the file from Anta-Vista to start again.';
+  const WORKER_RESTARTED =
+    'The media worker restarted, which stops this player \u2014 re-open the file from Anta-Vista to start again.';
+  const notice = (message) => {
+    preciseNotice = true;
+    main.classList.add('failed');
+    spin.hidden = true;
+    phaseText.textContent = 'Playback stopped';
+    sub.textContent = String(message).slice(0, 240);
+  };
 
   /* The stream URL the dialog handed over: same origin, our own worker's
    * session route, and nothing else. Validated before it reaches the media
@@ -1218,10 +1230,12 @@ const MEDIA_VIEW_HTML: &str = r##"<!doctype html>
 
     const sid = sidOf(streamUrl);
 
-    /* The precise death notice, straight from the worker: it looked for the
+    /* The worker's own messages: the death notice when it looked for the
      * host page that owns this session and found it gone — closed, crashed,
-     * navigated. The media element's own error fires too but cannot say why;
-     * this is the answer to that question, on screen where the user is. */
+     * navigated — and a realm-start announcement when Firefox idle-killed
+     * the worker and the browser registered a new one: the session's taught
+     * MIME and the host's route lived in the old realm, so this tab cannot
+     * recover and the next range request would fail obscurely. */
     navigator.serviceWorker.addEventListener('message', (event) => {
       const data = event.data;
       if (
@@ -1229,19 +1243,32 @@ const MEDIA_VIEW_HTML: &str = r##"<!doctype html>
         data.type === 'av-media-host-gone' &&
         (!sid || data.sessionId === sid)
       ) {
-        hostGone = true;
-        main.classList.add('failed');
-        spin.hidden = true;
-        phaseText.textContent = 'Playback stopped';
-        sub.textContent = HOST_CLOSED;
+        notice(HOST_CLOSED);
+        return;
+      }
+      if (
+        data &&
+        data.type === 'av-stream-log' &&
+        data.label === 'av-stream worker started'
+      ) {
+        notice(WORKER_RESTARTED);
       }
     });
 
     /* The goodbye: posted as this page goes away — closed, refreshed,
      * navigated — so the Anta-Vista tab retires the session and its keepalive
-     * at once instead of waiting for the worker's range timeout to notice. */
+     * at once instead of waiting for the worker's range timeout to notice.
+     * The host's `dropped` arrives the same way when *it* retires this
+     * session — a block, a replace — which is the answer to "why did it
+     * stop" before the stream's own error can ask it. */
     if ('BroadcastChannel' in window) {
       const channel = new BroadcastChannel('av-media-view');
+      channel.onmessage = (event) => {
+        const msg = event.data;
+        if (msg && msg.type === 'dropped' && (!sid || msg.sid === sid)) {
+          notice(SESSION_DROPPED);
+        }
+      };
       window.addEventListener(
         'pagehide',
         () => {
@@ -1286,7 +1313,7 @@ const MEDIA_VIEW_HTML: &str = r##"<!doctype html>
     player.addEventListener(
       'error',
       () => {
-        if (hostGone) return; // the precise message is already on screen
+        if (preciseNotice) return; // a precise message is already on screen
         main.classList.add('failed');
         spin.hidden = true;
         phaseText.textContent = 'Playback stopped';

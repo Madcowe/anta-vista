@@ -1338,59 +1338,71 @@ function teachMediaType(sessionId, mime) {
  * unreachable while its file plays. */
 let mediaSession = null;
 
-/* The session the player tab is feeding from, once the dialog has handed it
- * over. Distinct from `mediaSession` — the handoff clears that, because the
- * tab is now the consumer and the dialog's element has let go of the stream
- * — and this is what keeps the reader, the keepalive and the worker's idle
- * clock alive across the dialog's close. One at a time: handing a second tab
- * retires the first's session, exactly as a second `startPlayer` replaces the
- * dialog's own. */
-let handedSession = null;
+/* The sessions player tabs are feeding from, once the dialog has handed
+ * each over — keyed by the session id the tab was opened with, so several
+ * tabs can play different files (or the same file as independent sessions)
+ * at once, each fed by its own reader on this page. Distinct from
+ * `mediaSession` — a handoff clears that, because the tab is now the
+ * consumer and the dialog's element has let go of the stream — and these
+ * are what keep the readers, the keepalive and the worker's idle clock
+ * alive across the dialog's close. A session may be handed at most once:
+ * two consumers on one reader interleave badly. */
+const handedSessions = new Map();
 
-/* The browser's own "Leave site?" prompt, armed only while a handoff is
- * live: closing or refreshing *this* page stops playback in the tab, and the
- * prompt — no custom text, the browser forbids any — is the only warning a
- * closing page gets to give. Never installed at rest, so it never nags a
- * page with nothing to lose. */
+/* The browser's own "Leave site?" prompt, armed only while at least one
+ * handoff is live: closing or refreshing *this* page stops playback in
+ * those tabs, and the prompt — no custom text, the browser forbids any — is
+ * the only warning a closing page gets to give. Never installed at rest, so
+ * it never nags a page with nothing to lose. */
 let beforeUnloadWhileHandoff = null;
 
-/* How the player tab says goodbye. `window.opener` is severed by rule, so
- * this is the one channel between the two pages: the tab posts `closed` on
- * its pagehide — closing it, refreshing it, navigating away — and that is
- * what lets the reader and the keepalive go without waiting for the block
- * path to notice. */
+/* How a player tab says goodbye. `window.opener` is severed by rule, so
+ * this is the one channel between the pages: a tab posts `closed` on its
+ * pagehide — closing it, refreshing it, navigating away — and that is what
+ * lets its reader and the keepalive go without waiting for the block path
+ * to notice. `dropHandoff` posts `dropped` so a tab it retires learns that
+ * at once. */
 let handoffChannel = null;
 
 const HANDOFF_CHANNEL = 'av-media-view';
 
-/* Retire a handed-off session: close the reader, tell the worker it is
- * retired (so the tab's next range request 404s at once instead of waiting
- * out the 45 s timeout against a silent host), take down the leave-prompt,
- * and — only when nothing else is playing — release the keepalive. */
-function dropHandoff() {
-  const handed = handedSession;
-  handedSession = null;
-  if (beforeUnloadWhileHandoff) {
-    window.removeEventListener('beforeunload', beforeUnloadWhileHandoff);
-    beforeUnloadWhileHandoff = null;
-  }
+/* Retire one handed-off session: tell the tab it is dropped (so it stops
+ * with a named reason instead of a stream error), tell the worker it is
+ * retired (so the tab's in-flight and next range requests fail at once
+ * instead of waiting out the 45 s timeout against a reader that is about to
+ * close), close the reader, and — only when nothing else is playing — take
+ * down the leave-prompt and release the keepalive. Other handed sessions
+ * are untouched: they keep playing. */
+function dropHandoff(sid) {
+  const handed = handedSessions.get(sid);
   if (!handed) return;
+  handedSessions.delete(sid);
+  if (handoffChannel) {
+    try {
+      handoffChannel.postMessage({ type: 'dropped', sid });
+    } catch (_) {}
+  }
+  const controller =
+    navigator.serviceWorker && navigator.serviceWorker.controller;
+  if (controller && sid) {
+    try {
+      controller.postMessage({ type: 'av-media-drop', sessionId: sid });
+    } catch (_) {}
+  }
   try {
     handed.source.close();
   } catch (_) {}
-  const controller =
-    navigator.serviceWorker && navigator.serviceWorker.controller;
-  if (controller && handed.sid) {
-    try {
-      controller.postMessage({ type: 'av-media-drop', sessionId: handed.sid });
-    } catch (_) {}
+  if (!handedSessions.size && beforeUnloadWhileHandoff) {
+    window.removeEventListener('beforeunload', beforeUnloadWhileHandoff);
+    beforeUnloadWhileHandoff = null;
   }
-  if (!mediaSession) keepaliveRemove('media');
+  if (!mediaSession && !handedSessions.size) keepaliveRemove('media');
 }
 
-/* Hear the player tab's goodbye, and arm the leave-prompt for as long as a
- * handoff is live. BroadcastChannel is broadcast to every same-origin context
- * that has one open, so the host and the tab find each other without ever
+/* Hear a player tab's goodbye — retiring just that tab's session, so the
+ * others keep playing — and arm the leave-prompt for as long as any handoff
+ * is live. BroadcastChannel is broadcast to every same-origin context that
+ * has one open, so the host and the tabs find each other without ever
  * holding a handle to one another. */
 function armHandoff() {
   if (!handoffChannel && 'BroadcastChannel' in window) {
@@ -1400,10 +1412,10 @@ function armHandoff() {
       if (
         msg &&
         msg.type === 'closed' &&
-        handedSession &&
-        msg.sid === handedSession.sid
+        msg.sid &&
+        handedSessions.has(msg.sid)
       ) {
-        dropHandoff();
+        dropHandoff(msg.sid);
       }
     };
   }
@@ -1419,10 +1431,10 @@ function armHandoff() {
 /* Synchronous teardown, idempotent: null the session first so a second call
  * (or a late close event) finds nothing to close.
  *
- * A session that has been handed to the player tab is *spared* — the tab is
+ * A session that has been handed to a player tab is *spared* — the tab is
  * feeding from its reader right now, and closing it here would stop playback
- * in the other tab. The keepalive stays too while any handoff is live, for
- * the same reason; `dropHandoff` releases both when the tab lets go. */
+ * in that tab. The keepalive stays too while any handoff is live, for the
+ * same reason; `dropHandoff` releases both when the tab lets go. */
 function teardownPlayer() {
   const session = mediaSession;
   mediaSession = null;
@@ -1431,7 +1443,7 @@ function teardownPlayer() {
   ui.mediaPlayer.load(); // releases the fetch behind the old src
   ui.mediaStatus.textContent = '';
   if (session && session.handedOff) return;
-  if (!handedSession) keepaliveRemove('media');
+  if (!handedSessions.size) keepaliveRemove('media');
   if (session) {
     try {
       session.source.close();
@@ -1458,14 +1470,17 @@ ui.mediaPlayer.addEventListener('error', () => {
     'This file could not be played. Close the player and use Save to disk.';
 });
 
-/* Stop playback of `location` if that is what is playing. Blocking or
- * removing a resource out from under a player that is streaming it would
- * otherwise keep the bytes arriving after the row is gone. A handed-off
- * session is not spared here: the block is the user saying this file stops
- * now, wherever it is playing — the player tab hears it as the worker's
- * retired-session 404 and says so on its own line. */
+/* Stop playback of `location` if that is what is playing, in the dialog or
+ * in any handed tab. Blocking or removing a resource out from under a
+ * player that is streaming it would otherwise keep the bytes arriving after
+ * the row is gone. A handed-off session is not spared here: the block is
+ * the user saying this file stops now, wherever it is playing — the player
+ * tab hears it as the worker's retired-session 404 and its own `dropped`
+ * message, and says so on its own line. */
 function closePlayerIf(location) {
-  if (handedSession && handedSession.location === location) dropHandoff();
+  for (const [sid, handed] of Array.from(handedSessions)) {
+    if (handed.location === location) dropHandoff(sid);
+  }
   if (!mediaSession || mediaSession.location !== location) return;
   if (ui.mediaDialog.open) ui.mediaDialog.close(); // → 'close' → teardown
   else teardownPlayer();
@@ -1486,23 +1501,43 @@ function closePlayerIf(location) {
  * are *not* retried; a reconnect cannot fix those. Every failure is logged
  * with its real error, because the fall-through's messages describe the route
  * taken, never the cause. */
-async function startPlayer({ address, location, plan, onProgress, statusEl }) {
+/* Monotonic counter for last-click-wins media playback: each `startPlayer`
+ * takes the next value, and only the newest may take over the dialog's
+ * session — a superseded loser closes its own source and reports
+ * `SupersededOpen` instead of tearing down the winner it raced. */
+let playerGeneration = 0;
+
+async function startPlayer({
+  address,
+  location,
+  plan,
+  onProgress,
+  statusEl,
+  signal,
+}) {
+  const generation = ++playerGeneration;
   let source;
   let client = await getSharedClient({ onProgress });
   try {
     source = await client.createMediaSource(address, {
       serviceWorkerUrl: STREAM_SW_URL,
       ...(onProgress ? { onProgress } : {}),
+      ...(signal ? { signal } : {}),
     });
   } catch (err) {
     console.error('the media reader could not be opened', err);
-    if (err.name === 'DownloadCancelled') throw err;
+    /* A stop is not a failure to retry: aborting the open must not
+     * invalidate the shared client the rest of the page rides. */
+    if (err.name === 'DownloadCancelled' || (signal && signal.aborted)) {
+      throw err;
+    }
     invalidateSharedClient();
     setStatus(statusEl, 'The player could not connect; trying once more…', '');
     client = await getSharedClient({ onProgress });
     source = await client.createMediaSource(address, {
       serviceWorkerUrl: STREAM_SW_URL,
       ...(onProgress ? { onProgress } : {}),
+      ...(signal ? { signal } : {}),
     });
   }
   try {
@@ -1515,6 +1550,24 @@ async function startPlayer({ address, location, plan, onProgress, statusEl }) {
       source.close();
     } catch (_) {}
     throw err;
+  }
+  /* Stop or a newer click wins: close this reader and report, without
+   * touching the dialog's current session. The check sits before
+   * `teardownPlayer` on purpose — the loser must not tear down the
+   * winner it raced. */
+  if (signal && signal.aborted) {
+    try {
+      source.close();
+    } catch (_) {}
+    throw new DownloadCancelled();
+  }
+  if (generation !== playerGeneration) {
+    try {
+      source.close();
+    } catch (_) {}
+    const superseded = new Error('another file is already playing');
+    superseded.name = 'SupersededOpen';
+    throw superseded;
   }
   teardownPlayer(); // replaces any previous session before this one lands
   mediaSession = {
@@ -1684,7 +1737,12 @@ ui.mediaSave.addEventListener('click', async () => {
  * the session reaches it through the worker, not through us. */
 ui.mediaOpenTab.addEventListener('click', () => {
   const session = mediaSession;
-  if (!session || ui.mediaOpenTab.disabled) return;
+  /* A session may be handed at most once: two consumers on one reader
+   * interleave badly. The close event that clears `mediaSession` runs
+   * asynchronously, so a double-click would otherwise hand the same session
+   * twice — the guard makes the second click a no-op. Same file again is a
+   * new session: play it once more in the dialog, hand that. */
+  if (!session || session.handedOff || ui.mediaOpenTab.disabled) return;
   const query = new URLSearchParams({
     address: session.address,
     type: session.mime || session.source.file.contentType || '',
@@ -1700,15 +1758,12 @@ ui.mediaOpenTab.addEventListener('click', () => {
   /* Hand the live session over. The tab is now the consumer, so the dialog's
    * element must let go of the stream — two consumers on one reader
    * interleave badly — and the session survives the dialog closing, which is
-   * what makes this a handoff rather than a second transfer. A previous
-   * handoff, if one is still live, retires first: one handed tab at a time,
-   * exactly as one dialog session at a time. */
-  dropHandoff();
-  handedSession = {
+   * what makes this a handoff rather than a second transfer. Other handed
+   * tabs keep their own sessions and keep playing. */
+  handedSessions.set(mediaSessionId(session.source.url), {
     source: session.source,
     location: session.location,
-    sid: mediaSessionId(session.source.url),
-  };
+  });
   session.handedOff = true;
   armHandoff();
   ui.mediaPlayer.pause();
@@ -1951,6 +2006,7 @@ function wireFetch(node, result, statusEl) {
                 plan,
                 onProgress: hooks.onProgress,
                 statusEl,
+                signal: controller.signal,
               });
               /* The player owns a random-access reader of its own; the plan's
                * sequential one is finished and would only hold the stream. */
@@ -1958,7 +2014,24 @@ function wireFetch(node, result, statusEl) {
               if (tab) tab.close();
               return;
             } catch (err) {
-              if (err.name === 'DownloadCancelled') throw err;
+              if (
+                err.name === 'DownloadCancelled' ||
+                (controller && controller.signal.aborted)
+              ) {
+                throw new DownloadCancelled();
+              }
+              if (err.name === 'SupersededOpen') {
+                /* A newer click already took the dialog; report on this row
+                 * and stop — falling through to viewer/save would race the
+                 * winner with the reader this row no longer needs. */
+                setStatus(
+                  statusEl,
+                  'Another file is already playing \u2014 this open was replaced.',
+                  'warn'
+                );
+                await handle.cancel().catch(() => {});
+                return;
+              }
               /* A player that cannot be created is a routing decision: the
                * prefix reader is untouched, and the flow continues — the
                * viewer or the save below, or the daemon after that. The

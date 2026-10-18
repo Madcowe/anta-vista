@@ -118,6 +118,23 @@ const mediaHosts = new Map();
 const retiredSessions = new Map();
 const RETIRED_MAX = 64;
 
+/* In-flight range requests per session, so retiring a session can fail
+ * them at once instead of leaving each to wait out the range timeout
+ * against a reader that is already closed. Keyed by session id; each value
+ * is the set of reject callbacks for the requests currently waiting on the
+ * host page. */
+const pendingRanges = new Map();
+
+/* Reject every range request currently waiting on this session. Called
+ * from the `av-media-drop` arm: the host page told us the reader is gone,
+ * so any answer it might still have produced belongs to a dead stream. */
+function failPendingRanges(sessionId, message) {
+  const set = pendingRanges.get(sessionId);
+  if (!set) return;
+  pendingRanges.delete(sessionId);
+  for (const rejectOne of set) rejectOne(new Error(message));
+}
+
 /* The only Content-Types this worker will ever serve on the media route.
  * Deliberately narrow: same-origin bytes with a document type would be an
  * XSS hole the peer controls. */
@@ -225,6 +242,7 @@ self.addEventListener('message', (event) => {
      * the range timeout against a reader that is already closed. */
     const sessionId = typeof msg.sessionId === 'string' ? msg.sessionId : '';
     if (!/^[0-9a-f]{32}$/u.test(sessionId)) return;
+    failPendingRanges(sessionId, 'the media session was retired');
     mediaTypes.delete(sessionId);
     mediaHosts.delete(sessionId);
     if (!retiredSessions.has(sessionId) && retiredSessions.size >= RETIRED_MAX) {
@@ -576,19 +594,32 @@ async function requestRangeFromPage(clientId, sessionId, start, length) {
 
   return new Promise((resolve, reject) => {
     const channel = new MessageChannel();
-    const fail = (error) => {
-      clearTimeout(timeout);
-      channel.port1.close();
-      reject(error);
+    let settled = false;
+    const forget = () => {
+      const pending = pendingRanges.get(sessionId);
+      if (!pending) return;
+      pending.delete(settleReject);
+      if (!pending.size) pendingRanges.delete(sessionId);
     };
-    const timeout = setTimeout(() => {
-      fail(new Error('Autonomi file range request timed out'));
-    }, RANGE_REQUEST_TIMEOUT_MS);
-    channel.port1.onmessage = (event) => {
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
+      forget();
       channel.port1.close();
+      fn(value);
+    };
+    const settleReject = (error) => settle(reject, error);
+    const timeout = setTimeout(() => {
+      settleReject(new Error('Autonomi file range request timed out'));
+    }, RANGE_REQUEST_TIMEOUT_MS);
+    if (!pendingRanges.has(sessionId)) {
+      pendingRanges.set(sessionId, new Set());
+    }
+    pendingRanges.get(sessionId).add(settleReject);
+    channel.port1.onmessage = (event) => {
       if (!event.data || !event.data.ok) {
-        reject(
+        settleReject(
           new Error(
             (event.data && event.data.error) ||
               'Autonomi file range request failed'
@@ -596,10 +627,10 @@ async function requestRangeFromPage(clientId, sessionId, start, length) {
         );
         return;
       }
-      resolve(new Uint8Array(event.data.bytes));
+      settle(resolve, new Uint8Array(event.data.bytes));
     };
     channel.port1.onmessageerror = () => {
-      fail(new Error('Autonomi file range response could not be decoded'));
+      settleReject(new Error('Autonomi file range response could not be decoded'));
     };
     channel.port1.start();
     try {
@@ -609,7 +640,7 @@ async function requestRangeFromPage(clientId, sessionId, start, length) {
       );
     } catch (error) {
       channel.port2.close();
-      fail(error);
+      settleReject(error);
     }
   });
 }
