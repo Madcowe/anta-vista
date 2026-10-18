@@ -136,7 +136,7 @@ pub fn x0x_install_command() -> String {
         if cfg!(target_os = "windows") {
             "powershell -NoProfile -Command \"Invoke-WebRequest -Uri https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip -OutFile x0x.zip; tar -xf x0x.zip -C $env:USERPROFILE\\.local\\bin; Remove-Item x0x.zip\"".to_string()
         } else {
-            "curl -sfL https://x0x.md | sh -s -- --start".to_string()
+            "curl -sfL https://x0x.md | sh".to_string()
         }
     })
 }
