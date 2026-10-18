@@ -12,6 +12,21 @@ use av_net_x0x::dispatcher::MessageDispatcher;
 use av_query::cluster::cluster_responses;
 use serde_json::json;
 
+/// What the interactive rating prompt says about sharing a network link,
+/// shown whenever the result list holds one.
+///
+/// The browser confirms before recommending a network result for exactly
+/// this reason — "Share this link?" / "Recommending it may share the link
+/// with other people using this network" — because a rating that ranks a
+/// network result up propagates it into the local index, where `av listen`
+/// serves it on to peers. The terminal's single prompt covers every result
+/// at once and cannot ask per-result, so the caveat goes up once, in
+/// yellow, above the question — and only when there is a network result
+/// that could be shared; with local results only, a rating shares nothing,
+/// and a warning that fires anyway teaches the user to ignore warnings.
+pub const RATE_SHARING_NOTE: &str = "Note: recommending a network result may share the link \
+                                     with other people using this network.";
+
 /// Merged, ranked, de-duplicated search results ready for presentation.
 ///
 /// Shared by the CLI and the web interface so both surfaces rank, name-match
@@ -347,8 +362,17 @@ pub fn run(
     // Interactive relevance feedback + content propagation
     if !cli.non_interactive && !all_results.is_empty() {
         use std::io::Write;
+        // The GUI confirms before recommending a network link for exactly
+        // this reason; one prompt cannot ask per-result, so the caveat goes
+        // up once — and only when a network result is there to share.
+        if all_results
+            .iter()
+            .any(|r| r["source"].as_str() == Some("network"))
+        {
+            println!("\n{}", console::style(RATE_SHARING_NOTE).yellow());
+        }
         print!(
-            "\nWhich result was most relevant? (1-{}, or Enter for none): ",
+            "Which result was most relevant? (1-{}, or Enter for none): ",
             all_results.len()
         );
         std::io::stdout().flush().ok();

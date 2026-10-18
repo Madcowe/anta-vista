@@ -3806,6 +3806,41 @@ fn the_cli_prints_the_stored_name_beside_the_location_too() {
 }
 
 #[test]
+fn the_search_rating_prompt_warns_that_a_network_recommendation_may_share() {
+    // The browser confirms before recommending a network link ("Share this
+    // link?" / "Recommending it may share the link with other people using
+    // this network") because the recommendation propagates the link into
+    // the local index, where the listener serves it on. The terminal's one
+    // prompt covers every result at once, so the same warning goes up with
+    // the question — only when the list holds a network result, or it
+    // would train the user to ignore warnings on local-only searches.
+    let src = include_str!("../src/cmd/search.rs");
+    assert!(
+        src.contains("console::style(RATE_SHARING_NOTE).yellow()"),
+        "the interactive rating prompt must show the sharing warning"
+    );
+    assert!(
+        src.contains("r[\"source\"].as_str() == Some(\"network\")"),
+        "the warning must appear only when a network result is there to share"
+    );
+    assert!(
+        src.contains("Which result was most relevant?"),
+        "the rating question itself must survive unchanged"
+    );
+    let note = av_cli::cmd::search::RATE_SHARING_NOTE;
+    assert!(
+        note.contains("may share the link with other people using this network"),
+        "the note must carry the GUI's own warning clause: {note}"
+    );
+    let web = include_str!("../src/web/render.rs");
+    assert!(
+        web.contains("Recommending it may share the link with other people using this network."),
+        "the GUI's confirm is the counterpart this note mirrors — if one \
+         side stops saying it, both must be reconsidered together"
+    );
+}
+
+#[test]
 fn the_remove_confirm_names_the_location_not_the_embedded_text() {
     // `description` is the text anta-vista embeds, so for a text or PDF document
     // it is up to 800 characters of the file's own content. The confirm used to
