@@ -129,12 +129,37 @@ fn env_override(var: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The Windows PowerShell script that installs x0x.
+///
+/// The release zip is flat: x0x.exe and x0xd.exe sit at the archive root.
+/// Do NOT use `--strip-components` — it strips the only component and tar
+/// silently skips the member, leaving an empty target directory while
+/// PowerShell exits 0.
+///
+/// `$ErrorActionPreference = 'Stop'` makes every failing cmdlet abort the
+/// script loudly so `run_capture` sees a non-zero exit code.
+/// `-UseBasicParsing` avoids IE-engine issues on locked-down PS 5.1.
+/// TLS 1.2 is not the default on stock PS 5.1, which breaks GitHub downloads.
+const X0X_INSTALL_SCRIPT_WINDOWS: &str = concat!(
+    "$ErrorActionPreference = 'Stop'; ",
+    "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; ",
+    "$zip = \"$env:TEMP\\x0x.zip\"; ",
+    "$target = \"$env:USERPROFILE\\.local\\bin\"; ",
+    "mkdir -Force $target | Out-Null; ",
+    "Invoke-WebRequest -UseBasicParsing -Uri \"https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip\" -OutFile $zip; ",
+    "tar -xf $zip -C $target; ",
+    "Remove-Item $zip -Force",
+);
+
 /// The literal command used to install x0x on this platform, suitable for
 /// showing to a user before they consent to running it.
 pub fn x0x_install_command() -> String {
     env_override("ANTA_VISTA_X0X_INSTALL_CMD").unwrap_or_else(|| {
         if cfg!(target_os = "windows") {
-            "powershell -NoProfile -Command \"Invoke-WebRequest -Uri https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip -OutFile x0x.zip; tar -xf x0x.zip -C $env:USERPROFILE\\.local\\bin; Remove-Item x0x.zip\"".to_string()
+            format!(
+                "powershell -NoProfile -Command \"{}\"",
+                X0X_INSTALL_SCRIPT_WINDOWS.replace('"', "\\\"")
+            )
         } else {
             "curl -sfL https://x0x.md | sh".to_string()
         }
@@ -289,31 +314,22 @@ pub fn x0x_binary_available() -> bool {
 
 /// Install x0x, returning the installer's exit status and its log.
 ///
-/// The script starts the daemon itself and waits for it to answer its health
-/// endpoint, so the caller only has to settle briefly before probing.
+/// On success the daemon is started (same as the Unix installer, which does
+/// this itself) so the caller doesn't have to issue a separate start.
 pub fn install_x0x_with() -> (bool, String) {
     let (ok, log) = if let Some(cmd) = env_override("ANTA_VISTA_X0X_INSTALL_CMD") {
         run_installer(&cmd)
     } else if cfg!(target_os = "windows") {
-        run_capture(
-            "powershell",
-            &[
-                "-NoProfile",
-                "-Command",
-                concat!(
-                    "$zip = \"$env:TEMP\\x0x.zip\"; ",
-                    "$target = \"$env:USERPROFILE\\.local\\bin\"; ",
-                    "mkdir -Force $target | Out-Null; ",
-                    "Invoke-WebRequest -Uri \"https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip\" -OutFile $zip; ",
-                    "tar -xf $zip -C $target --strip-components=1; ",
-                    "Remove-Item $zip -Force",
-                ),
-            ],
-        )
+        run_capture("powershell", &["-NoProfile", "-Command", X0X_INSTALL_SCRIPT_WINDOWS])
     } else {
         run_installer(&x0x_install_command())
     };
     if ok {
+        // The Unix installer starts the daemon itself; the Windows one does not.
+        // Start it here so the "installed" state also means "running".
+        if cfg!(target_os = "windows") && x0x_binary_available() {
+            start_x0x_daemon();
+        }
         std::thread::sleep(Duration::from_secs(3));
     }
     (ok, log)
@@ -767,7 +783,21 @@ pub fn start_x0x_daemon() -> bool {
     let retry_until = std::time::Instant::now() + Duration::from_secs(8);
 
     let try_path = |bin: &PathBuf| -> bool {
-        match std::process::Command::new(bin).arg("start").spawn() {
+        // Canonicalize so we always have a full absolute path. resolve_bin
+        // can return a bare name ("x0x.exe") on a PATH hit, whose parent is
+        // an empty string — and x0x.exe looks for x0xd.exe in its current
+        // working directory, not next to itself, so an empty cwd means the
+        // spawn fails with "x0xd not found".
+        let bin = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.clone());
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.arg("start");
+        if let Some(dir) = bin.parent() {
+            let current = std::env::var("PATH").unwrap_or_default();
+            let sep = path_list_separator();
+            cmd.env("PATH", format!("{}{}{}", dir.display(), sep, current));
+            cmd.current_dir(dir);
+        }
+        match cmd.spawn() {
             Ok(_) => {
                 while std::time::Instant::now() < retry_until {
                     std::thread::sleep(Duration::from_millis(500));
