@@ -205,6 +205,17 @@ pub fn search(state: &Arc<AppState>, query: &str) -> WebResponse {
         Err(r) => return r,
     };
 
+    // The browser skips its ensure call while its cached deps already say the
+    // daemon is running, so a snapshot taken while x0x was down can stay
+    // `None` forever while the daemon is actually up — and `None` below means
+    // this search silently skips the fan-out. Refresh once *before* the
+    // request-long read guard (refreshing takes the write lock), so "x0x is
+    // running" always reaches the one read that decides.
+    let needs_refresh = state.startup.read().is_ok_and(|s| s.x0x_config.is_none());
+    if needs_refresh {
+        state.refresh_network_deps();
+    }
+
     // Take the startup snapshot once and hold it, so a dependency started from
     // the setup banner mid-request cannot change the fan-out underneath us.
     let startup = match state.startup.read() {

@@ -2,7 +2,7 @@ use crate::cmd::{CliError, CliResult};
 use av_core::config::AvConfig;
 use av_net_x0x::client::X0xConfig;
 use dialoguer::Confirm;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -320,7 +320,10 @@ pub fn install_x0x_with() -> (bool, String) {
     let (ok, log) = if let Some(cmd) = env_override("ANTA_VISTA_X0X_INSTALL_CMD") {
         run_installer(&cmd)
     } else if cfg!(target_os = "windows") {
-        run_capture("powershell", &["-NoProfile", "-Command", X0X_INSTALL_SCRIPT_WINDOWS])
+        run_capture(
+            "powershell",
+            &["-NoProfile", "-Command", X0X_INSTALL_SCRIPT_WINDOWS],
+        )
     } else {
         run_installer(&x0x_install_command())
     };
@@ -779,25 +782,62 @@ pub fn stop_x0x_daemon() -> bool {
     !x0x_running()
 }
 
+/// The absolute location of `exe` for the first entry of `path` that holds it.
+///
+/// `resolve_bin` answers a PATH hit with the *bare* name — what a fresh shell
+/// would get — which is what a `Command` needs for its own PATH lookup, but it
+/// carries no directory. This is the other half of that answer: where the file
+/// actually lives.
+fn path_hit_absolute(exe: &str, path: &str) -> Option<PathBuf> {
+    let sep = path_list_separator();
+    path.split(sep)
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| Path::new(dir).join(exe))
+        .find(|candidate| candidate.exists())
+        .map(|hit| std::fs::canonicalize(&hit).unwrap_or(hit))
+}
+
+/// Build the `x0x start` invocation for `bin`, resolving `path` the way a
+/// shell would.
+///
+/// Three rules, in order:
+///
+/// 1. Canonicalize. A real path from the installer's candidate directory
+///    stays itself, and on Windows that directory must become the child's
+///    working directory, because `x0x.exe` looks for `x0xd.exe` in its cwd
+///    rather than next to itself.
+/// 2. A *bare* name — a PATH hit — canonicalizes against **our** working
+///    directory, which usually fails, and the leftover parent of `""` must
+///    never become the child's cwd: `current_dir("")` makes the spawn die
+///    with ENOENT before x0x runs at all. A bare name is located on `path`
+///    instead.
+/// 3. Only a genuine, non-empty parent directory gets a cwd and a PATH
+///    prepend. Anything still bare spawns bare and rides the platform's own
+///    PATH lookup — how this worked before the Windows fix, and correct for
+///    Unix.
+fn x0x_start_command(bin: &Path, path: &str) -> std::process::Command {
+    let mut resolved = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
+    if !resolved.is_absolute() {
+        if let Some(hit) = path_hit_absolute(&resolved.to_string_lossy(), path) {
+            resolved = hit;
+        }
+    }
+    let mut cmd = std::process::Command::new(&resolved);
+    cmd.arg("start");
+    if let Some(dir) = resolved.parent().filter(|d| !d.as_os_str().is_empty()) {
+        let sep = path_list_separator();
+        cmd.env("PATH", format!("{}{}{}", dir.display(), sep, path));
+        cmd.current_dir(dir);
+    }
+    cmd
+}
+
 pub fn start_x0x_daemon() -> bool {
     let retry_until = std::time::Instant::now() + Duration::from_secs(8);
 
     let try_path = |bin: &PathBuf| -> bool {
-        // Canonicalize so we always have a full absolute path. resolve_bin
-        // can return a bare name ("x0x.exe") on a PATH hit, whose parent is
-        // an empty string — and x0x.exe looks for x0xd.exe in its current
-        // working directory, not next to itself, so an empty cwd means the
-        // spawn fails with "x0xd not found".
-        let bin = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.clone());
-        let mut cmd = std::process::Command::new(&bin);
-        cmd.arg("start");
-        if let Some(dir) = bin.parent() {
-            let current = std::env::var("PATH").unwrap_or_default();
-            let sep = path_list_separator();
-            cmd.env("PATH", format!("{}{}{}", dir.display(), sep, current));
-            cmd.current_dir(dir);
-        }
-        match cmd.spawn() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        match x0x_start_command(bin, &path).spawn() {
             Ok(_) => {
                 while std::time::Instant::now() < retry_until {
                     std::thread::sleep(Duration::from_millis(500));
@@ -869,6 +909,89 @@ mod tests {
             resolve_bin("x0x", tmp.path().to_string_lossy().as_ref(), &[]),
             None
         );
+    }
+
+    #[test]
+    fn a_bare_path_hit_gets_the_directory_it_lives_in() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let on_path = tmp.path().join("path");
+        let exe = touch_exe(&on_path, "x0x");
+        let expected = fs::canonicalize(&exe).unwrap_or(exe);
+        let cmd = x0x_start_command(Path::new("x0x"), &on_path.to_string_lossy());
+
+        assert_eq!(
+            Path::new(cmd.get_program()),
+            expected.as_path(),
+            "the bare PATH hit must become the real file, not our cwd's view of it"
+        );
+        assert_eq!(
+            cmd.get_current_dir(),
+            expected.parent(),
+            "x0x.exe finds x0xd.exe in its cwd, so the binary's own directory must be it"
+        );
+        let child_path = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+            .expect("the child PATH is rewritten");
+        let dir = expected.parent().expect("the binary has a directory");
+        assert!(
+            child_path.starts_with(&format!("{}{}", dir.display(), path_list_separator())),
+            "the binary's directory must lead the child's PATH, got {child_path}"
+        );
+    }
+
+    #[test]
+    fn a_name_we_cannot_locate_is_spawned_without_a_working_directory() {
+        let cmd = x0x_start_command(Path::new("x0x-definitely-absent"), "/nonexistent-av-path");
+        assert_eq!(
+            cmd.get_current_dir(),
+            None,
+            "an empty parent must never become the cwd: current_dir(\"\") dies with ENOENT \
+             before x0x runs at all"
+        );
+        assert_eq!(
+            Path::new(cmd.get_program()),
+            Path::new("x0x-definitely-absent"),
+            "a name we cannot place spawns bare and rides the platform's PATH lookup"
+        );
+    }
+
+    #[test]
+    fn an_absolute_binary_spawns_in_its_own_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exe = touch_exe(tmp.path(), "x0x.exe");
+        let dir = fs::canonicalize(tmp.path()).unwrap_or_else(|_| tmp.path().to_path_buf());
+        let cmd = x0x_start_command(&exe, "");
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(dir.as_path()),
+            "the installer's candidate directory is already absolute and must stay the cwd"
+        );
+        assert_eq!(Path::new(cmd.get_program()), dir.join("x0x.exe").as_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_name_still_spawns_when_our_cwd_does_not_hold_the_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let on_path = tmp.path().join("path");
+        let exe = touch_exe(&on_path, "x0x");
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod +x");
+
+        // The regression end to end: the process cwd has no `x0x` in it, so a
+        // bare PATH hit used to fall through to `current_dir("")` and the
+        // spawn died with ENOENT before x0x ever ran.
+        let path = on_path.to_string_lossy().into_owned();
+        let mut cmd = x0x_start_command(Path::new("x0x"), &path);
+        let mut child = cmd
+            .spawn()
+            .expect("a bare PATH hit must spawn from any cwd");
+        let status = child.wait().expect("wait for the fake x0x");
+        assert!(status.success());
     }
 
     #[test]
